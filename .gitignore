@@ -1,0 +1,9 @@
+.venv-paddle/
+__pycache__/
+*.pyc
+logs/
+flagged/
+processed/
+data/
+1.1.0 BACKUP/
+config.json

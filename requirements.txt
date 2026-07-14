@@ -1,0 +1,13 @@
+# OCR Engines (install one or both)
+pytesseract
+paddleocr
+paddlepaddle
+
+# Core dependencies
+opencv-python
+PyMuPDF
+Pillow
+numpy
+dateparser
+python-dateutil
+PyQt6
