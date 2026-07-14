@@ -1,7 +1,5 @@
 import os
 import json
-import cv2
-import numpy as np
 import fitz
 from pathlib import Path
 from datetime import date, datetime
@@ -9,14 +7,14 @@ from datetime import date, datetime
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QSpinBox, QScrollArea, QListWidget, QListWidgetItem, QSplitter,
-    QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog, QCheckBox
+    QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog,
+    QMenu
 )
 from PyQt6.QtCore import Qt, QSize, QTimer
-from PyQt6.QtGui import QFont, QColor, QPixmap, QImage, QPainter, QPen
+from PyQt6.QtGui import QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from blank_page_detector import detect_blank_page
 from pipeline import (
     PipelineConfig, parse_folder_structure, load_flagged_index,
     update_document_from_review, finalize_all_divisions, save_confirmed_documents
@@ -40,8 +38,9 @@ class ReviewTab(QWidget):
         self.ocr_dialog = None
         self.zoom_level = 100
         self.page_labels = []
-        self.debug_mode = False
-        self.debug_overrides = {}
+        self.document_modified = False
+        self.undo_stack = []
+        self.undo_max = 50
         self.build_ui()
 
     def build_ui(self):
@@ -148,25 +147,6 @@ class ReviewTab(QWidget):
         info_row = QHBoxLayout()
         info_row.setSpacing(12)
 
-        self.debug_checkbox = QCheckBox("Show Detection Debug")
-        self.debug_checkbox.setStyleSheet("color: #8888aa; font-size: 8pt;")
-        self.debug_checkbox.toggled.connect(self._toggle_debug_mode)
-        info_row.addWidget(self.debug_checkbox)
-
-        self.override_blank_btn = QPushButton("Mark Blank")
-        self.override_blank_btn.setFixedWidth(80)
-        self.override_blank_btn.setStyleSheet("font-size: 8pt; padding: 3px 8px; background-color: #5a2020; color: #ff8888;")
-        self.override_blank_btn.clicked.connect(lambda: self._override_page(True))
-        self.override_blank_btn.setEnabled(False)
-        info_row.addWidget(self.override_blank_btn)
-
-        self.override_content_btn = QPushButton("Mark Content")
-        self.override_content_btn.setFixedWidth(90)
-        self.override_content_btn.setStyleSheet("font-size: 8pt; padding: 3px 8px; background-color: #1a4a1a; color: #88ff88;")
-        self.override_content_btn.clicked.connect(lambda: self._override_page(False))
-        self.override_content_btn.setEnabled(False)
-        info_row.addWidget(self.override_content_btn)
-
         info_row.addStretch()
 
         self.page_label = QLabel("No document loaded")
@@ -226,6 +206,9 @@ class ReviewTab(QWidget):
         self.finalize_btn.clicked.connect(self.finalize_all)
         bottom.addWidget(self.finalize_btn)
         main_layout.addLayout(bottom)
+
+        self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
+        self.undo_shortcut.activated.connect(self._undo)
 
     def refresh_review(self):
         self.pending_list.clear()
@@ -305,6 +288,7 @@ class ReviewTab(QWidget):
             except Exception:
                 pass
             self.current_pdf_doc = None
+        self.undo_stack.clear()
         for lbl in self.page_labels:
             lbl.deleteLater()
         self.page_labels = []
@@ -385,6 +369,8 @@ class ReviewTab(QWidget):
             self.current_pdf_doc = None
 
         self.current_page = 0
+        self.document_modified = False
+        self.undo_stack.clear()
 
         total = len(self.pending_docs) + len(self.passed_docs)
         if self.active_list == "pending":
@@ -454,13 +440,6 @@ class ReviewTab(QWidget):
             preview_width = max(400, self.preview_scroll.viewport().width() - 30)
             dpi = int(150 * (self.zoom_level / 100))
 
-            blank_page_indices = []
-            filename = ""
-            if self.active_list == "pending" and self.active_index >= 0:
-                filename = self.pending_docs[self.active_index].get("original_filename", "")
-            elif self.active_list == "passed" and self.active_index >= 0:
-                filename = self.passed_docs[self.active_index].get("original_filename", "")
-
             for page_num in range(len(self.current_pdf_doc)):
                 page = self.current_pdf_doc[page_num]
                 pix = page.get_pixmap(dpi=dpi)
@@ -470,102 +449,119 @@ class ReviewTab(QWidget):
                 if pixmap.width() > preview_width:
                     pixmap = pixmap.scaledToWidth(preview_width, Qt.TransformationMode.SmoothTransformation)
 
-                img_array = np.array(QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888))
-                if len(img_array.shape) == 3:
-                    img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-
-                override_key = f"{filename}_{page_num}"
-                if override_key in self.debug_overrides:
-                    is_blank = self.debug_overrides[override_key]
-                    blank_result = {
-                        "is_blank": is_blank,
-                        "confidence": 100,
-                        "reason": "Manual override",
-                        "metrics": {"white_ratio": 0, "content_area": 0, "edge_ratio": 0, "std_dev": 0, "num_components": 0}
-                    }
-                else:
-                    blank_result = detect_blank_page(img_array, debug=self.debug_mode)
-
-                if blank_result["is_blank"] is True:
-                    blank_page_indices.append(page_num)
-                    overlay = QPixmap(pixmap.size())
-                    overlay.fill(QColor(0, 0, 0, 128))
-                    painter = QPainter(overlay)
-                    painter.setPen(QPen(QColor(255, 100, 100)))
-                    painter.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
-                    painter.drawText(overlay.rect(), Qt.AlignmentFlag.AlignCenter, "BLANK PAGE")
-                    painter.end()
-                    result_pixmap = QPixmap(pixmap.size())
-                    painter = QPainter(result_pixmap)
-                    painter.drawPixmap(0, 0, pixmap)
-                    painter.drawPixmap(0, 0, overlay)
-                    painter.end()
-                    pixmap = result_pixmap
-
-                if self.debug_mode:
-                    debug_overlay = QPixmap(pixmap.size())
-                    debug_overlay.fill(QColor(0, 0, 0, 0))
-                    if blank_result["is_blank"] is True:
-                        border_color = QColor(255, 80, 80)
-                    elif blank_result["is_blank"] is False:
-                        border_color = QColor(80, 255, 80)
-                    else:
-                        border_color = QColor(255, 255, 80)
-                    painter = QPainter(debug_overlay)
-                    painter.setPen(QPen(border_color, 3))
-                    painter.drawRect(2, 2, debug_overlay.width() - 4, debug_overlay.height() - 4)
-                    painter.fillRect(10, 10, 220, 110, QColor(0, 0, 0, 180))
-                    painter.setFont(QFont("Consolas", 9))
-                    painter.setPen(QColor(255, 255, 255))
-                    metrics = blank_result.get("metrics", {})
-                    y = 30
-                    painter.drawText(20, y, f"WHITE: {metrics.get('white_ratio', 0)*100:.1f}%"); y += 18
-                    painter.drawText(20, y, f"CONTENT: {metrics.get('content_area', 0)*100:.2f}%"); y += 18
-                    painter.drawText(20, y, f"EDGES: {metrics.get('edge_ratio', 0)*100:.3f}%"); y += 18
-                    painter.drawText(20, y, f"STD_DEV: {metrics.get('std_dev', 0):.1f}"); y += 18
-                    cls = "BLANK" if blank_result["is_blank"] is True else ("CONTENT" if blank_result["is_blank"] is False else "REVIEW")
-                    painter.drawText(20, y, f"CLASS: {cls} ({blank_result['confidence']}%)")
-                    painter.end()
-                    result_pixmap = QPixmap(pixmap.size())
-                    painter = QPainter(result_pixmap)
-                    painter.drawPixmap(0, 0, pixmap)
-                    painter.drawPixmap(0, 0, debug_overlay)
-                    painter.end()
-                    pixmap = result_pixmap
-
                 lbl = QLabel()
                 lbl.setPixmap(pixmap)
                 lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 lbl.setStyleSheet("background-color: #1e1f35; border: 1px solid #3a3b55; border-radius: 4px; padding: 4px;")
+                lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                lbl.customContextMenuRequested.connect(lambda pos, pn=page_num, lb=lbl: self._show_page_menu(pos, pn, lb))
                 self.preview_container_layout.addWidget(lbl)
                 self.page_labels.append(lbl)
 
             total_pages = len(self.current_pdf_doc)
-            if blank_page_indices:
-                blank_str = ", ".join(str(i + 1) for i in blank_page_indices)
-                self.page_label.setText(f"{total_pages} page(s) | {len(blank_page_indices)} blank: {blank_str} | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)")
-            else:
-                self.page_label.setText(f"{total_pages} page(s) | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)")
+            self.page_label.setText(f"{total_pages} page(s) | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)")
         except Exception as e:
             self.preview_placeholder.setText(f"Error rendering: {e}")
             self.preview_placeholder.setStyleSheet("color: #ff5555; font-size: 12pt;")
 
-    def _toggle_debug_mode(self, checked):
-        self.debug_mode = checked
-        self.override_blank_btn.setEnabled(checked)
-        self.override_content_btn.setEnabled(checked)
-        if self.current_pdf_doc:
-            self.render_preview()
-
-    def _override_page(self, is_blank):
-        if self.active_index < 0 or not self.current_pdf_doc:
+    def _show_page_menu(self, pos, page_num, lbl):
+        if not self.current_pdf_doc:
             return
-        if self.active_list == "pending":
-            filename = self.pending_docs[self.active_index].get("original_filename", "")
+        menu = QMenu(self)
+        delete_act = QAction("Delete Page", self)
+        delete_act.triggered.connect(lambda: self._delete_page(page_num))
+        menu.addAction(delete_act)
+        menu.addSeparator()
+        rot_l = QAction("Rotate Left", self)
+        rot_l.triggered.connect(lambda: self._rotate_page(page_num, -90))
+        menu.addAction(rot_l)
+        rot_r = QAction("Rotate Right", self)
+        rot_r.triggered.connect(lambda: self._rotate_page(page_num, 90))
+        menu.addAction(rot_r)
+        menu.addSeparator()
+        flip_h = QAction("Flip Horizontal", self)
+        flip_h.triggered.connect(lambda: self._flip_page(page_num, "h"))
+        menu.addAction(flip_h)
+        flip_v = QAction("Flip Vertical", self)
+        flip_v.triggered.connect(lambda: self._flip_page(page_num, "v"))
+        menu.addAction(flip_v)
+        menu.addSeparator()
+        ins_before = QAction(f"Insert Before Page {page_num + 1}", self)
+        ins_before.triggered.connect(lambda: self._insert_image_page(page_num, "before"))
+        menu.addAction(ins_before)
+        ins_after = QAction(f"Insert After Page {page_num + 1}", self)
+        ins_after.triggered.connect(lambda: self._insert_image_page(page_num, "after"))
+        menu.addAction(ins_after)
+        menu.exec(lbl.mapToGlobal(pos))
+
+    def _delete_page(self, page_num):
+        if not self.current_pdf_doc or len(self.current_pdf_doc) <= 1:
+            QMessageBox.warning(self, "Cannot Delete", "Cannot delete the only remaining page.")
+            return
+        self._push_undo()
+        self.current_pdf_doc.delete_page(page_num)
+        self.document_modified = True
+        self.render_preview()
+
+    def _rotate_page(self, page_num, degrees):
+        if not self.current_pdf_doc:
+            return
+        self._push_undo()
+        page = self.current_pdf_doc[page_num]
+        current = page.rotation or 0
+        page.set_rotation((current + degrees) % 360)
+        self.document_modified = True
+        self.render_preview()
+
+    def _flip_page(self, page_num, direction):
+        if not self.current_pdf_doc:
+            return
+        self._push_undo()
+        page = self.current_pdf_doc[page_num]
+        rect = page.rect
+        if direction == "h":
+            page.add_transformation(fitz.Matrix(-1, 0, 0, 1, rect.width, 0))
         else:
-            filename = self.passed_docs[self.active_index].get("original_filename", "")
-        key = f"{filename}_{self.current_page}"
-        self.debug_overrides[key] = is_blank
+            page.add_transformation(fitz.Matrix(1, 0, 0, -1, 0, rect.height))
+        page.clean_contents()
+        self.document_modified = True
+        self.render_preview()
+
+    def _insert_image_page(self, page_num, position):
+        if not self.current_pdf_doc:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Select Image", "", "Images (*.png *.jpg *.jpeg *.bmp)")
+        if not path:
+            return
+        try:
+            self._push_undo()
+            img_pix = fitz.Pixmap(path)
+            w, h = img_pix.width, img_pix.height
+            aspect = min(612 / w, 792 / h)
+            w, h = int(w * aspect), int(h * aspect)
+            insert_at = page_num + 1 if position == "after" else page_num
+            new_page = self.current_pdf_doc.new_page(insert_at, width=612, height=792)
+            img_rect = fitz.Rect((612 - w) / 2, (792 - h) / 2, (612 + w) / 2, (792 + h) / 2)
+            new_page.insert_image(img_rect, pixmap=img_pix)
+            self.document_modified = True
+            self.render_preview()
+        except Exception as e:
+            QMessageBox.critical(self, "Insert Error", f"Failed to insert image:\n{e}")
+
+    def _push_undo(self):
+        if not self.current_pdf_doc:
+            return
+        self.undo_stack.append(self.current_pdf_doc.tobytes())
+        if len(self.undo_stack) > self.undo_max:
+            self.undo_stack.pop(0)
+
+    def _undo(self):
+        if not self.undo_stack or not self.current_pdf_doc:
+            return
+        data = self.undo_stack.pop()
+        self.current_pdf_doc.close()
+        self.current_pdf_doc = fitz.open("pdf", data)
+        self.document_modified = True
         self.render_preview()
 
     def zoom_in(self):
@@ -756,6 +752,19 @@ class ReviewTab(QWidget):
         finalize_all_divisions(batches, pipeline_config)
 
         save_confirmed_documents(batches, pipeline_config)
+
+        if self.document_modified and self.current_pdf_doc and self.active_index >= 0:
+            if self.active_list == "pending":
+                cur_orig = self.pending_docs[self.active_index].get("original_path", "")
+            else:
+                cur_orig = self.passed_docs[self.active_index].get("original_path", "")
+            if cur_orig:
+                for batch in batches:
+                    for d in batch.documents:
+                        if d.original_path == cur_orig:
+                            out = Path(pipeline_config.output_root) / batch.division_code / d.company_name / d.original_filename
+                            self.current_pdf_doc.save(str(out), incremental=False, garbage=4, deflate=True)
+                            break
 
         for fname in ("passed_index.json", "flagged_index.json"):
             p = Path(self.config["flagged_root"]) / fname
