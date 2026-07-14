@@ -5,7 +5,7 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
-    QLineEdit, QSpinBox, QProgressBar, QGroupBox, QFileDialog, QMessageBox,
+    QLineEdit, QProgressBar, QGroupBox, QFileDialog, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -24,6 +24,7 @@ class DashboardTab(QWidget):
         super().__init__()
         self.config = config
         self.pipeline_thread = None
+        self._cancel_requested = False
         self.build_ui()
 
     def build_ui(self):
@@ -105,32 +106,23 @@ class DashboardTab(QWidget):
         self.run_btn.clicked.connect(self.run_pipeline)
         btn_row.addWidget(self.run_btn)
 
-        max_row = QHBoxLayout()
-        max_row.setSpacing(6)
-        max_lbl = QLabel("Max files (0 = all):")
-        max_lbl.setFont(QFont("Segoe UI", 8))
-        max_row.addWidget(max_lbl)
-        self.max_files_spin = QSpinBox()
-        self.max_files_spin.setRange(0, 10000)
-        self.max_files_spin.setValue(0)
-        self.max_files_spin.setFixedWidth(70)
-        max_row.addWidget(self.max_files_spin)
-        max_row.addStretch()
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setObjectName("danger")
+        self.cancel_btn.setFixedHeight(28)
+        self.cancel_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.clicked.connect(self.cancel_pipeline)
+        btn_row.addWidget(self.cancel_btn)
 
         pipeline_layout.addLayout(btn_row)
-        pipeline_layout.addLayout(max_row)
 
         progress_row = QHBoxLayout()
-        progress_row.setSpacing(8)
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
-        self.progress_bar.setFixedHeight(20)
-        self.progress_label = QLabel("Idle")
-        self.progress_label.setFixedWidth(180)
-        self.progress_label.setFont(QFont("Segoe UI", 8))
-        self.progress_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.progress_bar.setFixedHeight(28)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("Idle")
         progress_row.addWidget(self.progress_bar, 1)
-        progress_row.addWidget(self.progress_label)
         pipeline_layout.addLayout(progress_row)
 
         layout.addWidget(pipeline_group)
@@ -340,11 +332,12 @@ class DashboardTab(QWidget):
         self.run_btn.setEnabled(False)
         self.run_btn.setText("Running...")
         self.progress_bar.setValue(0)
-        self.progress_label.setText("Starting...")
+        self.progress_bar.setFormat("Starting...")
+        self.cancel_btn.setEnabled(True)
         self.log_signal.emit("=== Pipeline Started ===")
         self.pipeline_started.emit()
 
-        self.pipeline_thread = PipelineThread(self.config, self.max_files_spin.value())
+        self.pipeline_thread = PipelineThread(self.config, 0)
         self.pipeline_thread.progress.connect(self._on_progress)
         self.pipeline_thread.log_message.connect(self._append_log)
         self.pipeline_thread.finished_signal.connect(self._on_finished)
@@ -354,12 +347,17 @@ class DashboardTab(QWidget):
 
     def _on_progress(self, msg: str, pct: int):
         self.progress_bar.setValue(pct)
-        self.progress_label.setText(msg)
+        self.progress_bar.setFormat(msg)
 
     def _on_finished(self, flagged: list):
         self.run_btn.setEnabled(True)
         self.run_btn.setText("Run Pipeline")
-        self.progress_label.setText("Complete!")
+        self.cancel_btn.setEnabled(False)
+        if self._cancel_requested:
+            self.progress_bar.setFormat("Cancelled")
+            self._cancel_requested = False
+        else:
+            self.progress_bar.setFormat("Complete!")
         self.progress_bar.setValue(100)
         self.pipeline_finished.emit()
 
@@ -367,4 +365,13 @@ class DashboardTab(QWidget):
         self._append_log(f"Pipeline error: {msg}")
         self.run_btn.setEnabled(True)
         self.run_btn.setText("Run Pipeline")
-        self.progress_label.setText("Error")
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setFormat("Error")
+
+    def cancel_pipeline(self):
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            self.pipeline_thread.cancel()
+            self._cancel_requested = True
+            self.cancel_btn.setEnabled(False)
+            self.progress_bar.setFormat("Cancelling...")
+            self.log_signal.emit("--- Cancel requested ---")

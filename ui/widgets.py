@@ -26,6 +26,10 @@ class PipelineThread(QThread):
         super().__init__()
         self.config = config
         self.max_files = max_files
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
         try:
@@ -129,6 +133,12 @@ class PipelineThread(QThread):
                         self.log_message.emit(f"[ERROR] {doc.original_filename}: {e}")
 
                     processed += 1
+                    if self._cancelled:
+                        self.log_message.emit("--- Pipeline Cancelled ---")
+                        self.progress.emit("Cancelled", 0)
+                        self.finished_signal.emit([])
+                        return
+
                     elapsed = time.time() - start_time
                     avg_per = elapsed / max(1, processed)
                     remaining = avg_per * (total - processed)
