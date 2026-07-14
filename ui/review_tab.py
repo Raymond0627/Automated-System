@@ -378,7 +378,8 @@ class ReviewTab(QWidget):
         else:
             self.doc_nav_label.setText(f"Passed {self.active_index + 1} of {len(self.passed_docs)}")
 
-        pdf_path = doc.get("original_path", "")
+        mod_path = doc.get("modified_path", "")
+        pdf_path = mod_path if (mod_path and os.path.exists(mod_path)) else doc.get("original_path", "")
         loaded = False
         if pdf_path and os.path.exists(pdf_path):
             try:
@@ -638,6 +639,13 @@ class ReviewTab(QWidget):
                 "blank_pages": doc.get("blank_pages", []),
                 "final_filename": "",
             })
+
+            if self.document_modified and self.current_pdf_doc:
+                mod_path = Path(self.config["flagged_root"]) / doc.get("division_code", "") / doc.get("company_name", "") / doc.get("original_filename", "")
+                mod_path.parent.mkdir(parents=True, exist_ok=True)
+                self.current_pdf_doc.save(str(mod_path), incremental=False, garbage=4, deflate=True)
+                self.passed_docs[-1]["modified_path"] = str(mod_path)
+
             self._save_passed_updates()
 
             self.refresh_review()
@@ -645,6 +653,11 @@ class ReviewTab(QWidget):
         elif self.active_list == "passed":
             doc = self.passed_docs[self.active_index]
             doc["detected_date"] = dt
+            if self.document_modified and self.current_pdf_doc:
+                mod_path = Path(self.config["flagged_root"]) / doc.get("division_code", "") / doc.get("company_name", "") / doc.get("original_filename", "")
+                mod_path.parent.mkdir(parents=True, exist_ok=True)
+                self.current_pdf_doc.save(str(mod_path), incremental=False, garbage=4, deflate=True)
+                doc["modified_path"] = str(mod_path)
             self._save_passed_updates()
 
             card = self.passed_cards[self.active_index]
@@ -737,6 +750,8 @@ class ReviewTab(QWidget):
                             doc.confirmed_date = date.fromisoformat(pd["detected_date"])
                             doc.confirmed_method = pd.get("method", "auto")
                             doc.status = "confirmed"
+                            if pd.get("modified_path"):
+                                doc.original_path = pd["modified_path"]
                         except (ValueError, KeyError):
                             pass
                         break
