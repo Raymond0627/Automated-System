@@ -9,7 +9,7 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 
 from date_extractor import extract_document_date, DateResult
-from auto_qc import run_qc_on_pdf, remove_blank_pages, remove_docsep_pages
+from auto_qc import run_qc_on_pdf, remove_blank_pages, remove_docsep_pages, detect_docsep_flag
 
 
 @dataclass
@@ -26,6 +26,7 @@ class Document:
     status: str = "pending"
     flagged_data: Optional[Dict] = None
     blank_pages: List[int] = field(default_factory=list)
+    docsep_pages: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -130,13 +131,11 @@ def parse_folder_structure(root: Path) -> List[DivisionBatch]:
 def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> None:
     for doc in batch.documents:
         try:
-            # DOCSEP pre-processing: remove separator pages before OCR
+            # DOCSEP detection: tag separator pages (removal happens at finalize)
             if config.enable_docsep_removal:
                 try:
-                    flagged_out = str(Path(config.flagged_root) / doc.division_code / doc.company_name)
-                    dr = remove_docsep_pages(doc.original_path, flagged_out)
-                    if dr["removed"]:
-                        doc.original_path = dr["cleaned_path"]
+                    ds_result = detect_docsep_flag(doc.original_path)
+                    doc.docsep_pages = ds_result["docsep_pages"]
                 except Exception:
                     pass
 
@@ -333,6 +332,17 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
         if config.enable_blank_removal and doc.blank_pages:
             blank_removed_count = remove_blank_pages(str(output_path), doc.blank_pages, str(output_path))
 
+        docsep_removed_count = 0
+        if config.enable_docsep_removal and doc.docsep_pages:
+            for pn in reversed(sorted(doc.docsep_pages)):
+                import fitz
+                d = fitz.open(str(output_path))
+                if pn < len(d):
+                    d.delete_page(pn)
+                    docsep_removed_count += 1
+                d.save(str(output_path), incremental=False, garbage=4, deflate=True)
+                d.close()
+
         log_writer.writerow({
             "timestamp": datetime.now().isoformat(),
             "original_path": doc.original_path,
@@ -347,6 +357,8 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
             "method": doc.confirmed_method,
             "blank_pages": str(doc.blank_pages) if doc.blank_pages else "",
             "blank_removed": blank_removed_count,
+            "docsep_pages": str(doc.docsep_pages) if doc.docsep_pages else "",
+            "docsep_removed": docsep_removed_count,
             "status": "copied",
         })
 

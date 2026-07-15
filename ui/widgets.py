@@ -13,7 +13,7 @@ from PyQt6.QtGui import QFont, QColor
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from date_extractor import extract_document_date
 from pipeline import PipelineConfig, parse_folder_structure, save_confirmed_documents
-from auto_qc import run_qc_on_pdf, remove_docsep_pages
+from auto_qc import run_qc_on_pdf, detect_docsep_flag
 
 
 class PipelineThread(QThread):
@@ -74,16 +74,15 @@ class PipelineThread(QThread):
                     if doc.status == "skipped":
                         continue
                     try:
-                        # DOCSEP pre-processing: remove separator pages before OCR
+                        # DOCSEP detection: tag separator pages (removal happens at finalize)
                         docsep_msg = ""
                         if self.config.get("enable_docsep_removal", True):
                             try:
-                                flagged_out = str(Path(self.config["flagged_root"]) / doc.division_code / doc.company_name)
-                                dr = remove_docsep_pages(doc.original_path, flagged_out)
-                                if dr["removed"]:
-                                    doc.original_path = dr["cleaned_path"]
-                                    docsep_msg = f" | sep-rm:{dr['count']}"
-                                    self.log_message.emit(f"[DOCSEP] {doc.original_filename}: removed {dr['count']} separator page(s)")
+                                ds_result = detect_docsep_flag(doc.original_path)
+                                doc.docsep_pages = ds_result.get("docsep_pages", [])
+                                if doc.docsep_pages:
+                                    docsep_msg = f" | docsep:{len(doc.docsep_pages)}"
+                                    self.log_message.emit(f"[DOCSEP] {doc.original_filename}: separator page(s) detected at index {doc.docsep_pages}")
                             except Exception:
                                 pass
 
@@ -129,6 +128,7 @@ class PipelineThread(QThread):
                                 "error": "Document is entirely blank",
                                 "blank_pages": result.blank_pages,
                                 "all_blank": True,
+                                "docsep_pages": doc.docsep_pages,
                             }
                             if qc_result:
                                 doc.flagged_data["qc"] = qc_result
@@ -148,6 +148,7 @@ class PipelineThread(QThread):
                                     "method": result.method,
                                     "raw_ocr_text": result.raw_ocr_text,
                                     "blank_pages": result.blank_pages,
+                                    "docsep_pages": doc.docsep_pages,
                                 }
                                 if qc_result:
                                     doc.flagged_data["qc"] = qc_result
@@ -166,6 +167,7 @@ class PipelineThread(QThread):
                                     "confidence": result.confidence,
                                     "method": doc.confirmed_method,
                                     "blank_pages": result.blank_pages,
+                                    "docsep_pages": doc.docsep_pages,
                                 }
                                 if qc_result:
                                     passed_data["qc_status"] = qc_result.get("qc_status", "")
@@ -184,6 +186,7 @@ class PipelineThread(QThread):
                                 "method": result.method,
                                 "raw_ocr_text": result.raw_ocr_text,
                                 "blank_pages": result.blank_pages,
+                                "docsep_pages": doc.docsep_pages,
                             }
                             if qc_result:
                                 doc.flagged_data["qc"] = qc_result
@@ -280,6 +283,13 @@ class DocCardWidget(QFrame):
             blank_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
             blank_label.setStyleSheet("background: transparent; color: #ff9800;")
             top_row.addWidget(blank_label)
+
+        docsep_pages = doc.get("docsep_pages", [])
+        if docsep_pages:
+            docsep_label = QLabel(f"{len(docsep_pages)} DOCSEP")
+            docsep_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            docsep_label.setStyleSheet("background: transparent; color: #ffab00;")
+            top_row.addWidget(docsep_label)
 
         status_label = QLabel(status)
         status_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
@@ -399,6 +409,13 @@ class PassedDocCardWidget(QFrame):
             blank_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
             blank_label.setStyleSheet("background: transparent; color: #ff9800;")
             top_row.addWidget(blank_label)
+
+        docsep_pages = doc.get("docsep_pages", [])
+        if docsep_pages:
+            docsep_label = QLabel(f"{len(docsep_pages)} DOCSEP")
+            docsep_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            docsep_label.setStyleSheet("background: transparent; color: #ffab00;")
+            top_row.addWidget(docsep_label)
 
         status_label = QLabel("PASSED")
         status_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))

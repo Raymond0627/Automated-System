@@ -168,6 +168,35 @@ def detect_docsep_page(page_img: np.ndarray) -> Dict:
     return {"is_docsep": False, "confidence": 0.0, "matched_text": ""}
 
 
+def detect_docsep_flag(pdf_path: str) -> Dict:
+    """
+    Detect DOCSEP separator pages in a PDF without modifying the file.
+    Returns {docsep_pages: List[int], count: int, confidence: float, reason: str}
+    """
+    import fitz
+    doc = fitz.open(pdf_path)
+    total = len(doc)
+    docsep_pages = []
+    confidence = 0.0
+
+    if total > 0:
+        pix = doc[0].get_pixmap(dpi=200)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        result = detect_docsep_page(img)
+        if result["is_docsep"]:
+            docsep_pages.append(0)
+            confidence = result["confidence"]
+
+    doc.close()
+    return {
+        "docsep_pages": docsep_pages,
+        "count": len(docsep_pages),
+        "confidence": confidence,
+        "reason": "QR code detected" if docsep_pages else "",
+    }
+
+
 def remove_docsep_pages(pdf_path: str, output_dir: str) -> Dict:
     """
     Open a PDF, detect and remove DOCSEP separator page from first page position.

@@ -430,6 +430,20 @@ class ReviewTab(QWidget):
         year = self.year_spin.value()
         return f"{year}-{month:02d}-01"
 
+    def _get_blank_pages(self):
+        if self.active_list == "pending" and self.active_index >= 0:
+            return self.pending_docs[self.active_index].get("blank_pages", [])
+        elif self.active_list == "passed" and self.active_index >= 0:
+            return self.passed_docs[self.active_index].get("blank_pages", [])
+        return []
+
+    def _get_docsep_pages(self):
+        if self.active_list == "pending" and self.active_index >= 0:
+            return self.pending_docs[self.active_index].get("docsep_pages", [])
+        elif self.active_list == "passed" and self.active_index >= 0:
+            return self.passed_docs[self.active_index].get("docsep_pages", [])
+        return []
+
     def render_preview(self):
         if not self.current_pdf_doc:
             return
@@ -440,6 +454,8 @@ class ReviewTab(QWidget):
 
             preview_width = max(400, self.preview_scroll.viewport().width() - 30)
             dpi = int(150 * (self.zoom_level / 100))
+            blank_pages = self._get_blank_pages()
+            docsep_pages = self._get_docsep_pages()
 
             for page_num in range(len(self.current_pdf_doc)):
                 page = self.current_pdf_doc[page_num]
@@ -453,14 +469,44 @@ class ReviewTab(QWidget):
                 lbl = QLabel()
                 lbl.setPixmap(pixmap)
                 lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                lbl.setStyleSheet("background-color: #1e1f35; border: 1px solid #3a3b55; border-radius: 4px; padding: 4px;")
                 lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
                 lbl.customContextMenuRequested.connect(lambda pos, pn=page_num, lb=lbl: self._show_page_menu(pos, pn, lb))
+
+                is_blank = page_num in blank_pages
+                is_docsep = page_num in docsep_pages
+
+                if is_blank:
+                    lbl.setStyleSheet("background-color: #1e1f35; border: 3px solid #ff4444; border-radius: 4px; padding: 4px;")
+                    blank_badge = QLabel("BLANK", lbl)
+                    blank_badge.setStyleSheet("background-color: #ff4444; color: white; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
+                    blank_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    blank_badge.move(8, 8)
+                    blank_badge.adjustSize()
+                    blank_badge.show()
+                elif is_docsep:
+                    lbl.setStyleSheet("background-color: #1e1f35; border: 3px solid #ffab00; border-radius: 4px; padding: 4px;")
+                    docsep_badge = QLabel("DOCSEP", lbl)
+                    docsep_badge.setStyleSheet("background-color: #ffab00; color: #1e1f35; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
+                    docsep_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    docsep_badge.move(8, 8)
+                    docsep_badge.adjustSize()
+                    docsep_badge.show()
+                else:
+                    lbl.setStyleSheet("background-color: #1e1f35; border: 1px solid #3a3b55; border-radius: 4px; padding: 4px;")
+
                 self.preview_container_layout.addWidget(lbl)
                 self.page_labels.append(lbl)
 
             total_pages = len(self.current_pdf_doc)
-            self.page_label.setText(f"{total_pages} page(s) | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)")
+            blank_count = len([p for p in blank_pages if p < total_pages])
+            docsep_count = len([p for p in docsep_pages if p < total_pages])
+            status = f"{total_pages} page(s)"
+            if blank_count:
+                status += f" | {blank_count} blank"
+            if docsep_count:
+                status += f" | {docsep_count} DOCSEP"
+            status += f" | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)"
+            self.page_label.setText(status)
         except Exception as e:
             self.preview_placeholder.setText(f"Error rendering: {e}")
             self.preview_placeholder.setStyleSheet("color: #ff5555; font-size: 12pt;")
@@ -726,7 +772,18 @@ class ReviewTab(QWidget):
         if not self.passed_docs and not any(d.get("reviewed") for d in self.all_flagged_docs):
             QMessageBox.information(self, "Info", "No documents to finalize")
             return
-        reply = QMessageBox.question(self, "Confirm", "Finalize and rename all confirmed documents?")
+
+        total_blank = sum(len(pd.get("blank_pages", [])) for pd in self.passed_docs)
+        total_docsep = sum(len(pd.get("docsep_pages", [])) for pd in self.passed_docs)
+        msg = f"Finalize {len(self.passed_docs)} document(s)?"
+        if total_blank > 0:
+            msg += f"\n\n{total_blank} blank page(s) will be removed."
+        if total_docsep > 0:
+            msg += f"\n{total_docsep} DOCSEP separator page(s) will be removed."
+        if total_blank > 0 or total_docsep > 0:
+            msg += "\n\nThis action cannot be undone."
+
+        reply = QMessageBox.question(self, "Confirm Finalize", msg)
         if reply != QMessageBox.StandardButton.Yes:
             return
 
@@ -753,8 +810,10 @@ class ReviewTab(QWidget):
                             if pd.get("modified_path"):
                                 doc.original_path = pd["modified_path"]
                                 doc.blank_pages = []
+                                doc.docsep_pages = []
                             else:
                                 doc.blank_pages = pd.get("blank_pages", [])
+                                doc.docsep_pages = pd.get("docsep_pages", [])
                         except (ValueError, KeyError):
                             pass
                         break
