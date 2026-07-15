@@ -2,6 +2,8 @@ import os
 import sys
 import json
 import time
+import numpy as np
+import cv2
 import fitz
 from pathlib import Path
 from typing import Dict
@@ -14,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from date_extractor import extract_document_date
 from pipeline import PipelineConfig, parse_folder_structure, save_confirmed_documents
 from auto_qc import run_qc_on_pdf, detect_docsep_flag
+
+import pytesseract
 
 
 class PipelineThread(QThread):
@@ -88,14 +92,37 @@ class PipelineThread(QThread):
 
                         result = extract_document_date(doc.original_path, pipeline_config.page_index)
                         doc.date_result = result
-                        doc.blank_pages = result.blank_pages or []
+                        doc.blank_pages = list(result.blank_pages or [])
+
+                        # Layer 3: OCR text check — re-check blank-flagged pages with Tesseract
+                        if doc.blank_pages:
+                            try:
+                                pdf_for_ocr = fitz.open(doc.original_path)
+                                for blank_pg in list(doc.blank_pages):
+                                    if blank_pg >= len(pdf_for_ocr):
+                                        continue
+                                    pg = pdf_for_ocr[blank_pg]
+                                    pix = pg.get_pixmap(dpi=200)
+                                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+                                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                                    text = pytesseract.image_to_string(gray, config='--psm 6').strip()
+                                    words = [w for w in text.split() if len(w) >= 2]
+                                    if len(words) >= 2:
+                                        doc.blank_pages.remove(blank_pg)
+                                        self.log_message.emit(f"[BLANK-OCR] {doc.original_filename} p{blank_pg+1}: {len(words)} words found — NOT blank")
+                                    else:
+                                        self.log_message.emit(f"[BLANK-OCR] {doc.original_filename} p{blank_pg+1}: {len(words)} word(s) — confirmed blank")
+                                pdf_for_ocr.close()
+                            except Exception:
+                                pass
 
                         try:
                             doc_file = fitz.open(doc.original_path)
                             total_pages = len(doc_file)
                             doc_file.close()
                         except Exception:
-                            total_pages = len(result.blank_pages) + 1
+                            total_pages = len(doc.blank_pages) + 1
 
                         qc_result = None
                         if self.config.get("enable_qc", True) and not result.all_blank:
@@ -126,7 +153,7 @@ class PipelineThread(QThread):
                                 "company_name": doc.company_name,
                                 "original_filename": doc.original_filename,
                                 "error": "Document is entirely blank",
-                                "blank_pages": result.blank_pages,
+                                "blank_pages": doc.blank_pages,
                                 "all_blank": True,
                                 "docsep_pages": doc.docsep_pages,
                             }
@@ -135,7 +162,7 @@ class PipelineThread(QThread):
                             self.log_message.emit(f"[BLANK] {doc.original_filename}: ALL BLANK ({total_pages} pages){qc_str}{docsep_msg}")
                             self.doc_processed.emit("pending", doc.flagged_data)
                         elif result.confidence >= pipeline_config.confidence_threshold and result.date:
-                            blank_str = f" | {len(result.blank_pages)}/{total_pages} blank" if result.blank_pages else ""
+                            blank_str = f" | {len(doc.blank_pages)}/{total_pages} blank" if doc.blank_pages else ""
                             if qc_failed:
                                 doc.status = "flagged"
                                 doc.flagged_data = {
@@ -147,7 +174,7 @@ class PipelineThread(QThread):
                                     "confidence": result.confidence,
                                     "method": result.method,
                                     "raw_ocr_text": result.raw_ocr_text,
-                                    "blank_pages": result.blank_pages,
+                                    "blank_pages": doc.blank_pages,
                                     "docsep_pages": doc.docsep_pages,
                                 }
                                 if qc_result:
@@ -166,7 +193,7 @@ class PipelineThread(QThread):
                                     "detected_date": doc.confirmed_date.isoformat(),
                                     "confidence": result.confidence,
                                     "method": doc.confirmed_method,
-                                    "blank_pages": result.blank_pages,
+                                    "blank_pages": doc.blank_pages,
                                     "docsep_pages": doc.docsep_pages,
                                 }
                                 if qc_result:
@@ -185,12 +212,12 @@ class PipelineThread(QThread):
                                 "confidence": result.confidence,
                                 "method": result.method,
                                 "raw_ocr_text": result.raw_ocr_text,
-                                "blank_pages": result.blank_pages,
+                                "blank_pages": doc.blank_pages,
                                 "docsep_pages": doc.docsep_pages,
                             }
                             if qc_result:
                                 doc.flagged_data["qc"] = qc_result
-                            blank_str = f" | {len(result.blank_pages)}/{total_pages} blank" if result.blank_pages else ""
+                            blank_str = f" | {len(doc.blank_pages)}/{total_pages} blank" if doc.blank_pages else ""
                             self.log_message.emit(f"[FLAGGED] {doc.original_filename} ({result.confidence}%){blank_str}{qc_str}{docsep_msg}")
                             self.doc_processed.emit("pending", doc.flagged_data)
                     except Exception as e:

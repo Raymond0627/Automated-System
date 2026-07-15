@@ -268,10 +268,13 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
         if img.size == 0 or img.shape[0] < 10 or img.shape[1] < 10:
             continue
 
-        # Check if page is blank
         blank_result = detect_blank_page(img)
-        if blank_result["is_blank"] is True:
+        if blank_result["is_blank"] is True or blank_result["is_blank"] == "needs_review":
             blank_pages.append(page_idx)
+            if blank_result["is_blank"] is True:
+                continue
+
+        if all_candidates:
             continue
 
         if engine == "paddle":
@@ -301,9 +304,6 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
                     all_candidates.extend(candidates)
                 except Exception:
                     continue
-
-        if all_candidates:
-            break
 
     # Check if all pages were blank
     all_blank = len(blank_pages) == num_pages
