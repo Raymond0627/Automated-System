@@ -752,6 +752,9 @@ class ReviewTab(QWidget):
                             doc.status = "confirmed"
                             if pd.get("modified_path"):
                                 doc.original_path = pd["modified_path"]
+                                doc.blank_pages = []
+                            else:
+                                doc.blank_pages = pd.get("blank_pages", [])
                         except (ValueError, KeyError):
                             pass
                         break

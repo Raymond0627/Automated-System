@@ -6,9 +6,10 @@ import re
 from pathlib import Path
 from datetime import date, datetime
 from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 
 from date_extractor import extract_document_date, DateResult
+from auto_qc import run_qc_on_pdf, remove_blank_pages, remove_docsep_pages
 
 
 @dataclass
@@ -24,6 +25,7 @@ class Document:
     final_filename: str = ""
     status: str = "pending"
     flagged_data: Optional[Dict] = None
+    blank_pages: List[int] = field(default_factory=list)
 
 
 @dataclass
@@ -52,6 +54,12 @@ class PipelineConfig:
         self.sequence_start = sequence_start
         self.earliest_year = earliest_year
         self.ocr_engine = ocr_engine
+        self.enable_qc = None  # None = use config default
+        self.qc_blank_threshold = 1.5
+        self.qc_rotation_threshold = 65
+        self.qc_mirror_threshold = 15
+        self.enable_docsep_removal = True
+        self.enable_blank_removal = True
         
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.flagged_root.mkdir(parents=True, exist_ok=True)
@@ -122,13 +130,38 @@ def parse_folder_structure(root: Path) -> List[DivisionBatch]:
 def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> None:
     for doc in batch.documents:
         try:
+            # DOCSEP pre-processing: remove separator pages before OCR
+            if config.enable_docsep_removal:
+                try:
+                    flagged_out = str(Path(config.flagged_root) / doc.division_code / doc.company_name)
+                    dr = remove_docsep_pages(doc.original_path, flagged_out)
+                    if dr["removed"]:
+                        doc.original_path = dr["cleaned_path"]
+                except Exception:
+                    pass
+
             result = extract_document_date(doc.original_path, config.page_index, engine=config.ocr_engine)
             doc.date_result = result
+            doc.blank_pages = result.blank_pages or []
+            
+            qc_result = None
+            if config.enable_qc and not result.all_blank:
+                try:
+                    qc_result = run_qc_on_pdf(
+                        doc.original_path,
+                        config.qc_blank_threshold,
+                        config.qc_rotation_threshold,
+                        config.qc_mirror_threshold,
+                    )
+                except Exception:
+                    pass
             
             # Handle all-blank documents
             if result.all_blank:
                 doc.status = "failed"
                 doc.flagged_data = create_flagged_data(doc, result, error="Document is entirely blank")
+                if qc_result:
+                    doc.flagged_data["qc"] = qc_result
                 continue
             
             # Handle documents with some blank pages
@@ -136,17 +169,32 @@ def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> Non
                 doc.flagged_data = doc.flagged_data or {}
                 doc.flagged_data["blank_pages"] = result.blank_pages
             
+            # Determine if QC passes
+            qc_passed = True
+            if qc_result and qc_result.get("qc_status") in ("failed", "needs_review"):
+                qc_passed = False
+            
             if result.confidence >= config.confidence_threshold and result.date:
                 if result.date.year >= config.earliest_year and result.date <= date.today():
-                    doc.confirmed_date = result.date
-                    doc.confirmed_method = "auto"
-                    doc.status = "confirmed"
+                    if qc_passed:
+                        doc.confirmed_date = result.date
+                        doc.confirmed_method = "auto"
+                        doc.status = "confirmed"
+                    else:
+                        doc.status = "flagged"
+                        doc.flagged_data = create_flagged_data(doc, result)
+                        if qc_result:
+                            doc.flagged_data["qc"] = qc_result
                 else:
                     doc.status = "flagged"
                     doc.flagged_data = create_flagged_data(doc, result)
+                    if qc_result:
+                        doc.flagged_data["qc"] = qc_result
             else:
                 doc.status = "flagged"
                 doc.flagged_data = create_flagged_data(doc, result)
+                if qc_result:
+                    doc.flagged_data["qc"] = qc_result
                 
         except Exception as e:
             doc.status = "error"
@@ -210,7 +258,8 @@ def save_confirmed_documents(batches: List[DivisionBatch], config: PipelineConfi
     for batch in batches:
         for doc in batch.documents:
             if doc.status == "confirmed" and doc.confirmed_date:
-                confirmed_data.append({
+                qc = doc.flagged_data.get("qc", {}) if doc.flagged_data else {}
+                entry = {
                     "original_path": doc.original_path,
                     "division_code": doc.division_code,
                     "company_name": doc.company_name,
@@ -218,9 +267,16 @@ def save_confirmed_documents(batches: List[DivisionBatch], config: PipelineConfi
                     "detected_date": doc.confirmed_date.isoformat(),
                     "confidence": doc.date_result.confidence if doc.date_result else 100,
                     "method": doc.confirmed_method,
-                    "blank_pages": doc.date_result.blank_pages if doc.date_result else [],
+                    "blank_pages": doc.blank_pages or [],
                     "final_filename": doc.final_filename or "",
-                })
+                }
+                if qc:
+                    entry["qc_status"] = qc.get("qc_status", "")
+                    entry["qc_failure_reasons"] = qc.get("qc_failure_reasons", "")
+                    entry["qc_blank_detected"] = qc.get("blank_detected", False)
+                    entry["qc_rotation_detected"] = qc.get("rotation_detected", "none")
+                    entry["qc_mirrored_detected"] = qc.get("mirrored_detected", False)
+                confirmed_data.append(entry)
 
     passed_index = config.flagged_root / "passed_index.json"
     with open(passed_index, "w", encoding="utf-8") as f:
@@ -272,7 +328,11 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
             counter += 1
         
         shutil.copy2(doc.original_path, output_path)
-        
+
+        blank_removed_count = 0
+        if config.enable_blank_removal and doc.blank_pages:
+            blank_removed_count = remove_blank_pages(str(output_path), doc.blank_pages, str(output_path))
+
         log_writer.writerow({
             "timestamp": datetime.now().isoformat(),
             "original_path": doc.original_path,
@@ -285,7 +345,8 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
             "sequence_number": doc.sequence_number,
             "confidence": doc.date_result.confidence if doc.date_result else 100,
             "method": doc.confirmed_method,
-            "blank_pages": str(doc.date_result.blank_pages) if doc.date_result and doc.date_result.blank_pages else "",
+            "blank_pages": str(doc.blank_pages) if doc.blank_pages else "",
+            "blank_removed": blank_removed_count,
             "status": "copied",
         })
 
@@ -340,7 +401,8 @@ def finalize_all_divisions(batches: List[DivisionBatch], config: PipelineConfig)
         fieldnames = [
             "timestamp", "original_path", "new_filename", "new_path",
             "division_code", "company_name", "document_date", "yyyymm",
-            "sequence_number", "confidence", "method", "blank_pages", "status"
+            "sequence_number", "confidence", "method", "blank_pages",
+            "blank_removed", "status"
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         

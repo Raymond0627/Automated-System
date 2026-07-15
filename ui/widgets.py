@@ -13,6 +13,7 @@ from PyQt6.QtGui import QFont, QColor
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from date_extractor import extract_document_date
 from pipeline import PipelineConfig, parse_folder_structure, save_confirmed_documents
+from auto_qc import run_qc_on_pdf, remove_docsep_pages
 
 
 class PipelineThread(QThread):
@@ -73,8 +74,22 @@ class PipelineThread(QThread):
                     if doc.status == "skipped":
                         continue
                     try:
+                        # DOCSEP pre-processing: remove separator pages before OCR
+                        docsep_msg = ""
+                        if self.config.get("enable_docsep_removal", True):
+                            try:
+                                flagged_out = str(Path(self.config["flagged_root"]) / doc.division_code / doc.company_name)
+                                dr = remove_docsep_pages(doc.original_path, flagged_out)
+                                if dr["removed"]:
+                                    doc.original_path = dr["cleaned_path"]
+                                    docsep_msg = f" | sep-rm:{dr['count']}"
+                                    self.log_message.emit(f"[DOCSEP] {doc.original_filename}: removed {dr['count']} separator page(s)")
+                            except Exception:
+                                pass
+
                         result = extract_document_date(doc.original_path, pipeline_config.page_index)
                         doc.date_result = result
+                        doc.blank_pages = result.blank_pages or []
 
                         try:
                             doc_file = fitz.open(doc.original_path)
@@ -82,6 +97,27 @@ class PipelineThread(QThread):
                             doc_file.close()
                         except Exception:
                             total_pages = len(result.blank_pages) + 1
+
+                        qc_result = None
+                        if self.config.get("enable_qc", True) and not result.all_blank:
+                            try:
+                                qc_result = run_qc_on_pdf(
+                                    doc.original_path,
+                                    blank_threshold=self.config.get("qc_blank_threshold", 1.5),
+                                    rotation_threshold=self.config.get("qc_rotation_threshold", 65),
+                                    mirror_threshold=self.config.get("qc_mirror_threshold", 15),
+                                )
+                            except Exception:
+                                pass
+
+                        qc_failed = qc_result and qc_result.get("qc_status") in ("failed", "needs_review")
+                        qc_str = ""
+                        if qc_result:
+                            if qc_failed:
+                                reasons = qc_result.get("qc_failure_reasons", "unknown")
+                                qc_str = f" | QC:FAIL({reasons})"
+                            else:
+                                qc_str = " | QC:Passed"
 
                         if result.all_blank:
                             doc.status = "flagged"
@@ -94,24 +130,48 @@ class PipelineThread(QThread):
                                 "blank_pages": result.blank_pages,
                                 "all_blank": True,
                             }
-                            self.log_message.emit(f"[BLANK] {doc.original_filename}: ALL BLANK ({total_pages} pages)")
+                            if qc_result:
+                                doc.flagged_data["qc"] = qc_result
+                            self.log_message.emit(f"[BLANK] {doc.original_filename}: ALL BLANK ({total_pages} pages){qc_str}{docsep_msg}")
                             self.doc_processed.emit("pending", doc.flagged_data)
                         elif result.confidence >= pipeline_config.confidence_threshold and result.date:
-                            doc.confirmed_date = result.date
-                            doc.confirmed_method = "auto"
-                            doc.status = "confirmed"
                             blank_str = f" | {len(result.blank_pages)}/{total_pages} blank" if result.blank_pages else ""
-                            self.log_message.emit(f"[AUTO] {doc.original_filename} -> {result.date} ({result.confidence}%){blank_str}")
-                            self.doc_processed.emit("passed", {
-                                "original_path": doc.original_path,
-                                "division_code": doc.division_code,
-                                "company_name": doc.company_name,
-                                "original_filename": doc.original_filename,
-                                "detected_date": doc.confirmed_date.isoformat(),
-                                "confidence": result.confidence,
-                                "method": doc.confirmed_method,
-                                "blank_pages": result.blank_pages,
-                            })
+                            if qc_failed:
+                                doc.status = "flagged"
+                                doc.flagged_data = {
+                                    "original_path": doc.original_path,
+                                    "division_code": doc.division_code,
+                                    "company_name": doc.company_name,
+                                    "original_filename": doc.original_filename,
+                                    "best_guess_date": result.date.isoformat() if result.date else None,
+                                    "confidence": result.confidence,
+                                    "method": result.method,
+                                    "raw_ocr_text": result.raw_ocr_text,
+                                    "blank_pages": result.blank_pages,
+                                }
+                                if qc_result:
+                                    doc.flagged_data["qc"] = qc_result
+                                self.log_message.emit(f"[FLAGGED] {doc.original_filename} ({result.confidence}%){blank_str}{qc_str}{docsep_msg}")
+                                self.doc_processed.emit("pending", doc.flagged_data)
+                            else:
+                                doc.confirmed_date = result.date
+                                doc.confirmed_method = "auto"
+                                doc.status = "confirmed"
+                                passed_data = {
+                                    "original_path": doc.original_path,
+                                    "division_code": doc.division_code,
+                                    "company_name": doc.company_name,
+                                    "original_filename": doc.original_filename,
+                                    "detected_date": doc.confirmed_date.isoformat(),
+                                    "confidence": result.confidence,
+                                    "method": doc.confirmed_method,
+                                    "blank_pages": result.blank_pages,
+                                }
+                                if qc_result:
+                                    passed_data["qc_status"] = qc_result.get("qc_status", "")
+                                    passed_data["qc_failure_reasons"] = qc_result.get("qc_failure_reasons", "")
+                                self.log_message.emit(f"[AUTO] {doc.original_filename} -> {result.date} ({result.confidence}%){blank_str}{qc_str}{docsep_msg}")
+                                self.doc_processed.emit("passed", passed_data)
                         else:
                             doc.status = "flagged"
                             doc.flagged_data = {
@@ -125,8 +185,10 @@ class PipelineThread(QThread):
                                 "raw_ocr_text": result.raw_ocr_text,
                                 "blank_pages": result.blank_pages,
                             }
+                            if qc_result:
+                                doc.flagged_data["qc"] = qc_result
                             blank_str = f" | {len(result.blank_pages)}/{total_pages} blank" if result.blank_pages else ""
-                            self.log_message.emit(f"[FLAGGED] {doc.original_filename} ({result.confidence}%){blank_str}")
+                            self.log_message.emit(f"[FLAGGED] {doc.original_filename} ({result.confidence}%){blank_str}{qc_str}{docsep_msg}")
                             self.doc_processed.emit("pending", doc.flagged_data)
                     except Exception as e:
                         doc.status = "error"
@@ -203,6 +265,8 @@ class DocCardWidget(QFrame):
         div = doc.get("division_code", "?")
         blank_pages = doc.get("blank_pages", [])
         status = "DONE" if doc.get("reviewed") else "TODO"
+        qc = doc.get("qc", {})
+        qc_status = qc.get("qc_status", "")
 
         top_row = QHBoxLayout()
         name_label = QLabel(name)
@@ -233,6 +297,19 @@ class DocCardWidget(QFrame):
         conf_label.setFont(QFont("Segoe UI", 8))
         conf_label.setStyleSheet("background: transparent; color: #8888aa;")
         bottom_row.addWidget(conf_label)
+
+        if qc_status == "failed":
+            qc_reasons = qc.get("qc_failure_reasons", "")
+            qc_label = QLabel(f"QC: {qc_reasons[:30]}")
+            qc_label.setFont(QFont("Segoe UI", 7))
+            qc_label.setStyleSheet("background: transparent; color: #ff7043;")
+            bottom_row.addWidget(qc_label)
+        elif qc_status == "needs_review":
+            qc_label = QLabel("QC: ?")
+            qc_label.setFont(QFont("Segoe UI", 7))
+            qc_label.setStyleSheet("background: transparent; color: #ffa726;")
+            bottom_row.addWidget(qc_label)
+
         bottom_row.addStretch()
         info_layout.addLayout(bottom_row)
 
@@ -307,6 +384,8 @@ class PassedDocCardWidget(QFrame):
         confidence = doc.get("confidence", 0)
         method = doc.get("method", "")
         blank_pages = doc.get("blank_pages", [])
+        qc_status = doc.get("qc_status", "")
+        qc_reasons = doc.get("qc_failure_reasons", "")
 
         top_row = QHBoxLayout()
         name_label = QLabel(name)
@@ -341,6 +420,18 @@ class PassedDocCardWidget(QFrame):
             method_label.setFont(QFont("Segoe UI", 7))
             method_label.setStyleSheet("background: transparent; color: #666688;")
             bottom_row.addWidget(method_label)
+
+        if qc_status == "passed":
+            qc_label = QLabel("QC:Passed")
+            qc_label.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+            qc_label.setStyleSheet("background: transparent; color: #66bb6a;")
+            bottom_row.addWidget(qc_label)
+        elif qc_status in ("failed", "needs_review") and qc_reasons:
+            qc_label = QLabel(f"QC:{qc_reasons[:30]}")
+            qc_label.setFont(QFont("Segoe UI", 7))
+            qc_label.setStyleSheet("background: transparent; color: #ff7043;")
+            bottom_row.addWidget(qc_label)
+
         bottom_row.addStretch()
         info_layout.addLayout(bottom_row)
 

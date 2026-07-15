@@ -72,7 +72,14 @@ class MainWindow(QMainWindow):
             "confidence_threshold": 20,
             "page_index": 0,
             "earliest_year": 1950,
-            "ocr_engine": "tesseract"
+            "ocr_engine": "tesseract",
+            "theme": "Dark Blue",
+            "enable_qc": True,
+            "enable_docsep_removal": True,
+            "enable_blank_removal": True,
+            "qc_blank_threshold": 1.5,
+            "qc_rotation_threshold": 65,
+            "qc_mirror_threshold": 15,
         }
         if Path(self.config_path).exists():
             try:

@@ -145,8 +145,8 @@ class DashboardTab(QWidget):
         log_layout.addLayout(log_toolbar)
 
         self.log_table = QTableWidget()
-        self.log_table.setColumnCount(6)
-        self.log_table.setHorizontalHeaderLabels(["Time", "Status", "File", "Detected Date", "Confidence", "Blank Pages"])
+        self.log_table.setColumnCount(7)
+        self.log_table.setHorizontalHeaderLabels(["Time", "Status", "File", "Detected Date", "Confidence", "Blank Pages", "QC"])
         self.log_table.verticalHeader().setVisible(False)
         self.log_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.log_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -160,6 +160,7 @@ class DashboardTab(QWidget):
         self.log_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.log_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.log_table.setColumnWidth(5, 70)
+        self.log_table.setColumnWidth(6, 80)
         log_layout.addWidget(self.log_table)
         layout.addWidget(log_group, 1)
 
@@ -189,6 +190,18 @@ class DashboardTab(QWidget):
         confidence = ""
         filename = ""
         blank_count = ""
+        qc_text = ""
+
+        # Extract QC suffix if present
+        qc_suffix = ""
+        if " | QC:" in msg:
+            parts = msg.split(" | QC:", 1)
+            msg = parts[0]
+            qc_suffix = "QC:" + parts[1]
+            if qc_suffix.startswith("QC:FAIL"):
+                qc_text = "FAIL"
+            elif qc_suffix.startswith("QC:Passed"):
+                qc_text = "OK"
 
         if "[AUTO]" in msg:
             status = "AUTO"
@@ -248,6 +261,15 @@ class DashboardTab(QWidget):
                         blank_count = "ALL"
                     else:
                         blank_count = rest
+        elif "[DOCSEP]" in msg:
+            status = "DOCSEP"
+            color = "#9c27b0"
+            parts = msg.split("[DOCSEP] ", 1)
+            if len(parts) > 1:
+                detail = parts[1]
+                if ": " in detail:
+                    filename = detail.split(": ")[0]
+                    confidence = detail.split(": ", 1)[1]
         elif "Done" in msg:
             status = "DONE"
             color = "#2196f3"
@@ -295,6 +317,17 @@ class DashboardTab(QWidget):
         blank_item.setFont(QFont("Consolas", 8))
         blank_item.setTextAlignment(align_center)
         self.log_table.setItem(row, 5, blank_item)
+
+        qc_item = QTableWidgetItem(qc_text)
+        if qc_text == "FAIL":
+            qc_item.setForeground(QColor("#ff7043"))
+        elif qc_text == "OK":
+            qc_item.setForeground(QColor("#66bb6a"))
+        else:
+            qc_item.setForeground(QColor("#555570"))
+        qc_item.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        qc_item.setTextAlignment(align_center)
+        self.log_table.setItem(row, 6, qc_item)
 
         self.log_table.scrollToBottom()
 
