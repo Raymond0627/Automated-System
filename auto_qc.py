@@ -170,7 +170,7 @@ def detect_docsep_page(page_img: np.ndarray) -> Dict:
 
 def remove_docsep_pages(pdf_path: str, output_dir: str) -> Dict:
     """
-    Open a PDF, detect and remove DOCSEP separator pages from first and/or last position.
+    Open a PDF, detect and remove DOCSEP separator page from first page position.
     Saves cleaned PDF to output_dir and returns details.
     Returns {removed: bool, count: int, pages_removed: List[int], cleaned_path: str}
     """
@@ -187,16 +187,6 @@ def remove_docsep_pages(pdf_path: str, output_dir: str) -> Dict:
         result = detect_docsep_page(img)
         if result["is_docsep"]:
             pages_to_remove.append(0)
-
-    # Check last page (different from first)
-    last = total - 1
-    if last > 0 and last not in pages_to_remove:
-        pix = doc[last].get_pixmap(dpi=200)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        result = detect_docsep_page(img)
-        if result["is_docsep"]:
-            pages_to_remove.append(last)
 
     if not pages_to_remove:
         doc.close()
