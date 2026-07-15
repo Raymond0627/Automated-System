@@ -267,6 +267,7 @@ def save_confirmed_documents(batches: List[DivisionBatch], config: PipelineConfi
                     "confidence": doc.date_result.confidence if doc.date_result else 100,
                     "method": doc.confirmed_method,
                     "blank_pages": doc.blank_pages or [],
+                    "docsep_pages": doc.docsep_pages or [],
                     "final_filename": doc.final_filename or "",
                 }
                 if qc:
