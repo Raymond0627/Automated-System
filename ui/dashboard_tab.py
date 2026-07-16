@@ -392,7 +392,6 @@ class DashboardTab(QWidget):
         else:
             self.progress_bar.setFormat("Complete!")
         self.progress_bar.setValue(100)
-        self.pipeline_finished.emit()
 
     def _on_error(self, msg: str):
         self._append_log(f"Pipeline error: {msg}")

@@ -1,5 +1,6 @@
 import os
 import json
+import shutil
 import fitz
 from pathlib import Path
 from datetime import date, datetime
@@ -10,7 +11,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog,
     QMenu
 )
-from PyQt6.QtCore import Qt, QSize, QTimer
+from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence
 
 import sys
@@ -21,6 +22,91 @@ from pipeline import (
 )
 
 from .widgets import DocCardWidget, PassedDocCardWidget
+
+
+class FinalizeWorker(QThread):
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def __init__(self, passed_docs, all_flagged_docs, config, document_modified, current_pdf_doc, active_index, active_list, pending_docs):
+        super().__init__()
+        self.passed_docs = passed_docs
+        self.all_flagged_docs = all_flagged_docs
+        self.config = config
+        self.document_modified = document_modified
+        self.current_pdf_doc = current_pdf_doc
+        self.active_index = active_index
+        self.active_list = active_list
+        self.pending_docs = pending_docs
+
+    def run(self):
+        try:
+            pipeline_config = PipelineConfig(
+                input_root=self.config["input_root"],
+                output_root=self.config["output_root"],
+                flagged_root=self.config["flagged_root"],
+                confidence_threshold=self.config["confidence_threshold"],
+                page_index=self.config["page_index"],
+                earliest_year=self.config["earliest_year"],
+                ocr_engine=self.config.get("ocr_engine", "tesseract"),
+            )
+
+            batches = parse_folder_structure(pipeline_config.input_root)
+
+            for batch in batches:
+                for doc in batch.documents:
+                    for pd in self.passed_docs:
+                        if pd.get("original_path") == doc.original_path:
+                            try:
+                                doc.confirmed_date = date.fromisoformat(pd["detected_date"])
+                                doc.confirmed_method = pd.get("method", "auto")
+                                doc.status = "confirmed"
+                                if pd.get("modified_path"):
+                                    doc.original_path = pd["modified_path"]
+                                doc.blank_pages = pd.get("blank_pages", [])
+                                doc.docsep_pages = pd.get("docsep_pages", [])
+                            except (ValueError, KeyError):
+                                pass
+                            break
+
+            flagged_data = load_flagged_index(pipeline_config)
+            for batch in batches:
+                for doc in batch.documents:
+                    for fd in flagged_data:
+                        if fd.get("original_path") == doc.original_path:
+                            update_document_from_review(doc, fd)
+                            break
+
+            finalize_all_divisions(batches, pipeline_config)
+
+            save_confirmed_documents(batches, pipeline_config)
+
+            if self.document_modified and self.current_pdf_doc and self.active_index >= 0:
+                if self.active_list == "pending":
+                    cur_orig = self.pending_docs[self.active_index].get("original_path", "")
+                else:
+                    cur_orig = self.passed_docs[self.active_index].get("original_path", "")
+                if cur_orig:
+                    for batch in batches:
+                        for d in batch.documents:
+                            if d.original_path == cur_orig:
+                                out = Path(pipeline_config.output_root) / batch.division_code / d.company_name / d.original_filename
+                                import tempfile
+                                tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+                                self.current_pdf_doc.save(tmp.name, incremental=False, garbage=4, deflate=True)
+                                tmp.close()
+                                shutil.move(tmp.name, str(out))
+                                break
+
+            for fname in ("passed_index.json", "flagged_index.json"):
+                p = Path(self.config["flagged_root"]) / fname
+                if p.exists():
+                    with open(p, "w", encoding="utf-8") as f:
+                        json.dump([], f)
+
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class ReviewTab(QWidget):
@@ -199,7 +285,7 @@ class ReviewTab(QWidget):
         bottom.addWidget(self.confirm_btn)
         bottom.addWidget(self.ocr_btn)
         bottom.addStretch()
-        self.finalize_btn = QPushButton("Finalize & Rename All")
+        self.finalize_btn = QPushButton("FINALIZE")
         self.finalize_btn.setObjectName("success")
         self.finalize_btn.setFixedHeight(26)
         self.finalize_btn.setFont(QFont("Segoe UI", 8))
@@ -533,6 +619,13 @@ class ReviewTab(QWidget):
         flip_v.triggered.connect(lambda: self._flip_page(page_num, "v"))
         menu.addAction(flip_v)
         menu.addSeparator()
+        mark_blank = QAction("Mark as Blank Page", self)
+        mark_blank.triggered.connect(lambda: self._mark_blank(page_num))
+        menu.addAction(mark_blank)
+        remove_mark = QAction("Remove Mark", self)
+        remove_mark.triggered.connect(lambda: self._remove_mark(page_num))
+        menu.addAction(remove_mark)
+        menu.addSeparator()
         ins_before = QAction(f"Insert Before Page {page_num + 1}", self)
         ins_before.triggered.connect(lambda: self._insert_image_page(page_num, "before"))
         menu.addAction(ins_before)
@@ -563,15 +656,69 @@ class ReviewTab(QWidget):
     def _flip_page(self, page_num, direction):
         if not self.current_pdf_doc:
             return
+        import cv2
+        import numpy as np
+        import tempfile
         self._push_undo()
-        page = self.current_pdf_doc[page_num]
-        rect = page.rect
-        if direction == "h":
-            page.add_transformation(fitz.Matrix(-1, 0, 0, 1, rect.width, 0))
-        else:
-            page.add_transformation(fitz.Matrix(1, 0, 0, -1, 0, rect.height))
-        page.clean_contents()
-        self.document_modified = True
+        try:
+            page = self.current_pdf_doc[page_num]
+            pix = page.get_pixmap(dpi=200)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            if direction == "h":
+                img = cv2.flip(img, 1)
+            else:
+                img = cv2.flip(img, 0)
+            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+            cv2.imwrite(tmp.name, img_rgb)
+            page.delete_contents()
+            rect = page.rect
+            img_pix = fitz.Pixmap(tmp.name)
+            scale = min(rect.width / img_pix.width, rect.height / img_pix.height)
+            w, h = int(img_pix.width * scale), int(img_pix.height * scale)
+            x = (rect.width - w) / 2
+            y = (rect.height - h) / 2
+            page.insert_image(fitz.Rect(x, y, x + w, y + h), pixmap=img_pix)
+            img_pix = None
+            tmp.close()
+            os.unlink(tmp.name)
+            self.document_modified = True
+            self.render_preview()
+        except Exception as e:
+            QMessageBox.critical(self, "Flip Error", f"Failed to flip page:\n{e}")
+
+    def _get_current_doc(self):
+        if self.active_list == "pending" and self.active_index >= 0:
+            return self.pending_docs[self.active_index]
+        elif self.active_list == "passed" and self.active_index >= 0:
+            return self.passed_docs[self.active_index]
+        return None
+
+    def _mark_blank(self, page_num):
+        doc = self._get_current_doc()
+        if not doc:
+            return
+        self._push_undo()
+        blank_pages = doc.setdefault("blank_pages", [])
+        if page_num not in blank_pages:
+            blank_pages.append(page_num)
+        docsep_pages = doc.get("docsep_pages", [])
+        if page_num in docsep_pages:
+            docsep_pages.remove(page_num)
+        self.render_preview()
+
+    def _remove_mark(self, page_num):
+        doc = self._get_current_doc()
+        if not doc:
+            return
+        self._push_undo()
+        blank_pages = doc.get("blank_pages", [])
+        if page_num in blank_pages:
+            blank_pages.remove(page_num)
+        docsep_pages = doc.get("docsep_pages", [])
+        if page_num in docsep_pages:
+            docsep_pages.remove(page_num)
         self.render_preview()
 
     def _insert_image_page(self, page_num, position):
@@ -598,16 +745,26 @@ class ReviewTab(QWidget):
     def _push_undo(self):
         if not self.current_pdf_doc:
             return
-        self.undo_stack.append(self.current_pdf_doc.tobytes())
+        doc = self._get_current_doc()
+        state = {
+            "pdf": self.current_pdf_doc.tobytes(),
+            "blank_pages": list(doc.get("blank_pages", [])) if doc else [],
+            "docsep_pages": list(doc.get("docsep_pages", [])) if doc else [],
+        }
+        self.undo_stack.append(state)
         if len(self.undo_stack) > self.undo_max:
             self.undo_stack.pop(0)
 
     def _undo(self):
         if not self.undo_stack or not self.current_pdf_doc:
             return
-        data = self.undo_stack.pop()
+        state = self.undo_stack.pop()
         self.current_pdf_doc.close()
-        self.current_pdf_doc = fitz.open("pdf", data)
+        self.current_pdf_doc = fitz.open("pdf", state["pdf"])
+        doc = self._get_current_doc()
+        if doc:
+            doc["blank_pages"] = state["blank_pages"]
+            doc["docsep_pages"] = state["docsep_pages"]
         self.document_modified = True
         self.render_preview()
 
@@ -683,6 +840,7 @@ class ReviewTab(QWidget):
                 "confidence": doc.get("confidence", 0),
                 "method": "manual",
                 "blank_pages": doc.get("blank_pages", []),
+                "docsep_pages": doc.get("docsep_pages", []),
                 "final_filename": "",
             })
 
@@ -787,72 +945,54 @@ class ReviewTab(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        pipeline_config = PipelineConfig(
-            input_root=self.config["input_root"],
-            output_root=self.config["output_root"],
-            flagged_root=self.config["flagged_root"],
-            confidence_threshold=self.config["confidence_threshold"],
-            page_index=self.config["page_index"],
-            earliest_year=self.config["earliest_year"],
-            ocr_engine=self.config.get("ocr_engine", "tesseract"),
+        self.finalize_btn.setEnabled(False)
+        self.finalize_btn.setText("Processing...")
+
+        self._finalize_worker = FinalizeWorker(
+            passed_docs=list(self.passed_docs),
+            all_flagged_docs=list(self.all_flagged_docs),
+            config=self.config,
+            document_modified=self.document_modified,
+            current_pdf_doc=self.current_pdf_doc,
+            active_index=self.active_index,
+            active_list=self.active_list,
+            pending_docs=list(self.pending_docs),
         )
+        self._finalize_worker.finished.connect(self._on_finalize_done)
+        self._finalize_worker.error.connect(self._on_finalize_error)
+        self._finalize_worker.start()
 
-        batches = parse_folder_structure(pipeline_config.input_root)
+    def _on_finalize_done(self):
+        self.pending_docs = []
+        self.passed_docs = []
+        self.all_flagged_docs = []
+        self.pending_cards = []
+        self.passed_cards = []
+        self.pending_list.clear()
+        self.passed_list.clear()
+        self.active_list = None
+        self.active_index = -1
+        self.current_pdf_doc = None
+        self.document_modified = False
+        self.undo_stack.clear()
+        for lbl in self.page_labels:
+            lbl.deleteLater()
+        self.page_labels = []
+        self.preview_placeholder.setText("Select a document to preview")
+        self.preview_placeholder.setStyleSheet("color: #555570; font-size: 12pt;")
+        self.preview_placeholder.show()
+        self.pending_label.setText("Pending Review (0)")
+        self.passed_label.setText("Auto-Confirmed (0)")
+        self.count_label.setText("No documents")
+        self.page_label.setText("No document loaded")
+        self.finalize_btn.setEnabled(True)
+        self.finalize_btn.setText("FINALIZE")
+        QMessageBox.information(self, "Finalize Complete", "All documents have been processed and moved to the output folder.")
 
-        for batch in batches:
-            for doc in batch.documents:
-                for pd in self.passed_docs:
-                    if pd.get("original_path") == doc.original_path:
-                        try:
-                            doc.confirmed_date = date.fromisoformat(pd["detected_date"])
-                            doc.confirmed_method = pd.get("method", "auto")
-                            doc.status = "confirmed"
-                            if pd.get("modified_path"):
-                                doc.original_path = pd["modified_path"]
-                                doc.blank_pages = []
-                                doc.docsep_pages = []
-                            else:
-                                doc.blank_pages = pd.get("blank_pages", [])
-                                doc.docsep_pages = pd.get("docsep_pages", [])
-                        except (ValueError, KeyError):
-                            pass
-                        break
-
-        flagged_data = load_flagged_index(pipeline_config)
-        for batch in batches:
-            for doc in batch.documents:
-                for fd in flagged_data:
-                    if fd.get("original_path") == doc.original_path:
-                        update_document_from_review(doc, fd)
-                        break
-
-        finalize_all_divisions(batches, pipeline_config)
-
-        save_confirmed_documents(batches, pipeline_config)
-
-        if self.document_modified and self.current_pdf_doc and self.active_index >= 0:
-            if self.active_list == "pending":
-                cur_orig = self.pending_docs[self.active_index].get("original_path", "")
-            else:
-                cur_orig = self.passed_docs[self.active_index].get("original_path", "")
-            if cur_orig:
-                for batch in batches:
-                    for d in batch.documents:
-                        if d.original_path == cur_orig:
-                            out = Path(pipeline_config.output_root) / batch.division_code / d.company_name / d.original_filename
-                            self.current_pdf_doc.save(str(out), incremental=False, garbage=4, deflate=True)
-                            break
-
-        for fname in ("passed_index.json", "flagged_index.json"):
-            p = Path(self.config["flagged_root"]) / fname
-            if p.exists():
-                with open(p, "w", encoding="utf-8") as f:
-                    json.dump([], f)
-
-        self.refresh_review()
-
-        log_path = Path(self.config["output_root"]) / "rename_log.csv"
-        QMessageBox.information(self, "Done", f"Files renamed. Check {log_path}")
+    def _on_finalize_error(self, msg):
+        self.finalize_btn.setEnabled(True)
+        self.finalize_btn.setText("FINALIZE")
+        QMessageBox.critical(self, "Finalize Error", f"Failed to finalize:\n{msg}")
 
     def resizeEvent(self, event):
         super().resizeEvent(event)

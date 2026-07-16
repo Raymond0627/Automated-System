@@ -50,7 +50,6 @@ class MainWindow(QMainWindow):
         self.review_tab = ReviewTab(self.config)
         self.settings_tab = SettingsTab(self.config)
 
-        self.dashboard_tab.pipeline_finished.connect(self.review_tab.refresh_review)
         self.dashboard_tab.pipeline_started.connect(self.review_tab.clear_all)
         self.dashboard_tab.doc_update.connect(self.review_tab.add_doc)
 

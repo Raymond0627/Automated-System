@@ -1,4 +1,5 @@
 import os
+import sys
 import shutil
 import json
 import csv
@@ -9,7 +10,7 @@ from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict, field
 
 from date_extractor import extract_document_date, DateResult
-from auto_qc import run_qc_on_pdf, remove_blank_pages, remove_docsep_pages, detect_docsep_flag
+from auto_qc import run_qc_on_pdf, detect_docsep_flag
 
 
 @dataclass
@@ -306,62 +307,100 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
     confirmed_docs.sort(key=lambda d: d.confirmed_date)
     
     for i, doc in enumerate(confirmed_docs, start=config.sequence_start):
-        doc.sequence_number = i
-        
-        yyyymm = doc.confirmed_date.strftime("%Y%m")
-        seq = f"{i:04d}"
-        div = doc.division_code
-        company = sanitize_filename(doc.company_name)
-        
-        doc.final_filename = f"{yyyymm}{seq}_{div}_{company}.pdf"
-        
-        output_div_dir = config.output_root / doc.division_code
-        output_div_dir.mkdir(parents=True, exist_ok=True)
-        
-        output_path = output_div_dir / doc.final_filename
-        
-        counter = 1
-        original_output_path = output_path
-        while output_path.exists():
-            stem = original_output_path.stem
-            output_path = original_output_path.parent / f"{stem}_{counter}{original_output_path.suffix}"
-            counter += 1
-        
-        shutil.copy2(doc.original_path, output_path)
+        try:
+            doc.sequence_number = i
 
-        blank_removed_count = 0
-        if config.enable_blank_removal and doc.blank_pages:
-            blank_removed_count = remove_blank_pages(str(output_path), doc.blank_pages, str(output_path))
+            yyyymm = doc.confirmed_date.strftime("%Y%m")
+            seq = f"{i:04d}"
+            div = doc.division_code
+            company = sanitize_filename(doc.company_name)
 
-        docsep_removed_count = 0
-        if config.enable_docsep_removal and doc.docsep_pages:
-            for pn in reversed(sorted(doc.docsep_pages)):
-                import fitz
+            doc.final_filename = f"{yyyymm}{seq}_{div}_{company}.pdf"
+
+            output_div_dir = config.output_root / doc.division_code
+            output_div_dir.mkdir(parents=True, exist_ok=True)
+
+            output_path = output_div_dir / doc.final_filename
+
+            counter = 1
+            original_output_path = output_path
+            while output_path.exists():
+                stem = original_output_path.stem
+                output_path = original_output_path.parent / f"{stem}_{counter}{original_output_path.suffix}"
+                counter += 1
+
+            shutil.copy2(doc.original_path, output_path)
+
+            blank_removed_count = 0
+            docsep_removed_count = 0
+
+            all_remove = set()
+            if config.enable_blank_removal and doc.blank_pages:
+                all_remove.update(doc.blank_pages)
+            if config.enable_docsep_removal and doc.docsep_pages:
+                all_remove.update(doc.docsep_pages)
+
+            if all_remove:
+                import fitz, tempfile
                 d = fitz.open(str(output_path))
-                if pn < len(d):
-                    d.delete_page(pn)
-                    docsep_removed_count += 1
-                d.save(str(output_path), incremental=False, garbage=4, deflate=True)
-                d.close()
+                for pn in reversed(sorted(all_remove)):
+                    if pn < len(d):
+                        d.delete_page(pn)
+                        if pn in doc.blank_pages:
+                            blank_removed_count += 1
+                        if pn in doc.docsep_pages:
+                            docsep_removed_count += 1
+                if blank_removed_count > 0 or docsep_removed_count > 0:
+                    tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+                    d.save(tmp.name, incremental=False, garbage=4, deflate=True)
+                    d.close()
+                    shutil.move(tmp.name, str(output_path))
+                else:
+                    d.close()
 
-        log_writer.writerow({
-            "timestamp": datetime.now().isoformat(),
-            "original_path": doc.original_path,
-            "new_filename": output_path.name,
-            "new_path": str(output_path),
-            "division_code": doc.division_code,
-            "company_name": doc.company_name,
-            "document_date": doc.confirmed_date.isoformat(),
-            "yyyymm": yyyymm,
-            "sequence_number": doc.sequence_number,
-            "confidence": doc.date_result.confidence if doc.date_result else 100,
-            "method": doc.confirmed_method,
-            "blank_pages": str(doc.blank_pages) if doc.blank_pages else "",
-            "blank_removed": blank_removed_count,
-            "docsep_pages": str(doc.docsep_pages) if doc.docsep_pages else "",
-            "docsep_removed": docsep_removed_count,
-            "status": "copied",
-        })
+            log_writer.writerow({
+                "timestamp": datetime.now().isoformat(),
+                "original_path": doc.original_path,
+                "new_filename": output_path.name,
+                "new_path": str(output_path),
+                "division_code": doc.division_code,
+                "company_name": doc.company_name,
+                "document_date": doc.confirmed_date.isoformat(),
+                "yyyymm": yyyymm,
+                "sequence_number": doc.sequence_number,
+                "confidence": doc.date_result.confidence if doc.date_result else 100,
+                "method": doc.confirmed_method,
+                "blank_pages": str(doc.blank_pages) if doc.blank_pages else "",
+                "blank_removed": blank_removed_count,
+                "docsep_pages": str(doc.docsep_pages) if doc.docsep_pages else "",
+                "docsep_removed": docsep_removed_count,
+                "status": "copied",
+            })
+        except Exception as e:
+            # Don't let one bad document abort the rest of the batch/run.
+            print(f"[finalize_division] Failed to finalize '{doc.original_path}': {e}")
+            try:
+                log_writer.writerow({
+                    "timestamp": datetime.now().isoformat(),
+                    "original_path": doc.original_path,
+                    "new_filename": "",
+                    "new_path": "",
+                    "division_code": doc.division_code,
+                    "company_name": doc.company_name,
+                    "document_date": doc.confirmed_date.isoformat() if doc.confirmed_date else "",
+                    "yyyymm": "",
+                    "sequence_number": doc.sequence_number,
+                    "confidence": doc.date_result.confidence if doc.date_result else "",
+                    "method": doc.confirmed_method,
+                    "blank_pages": str(doc.blank_pages) if doc.blank_pages else "",
+                    "blank_removed": 0,
+                    "docsep_pages": str(doc.docsep_pages) if doc.docsep_pages else "",
+                    "docsep_removed": 0,
+                    "status": f"error: {e}",
+                })
+            except Exception:
+                pass
+            continue
 
 
 def run_pipeline(config: PipelineConfig, progress_callback=None) -> List[DivisionBatch]:
@@ -409,14 +448,19 @@ def run_pipeline(config: PipelineConfig, progress_callback=None) -> List[Divisio
 def finalize_all_divisions(batches: List[DivisionBatch], config: PipelineConfig) -> None:
     log_path = config.output_root / "rename_log.csv"
     log_exists = log_path.exists()
-    
+
+    # NOTE: fieldnames must include every key written by finalize_division's
+    # log_writer.writerow(...) calls (including the error-path row), or
+    # csv.DictWriter raises ValueError mid-run and silently aborts the
+    # remaining divisions/documents.
+    fieldnames = [
+        "timestamp", "original_path", "new_filename", "new_path",
+        "division_code", "company_name", "document_date", "yyyymm",
+        "sequence_number", "confidence", "method", "blank_pages",
+        "blank_removed", "docsep_pages", "docsep_removed", "status"
+    ]
+
     with open(log_path, "a", newline="", encoding="utf-8") as f:
-        fieldnames = [
-            "timestamp", "original_path", "new_filename", "new_path",
-            "division_code", "company_name", "document_date", "yyyymm",
-            "sequence_number", "confidence", "method", "blank_pages",
-            "blank_removed", "status"
-        ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         
         if not log_exists:
@@ -445,28 +489,49 @@ def move_confirmed_to_passed(config: PipelineConfig, batches: List[DivisionBatch
 
 
 if __name__ == "__main__":
-    import argparse
+    config_path = Path(__file__).parent / "config.json"
     
-    parser = argparse.ArgumentParser(description="Lumeed QScan Pipeline")
-    parser.add_argument("input_root", help="Root folder containing division/company/PDF structure")
-    parser.add_argument("output_root", help="Output folder for renamed PDFs")
-    parser.add_argument("flagged_root", help="Folder for flagged documents awaiting review")
-    parser.add_argument("--threshold", type=int, default=70, help="Confidence threshold (0-100)")
-    parser.add_argument("--page", type=int, default=0, help="PDF page index to OCR (0-based)")
-    parser.add_argument("--earliest-year", type=int, default=1990, help="Earliest valid document year")
-    parser.add_argument("--ocr-engine", type=str, default="tesseract", choices=["tesseract", "paddle"], help="OCR engine to use")
-    
-    args = parser.parse_args()
-    
-    config = PipelineConfig(
-        input_root=args.input_root,
-        output_root=args.output_root,
-        flagged_root=args.flagged_root,
-        confidence_threshold=args.threshold,
-        page_index=args.page,
-        earliest_year=args.earliest_year,
-        ocr_engine=args.ocr_engine,
-    )
+    if config_path.exists() and len(sys.argv) <= 1:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        config = PipelineConfig(
+            input_root=cfg.get("input_root", ""),
+            output_root=cfg.get("output_root", ""),
+            flagged_root=cfg.get("flagged_root", ""),
+            confidence_threshold=cfg.get("confidence_threshold", 70),
+            page_index=cfg.get("page_index", 0),
+            earliest_year=cfg.get("earliest_year", 1990),
+            ocr_engine=cfg.get("ocr_engine", "tesseract"),
+        )
+        config.enable_qc = cfg.get("enable_qc", None)
+        config.enable_docsep_removal = cfg.get("enable_docsep_removal", True)
+        config.enable_blank_removal = cfg.get("enable_blank_removal", True)
+        config.qc_blank_threshold = cfg.get("qc_blank_threshold", 1.5)
+        config.qc_rotation_threshold = cfg.get("qc_rotation_threshold", 65)
+        config.qc_mirror_threshold = cfg.get("qc_mirror_threshold", 15)
+    else:
+        import argparse
+        
+        parser = argparse.ArgumentParser(description="Lumeed QScan Pipeline")
+        parser.add_argument("input_root", help="Root folder containing division/company/PDF structure")
+        parser.add_argument("output_root", help="Output folder for renamed PDFs")
+        parser.add_argument("flagged_root", help="Folder for flagged documents awaiting review")
+        parser.add_argument("--threshold", type=int, default=70, help="Confidence threshold (0-100)")
+        parser.add_argument("--page", type=int, default=0, help="PDF page index to OCR (0-based)")
+        parser.add_argument("--earliest-year", type=int, default=1990, help="Earliest valid document year")
+        parser.add_argument("--ocr-engine", type=str, default="tesseract", choices=["tesseract", "paddle"], help="OCR engine to use")
+        
+        args = parser.parse_args()
+        
+        config = PipelineConfig(
+            input_root=args.input_root,
+            output_root=args.output_root,
+            flagged_root=args.flagged_root,
+            confidence_threshold=args.threshold,
+            page_index=args.page,
+            earliest_year=args.earliest_year,
+            ocr_engine=args.ocr_engine,
+        )
     
     batches = run_pipeline(config)
     finalize_all_divisions(batches, config)
