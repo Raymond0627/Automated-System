@@ -352,6 +352,7 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
                             docsep_removed_count += 1
                 if blank_removed_count > 0 or docsep_removed_count > 0:
                     tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+                    tmp.close()
                     d.save(tmp.name, incremental=False, garbage=4, deflate=True)
                     d.close()
                     shutil.move(tmp.name, str(output_path))

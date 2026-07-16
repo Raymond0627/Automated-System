@@ -1,6 +1,5 @@
 import os
 import json
-import shutil
 import fitz
 from pathlib import Path
 from datetime import date, datetime
@@ -50,53 +49,52 @@ class FinalizeWorker(QThread):
                 earliest_year=self.config["earliest_year"],
                 ocr_engine=self.config.get("ocr_engine", "tesseract"),
             )
+            pipeline_config.enable_docsep_removal = self.config.get("enable_docsep_removal", True)
+            pipeline_config.enable_blank_removal = self.config.get("enable_blank_removal", True)
+
+            def _norm(p):
+                return os.path.normcase(os.path.normpath(os.path.abspath(p))) if p else ""
 
             batches = parse_folder_structure(pipeline_config.input_root)
 
+            passed_lookup = {_norm(pd.get("original_path")): pd for pd in self.passed_docs if pd.get("original_path")}
+
+            matched_doc_paths = set()
             for batch in batches:
                 for doc in batch.documents:
-                    for pd in self.passed_docs:
-                        if pd.get("original_path") == doc.original_path:
-                            try:
-                                doc.confirmed_date = date.fromisoformat(pd["detected_date"])
-                                doc.confirmed_method = pd.get("method", "auto")
-                                doc.status = "confirmed"
-                                if pd.get("modified_path"):
-                                    doc.original_path = pd["modified_path"]
-                                doc.blank_pages = pd.get("blank_pages", [])
-                                doc.docsep_pages = pd.get("docsep_pages", [])
-                            except (ValueError, KeyError):
-                                pass
-                            break
+                    pd = passed_lookup.get(_norm(doc.original_path))
+                    if pd:
+                        matched_doc_paths.add(_norm(doc.original_path))
+                        try:
+                            doc.confirmed_date = date.fromisoformat(pd["detected_date"])
+                            doc.confirmed_method = pd.get("method", "auto")
+                            doc.status = "confirmed"
+                            if pd.get("modified_path"):
+                                doc.original_path = pd["modified_path"]
+                            doc.blank_pages = pd.get("blank_pages", [])
+                            doc.docsep_pages = pd.get("docsep_pages", [])
+                        except (ValueError, KeyError):
+                            pass
+
+            unmatched_passed = [pd.get("original_path") for pd in self.passed_docs
+                                if _norm(pd.get("original_path")) not in matched_doc_paths]
+            if unmatched_passed:
+                print(f"[Finalize] WARNING: {len(unmatched_passed)}/{len(self.passed_docs)} "
+                      f"passed docs did not match any parsed batch doc:")
+                for p in unmatched_passed:
+                    print("   MISSING MATCH:", p)
 
             flagged_data = load_flagged_index(pipeline_config)
+            flagged_lookup = {_norm(fd.get("original_path")): fd for fd in flagged_data if fd.get("original_path")}
             for batch in batches:
                 for doc in batch.documents:
-                    for fd in flagged_data:
-                        if fd.get("original_path") == doc.original_path:
-                            update_document_from_review(doc, fd)
-                            break
+                    fd = flagged_lookup.get(_norm(doc.original_path))
+                    if fd:
+                        update_document_from_review(doc, fd)
 
             finalize_all_divisions(batches, pipeline_config)
 
             save_confirmed_documents(batches, pipeline_config)
-
-            if self.document_modified and self.current_pdf_doc and self.active_index >= 0:
-                if self.active_list == "pending":
-                    cur_orig = self.pending_docs[self.active_index].get("original_path", "")
-                else:
-                    cur_orig = self.passed_docs[self.active_index].get("original_path", "")
-                if cur_orig:
-                    for batch in batches:
-                        for d in batch.documents:
-                            if d.original_path == cur_orig:
-                                out = Path(pipeline_config.output_root) / batch.division_code / d.company_name / d.original_filename
-                                import tempfile
-                                tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-                                self.current_pdf_doc.save(tmp.name, incremental=False, garbage=4, deflate=True)
-                                tmp.close()
-                                shutil.move(tmp.name, str(out))
-                                break
 
             for fname in ("passed_index.json", "flagged_index.json"):
                 p = Path(self.config["flagged_root"]) / fname
