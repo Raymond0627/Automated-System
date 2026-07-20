@@ -247,7 +247,7 @@ def score_candidate(candidate: DateCandidate, uniqueness_bonus: float) -> float:
     return score
 
 
-def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract") -> DateResult:
+def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150) -> DateResult:
     all_candidates = []
     raw_texts = []
     method = f"{engine}_heuristic"
@@ -261,7 +261,7 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
         num_pages = 1
 
     for page_idx in range(num_pages):
-        img = pdf_to_image(pdf_path, page_idx, dpi=200)
+        img = pdf_to_image(pdf_path, page_idx, dpi=dpi)
         if img is None:
             continue
 

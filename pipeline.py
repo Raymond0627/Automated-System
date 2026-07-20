@@ -62,6 +62,9 @@ class PipelineConfig:
         self.qc_mirror_threshold = 15
         self.enable_docsep_removal = True
         self.enable_blank_removal = True
+        self.rename_enabled = True
+        self.audit_enabled = True
+        self.render_dpi = 150
         
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.flagged_root.mkdir(parents=True, exist_ok=True)
@@ -510,6 +513,7 @@ if __name__ == "__main__":
         config.qc_blank_threshold = cfg.get("qc_blank_threshold", 1.5)
         config.qc_rotation_threshold = cfg.get("qc_rotation_threshold", 65)
         config.qc_mirror_threshold = cfg.get("qc_mirror_threshold", 15)
+        config.render_dpi = cfg.get("render_dpi", 150)
     else:
         import argparse
         

@@ -79,6 +79,9 @@ class MainWindow(QMainWindow):
             "qc_blank_threshold": 1.5,
             "qc_rotation_threshold": 65,
             "qc_mirror_threshold": 15,
+            "rename_enabled": True,
+            "audit_enabled": True,
+            "render_dpi": 150,
         }
         if Path(self.config_path).exists():
             try:

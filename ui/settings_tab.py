@@ -49,6 +49,13 @@ class SettingsTab(QWidget):
         self.ocr_combo.setFixedWidth(120)
         settings_layout.addRow("OCR Engine:", self.ocr_combo)
 
+        self.dpi_spin = QSpinBox()
+        self.dpi_spin.setRange(72, 600)
+        self.dpi_spin.setSingleStep(10)
+        self.dpi_spin.setValue(self.config.get("render_dpi", 150))
+        self.dpi_spin.setFixedWidth(120)
+        settings_layout.addRow("Render DPI (72-600):", self.dpi_spin)
+
         layout.addWidget(settings_group)
 
         self.save_btn = QPushButton("Save Settings")
@@ -126,6 +133,7 @@ class SettingsTab(QWidget):
         self.config["page_index"] = self.page_spin.value()
         self.config["earliest_year"] = self.year_spin.value()
         self.config["ocr_engine"] = self.ocr_combo.currentText()
+        self.config["render_dpi"] = self.dpi_spin.value()
         self.config["enable_qc"] = self.enable_qc_check.isChecked()
         self.config["enable_docsep_removal"] = self.enable_docsep.isChecked()
         self.config["enable_blank_removal"] = self.enable_blank_rm.isChecked()

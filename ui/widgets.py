@@ -48,8 +48,14 @@ class PipelineThread(QThread):
                 earliest_year=self.config["earliest_year"],
                 ocr_engine=self.config.get("ocr_engine", "tesseract"),
             )
+            pipeline_config.enable_docsep_removal = self.config.get("enable_docsep_removal", True)
+            pipeline_config.enable_blank_removal = self.config.get("enable_blank_removal", True)
+            pipeline_config.rename_enabled = self.config.get("rename_enabled", True)
+            pipeline_config.audit_enabled = self.config.get("audit_enabled", True)
 
             flagged_root = Path(self.config["flagged_root"])
+            render_dpi = self.config.get("render_dpi", 150)
+            pipeline_config.render_dpi = render_dpi
             flagged_root.mkdir(parents=True, exist_ok=True)
             for f in ["flagged_index.json", "passed_index.json"]:
                 p = flagged_root / f
@@ -82,7 +88,7 @@ class PipelineThread(QThread):
                         docsep_msg = ""
                         if self.config.get("enable_docsep_removal", True):
                             try:
-                                ds_result = detect_docsep_flag(doc.original_path)
+                                ds_result = detect_docsep_flag(doc.original_path, dpi=render_dpi)
                                 doc.docsep_pages = ds_result.get("docsep_pages", [])
                                 if doc.docsep_pages:
                                     docsep_msg = f" | docsep:{len(doc.docsep_pages)}"
@@ -90,7 +96,7 @@ class PipelineThread(QThread):
                             except Exception:
                                 pass
 
-                        result = extract_document_date(doc.original_path, pipeline_config.page_index)
+                        result = extract_document_date(doc.original_path, pipeline_config.page_index, dpi=render_dpi)
                         doc.date_result = result
                         doc.blank_pages = list(result.blank_pages or [])
 
@@ -102,7 +108,7 @@ class PipelineThread(QThread):
                                     if blank_pg >= len(pdf_for_ocr):
                                         continue
                                     pg = pdf_for_ocr[blank_pg]
-                                    pix = pg.get_pixmap(dpi=200)
+                                    pix = pg.get_pixmap(dpi=render_dpi)
                                     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
                                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                                     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -132,6 +138,7 @@ class PipelineThread(QThread):
                                     blank_threshold=self.config.get("qc_blank_threshold", 1.5),
                                     rotation_threshold=self.config.get("qc_rotation_threshold", 65),
                                     mirror_threshold=self.config.get("qc_mirror_threshold", 15),
+                                    dpi=render_dpi,
                                 )
                             except Exception:
                                 pass

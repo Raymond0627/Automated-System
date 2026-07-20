@@ -48,7 +48,7 @@ def check_rotation(page_img: np.ndarray, confidence_threshold: float = ROTATION_
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(denoised)
     h, w = enhanced.shape
-    upscaled = cv2.resize(enhanced, (int(w * 1.5), int(h * 1.5)), interpolation=cv2.INTER_CUBIC)
+    upscaled = cv2.resize(enhanced, (int(w * 1.2), int(h * 1.2)), interpolation=cv2.INTER_LINEAR)
 
     try:
         osd = pytesseract.image_to_osd(upscaled, output_type=pytesseract.Output.DICT)
@@ -168,7 +168,7 @@ def detect_docsep_page(page_img: np.ndarray) -> Dict:
     return {"is_docsep": False, "confidence": 0.0, "matched_text": ""}
 
 
-def detect_docsep_flag(pdf_path: str) -> Dict:
+def detect_docsep_flag(pdf_path: str, dpi: int = 150) -> Dict:
     """
     Detect DOCSEP separator pages in a PDF without modifying the file.
     Returns {docsep_pages: List[int], count: int, confidence: float, reason: str}
@@ -180,7 +180,7 @@ def detect_docsep_flag(pdf_path: str) -> Dict:
     confidence = 0.0
 
     if total > 0:
-        pix = doc[0].get_pixmap(dpi=200)
+        pix = doc[0].get_pixmap(dpi=dpi)
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         result = detect_docsep_page(img)
@@ -197,7 +197,7 @@ def detect_docsep_flag(pdf_path: str) -> Dict:
     }
 
 
-def remove_docsep_pages(pdf_path: str, output_dir: str) -> Dict:
+def remove_docsep_pages(pdf_path: str, output_dir: str, dpi: int = 150) -> Dict:
     """
     Open a PDF, detect and remove DOCSEP separator page from first page position.
     Saves cleaned PDF to output_dir and returns details.
@@ -210,7 +210,7 @@ def remove_docsep_pages(pdf_path: str, output_dir: str) -> Dict:
 
     # Check first page
     if total > 0:
-        pix = doc[0].get_pixmap(dpi=200)
+        pix = doc[0].get_pixmap(dpi=dpi)
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         result = detect_docsep_page(img)
@@ -280,6 +280,7 @@ def run_qc_on_pdf(
     rotation_threshold: float = ROTATION_CONFIDENCE_THRESHOLD,
     mirror_threshold: float = MIRROR_CONFIDENCE_DELTA_THRESHOLD,
     max_pages: int = 3,
+    dpi: int = 150,
 ) -> Dict:
     """
     Run QC on a PDF file. Processes up to `max_pages` pages (cheapest to scan all,
@@ -306,7 +307,7 @@ def run_qc_on_pdf(
 
     for pn in range(pages_to_check):
         page = doc[pn]
-        pix = page.get_pixmap(dpi=150)
+        pix = page.get_pixmap(dpi=dpi)
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
