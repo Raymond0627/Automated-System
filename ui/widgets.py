@@ -34,7 +34,6 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
         "blank_pages": [],
         "docsep_pages": [],
         "total_pages": 0,
-        "date_result": None,
     }
 
     try:
@@ -57,14 +56,6 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
         page_index = config.get("page_index", 0)
         date_result = extract_document_date(original_path, page_index, dpi=render_dpi)
         result["blank_pages"] = list(date_result.blank_pages or [])
-        result["date_result"] = {
-            "date": date_result.date.isoformat() if date_result.date else None,
-            "confidence": date_result.confidence,
-            "method": date_result.method,
-            "raw_ocr_text": date_result.raw_ocr_text,
-            "blank_pages": list(date_result.blank_pages or []),
-            "all_blank": date_result.all_blank,
-        }
 
         total_pages = 0
         if result["blank_pages"]:
@@ -306,28 +297,6 @@ class PipelineThread(QThread):
                     docsep_pages = worker_result.get("docsep_pages", [])
                     total_pages = worker_result.get("total_pages", 0)
 
-                    dr_dict = worker_result.get("date_result")
-                    date_obj = None
-                    all_blank = False
-                    confidence = 0
-                    method = ""
-                    raw_ocr_text = ""
-                    if dr_dict:
-                        if dr_dict.get("date"):
-                            date_obj = _date.fromisoformat(dr_dict["date"])
-                        all_blank = dr_dict.get("all_blank", False)
-                        confidence = dr_dict.get("confidence", 0)
-                        method = dr_dict.get("method", "")
-                        raw_ocr_text = dr_dict.get("raw_ocr_text", "")
-
-                    doc.date_result = DateResult(
-                        date=date_obj,
-                        confidence=confidence,
-                        method=method,
-                        raw_ocr_text=raw_ocr_text,
-                        blank_pages=blank_pages,
-                        all_blank=all_blank,
-                    )
                     doc.blank_pages = list(blank_pages)
                     doc.docsep_pages = list(docsep_pages)
                     doc.status = worker_result["status"]
@@ -337,8 +306,7 @@ class PipelineThread(QThread):
                         self.doc_processed.emit("pending", worker_result["flagged_data"])
                     elif worker_result["status"] == "confirmed" and worker_result.get("passed_data"):
                         passed_data = worker_result["passed_data"]
-                        if passed_data.get("detected_date"):
-                            doc.confirmed_date = _date.fromisoformat(passed_data["detected_date"])
+                        doc.confirmed_date = passed_data.get("detected_date")
                         doc.confirmed_method = passed_data.get("method", "auto")
                         doc.flagged_data = None
                         self.doc_processed.emit("passed", passed_data)
