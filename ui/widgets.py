@@ -7,17 +7,194 @@ import cv2
 import fitz
 from pathlib import Path
 from typing import Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date as _date
 
 from PyQt6.QtWidgets import QWidget, QFrame, QHBoxLayout, QVBoxLayout, QLabel
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
 from PyQt6.QtGui import QFont, QColor
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from date_extractor import extract_document_date
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+from paths import BASE_DIR
+from date_extractor import extract_document_date, DateResult
 from pipeline import PipelineConfig, parse_folder_structure, save_confirmed_documents
 from auto_qc import run_qc_on_pdf, detect_docsep_flag
 
 import pytesseract
+
+
+def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
+    """Process a single document in a worker thread. Returns result dict."""
+    result = {
+        "status": "error",
+        "flagged_data": None,
+        "passed_data": None,
+        "log_messages": [],
+        "blank_pages": [],
+        "docsep_pages": [],
+        "total_pages": 0,
+        "date_result": None,
+    }
+
+    try:
+        original_path = doc_info["original_path"]
+        original_filename = doc_info["original_filename"]
+        division_code = doc_info["division_code"]
+        company_name = doc_info["company_name"]
+
+        docsep_msg = ""
+        if config.get("enable_docsep_removal", True):
+            try:
+                ds_result = detect_docsep_flag(original_path, dpi=render_dpi)
+                result["docsep_pages"] = ds_result.get("docsep_pages", [])
+                if result["docsep_pages"]:
+                    docsep_msg = f" | docsep:{len(result['docsep_pages'])}"
+                    result["log_messages"].append(f"[DOCSEP] {original_filename}: separator page(s) detected at index {result['docsep_pages']}")
+            except Exception:
+                pass
+
+        page_index = config.get("page_index", 0)
+        date_result = extract_document_date(original_path, page_index, dpi=render_dpi)
+        result["blank_pages"] = list(date_result.blank_pages or [])
+        result["date_result"] = {
+            "date": date_result.date.isoformat() if date_result.date else None,
+            "confidence": date_result.confidence,
+            "method": date_result.method,
+            "raw_ocr_text": date_result.raw_ocr_text,
+            "blank_pages": list(date_result.blank_pages or []),
+            "all_blank": date_result.all_blank,
+        }
+
+        total_pages = 0
+        if result["blank_pages"]:
+            try:
+                pdf_for_ocr = fitz.open(original_path)
+                total_pages = len(pdf_for_ocr)
+                for blank_pg in list(result["blank_pages"]):
+                    if blank_pg >= len(pdf_for_ocr):
+                        continue
+                    pg = pdf_for_ocr[blank_pg]
+                    pix = pg.get_pixmap(dpi=render_dpi)
+                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    text = pytesseract.image_to_string(gray, config='--psm 6').strip()
+                    words = [w for w in text.split() if len(w) >= 2]
+                    if len(words) >= 2:
+                        result["blank_pages"].remove(blank_pg)
+                        result["log_messages"].append(f"[BLANK-OCR] {original_filename} p{blank_pg+1}: {len(words)} words found - NOT blank")
+                    else:
+                        result["log_messages"].append(f"[BLANK-OCR] {original_filename} p{blank_pg+1}: {len(words)} word(s) - confirmed blank")
+                pdf_for_ocr.close()
+            except Exception:
+                pass
+
+        result["total_pages"] = total_pages
+
+        qc_result = None
+        if config.get("enable_qc", True) and not date_result.all_blank:
+            try:
+                gpu_mode = config.get("gpu_mode", "cpu")
+                use_gpu = gpu_mode == "local_gpu"
+                if gpu_mode == "remote":
+                    from auto_qc import set_remote_gpu_url
+                    set_remote_gpu_url(config.get("remote_gpu_url", ""))
+                qc_result = run_qc_on_pdf(
+                    original_path,
+                    blank_threshold=config.get("qc_blank_threshold", 1.5),
+                    rotation_threshold=config.get("qc_rotation_threshold", 65),
+                    mirror_threshold=config.get("qc_mirror_threshold", 15),
+                    dpi=render_dpi,
+                    use_gpu=use_gpu,
+                    gpu_mode=gpu_mode,
+                )
+            except Exception:
+                pass
+
+        qc_failed = qc_result and qc_result.get("qc_status") in ("failed", "needs_review")
+        qc_str = ""
+        if qc_result:
+            if qc_failed:
+                reasons = qc_result.get("qc_failure_reasons", "unknown")
+                qc_str = f" | QC:FAIL({reasons})"
+            else:
+                qc_str = " | QC:Passed"
+
+        blank_str = f" | {len(result['blank_pages'])}/{total_pages} blank" if result["blank_pages"] else ""
+
+        if date_result.all_blank:
+            result["status"] = "flagged"
+            result["flagged_data"] = {
+                "original_path": original_path,
+                "division_code": division_code,
+                "company_name": company_name,
+                "original_filename": original_filename,
+                "error": "Document is entirely blank",
+                "blank_pages": result["blank_pages"],
+                "all_blank": True,
+                "docsep_pages": result["docsep_pages"],
+            }
+            if qc_result:
+                result["flagged_data"]["qc"] = qc_result
+            result["log_messages"].append(f"[BLANK] {original_filename}: ALL BLANK ({total_pages} pages){qc_str}{docsep_msg}")
+        elif date_result.confidence >= config.get("confidence_threshold", 70) and date_result.date:
+            if qc_failed:
+                result["status"] = "flagged"
+                result["flagged_data"] = {
+                    "original_path": original_path,
+                    "division_code": division_code,
+                    "company_name": company_name,
+                    "original_filename": original_filename,
+                    "best_guess_date": date_result.date.isoformat() if date_result.date else None,
+                    "confidence": date_result.confidence,
+                    "method": date_result.method,
+                    "raw_ocr_text": date_result.raw_ocr_text,
+                    "blank_pages": result["blank_pages"],
+                    "docsep_pages": result["docsep_pages"],
+                }
+                if qc_result:
+                    result["flagged_data"]["qc"] = qc_result
+                result["log_messages"].append(f"[FLAGGED] {original_filename} ({date_result.confidence}%){blank_str}{qc_str}{docsep_msg}")
+            else:
+                result["status"] = "confirmed"
+                result["passed_data"] = {
+                    "original_path": original_path,
+                    "division_code": division_code,
+                    "company_name": company_name,
+                    "original_filename": original_filename,
+                    "detected_date": date_result.date.isoformat(),
+                    "confidence": date_result.confidence,
+                    "method": "auto",
+                    "blank_pages": result["blank_pages"],
+                    "docsep_pages": result["docsep_pages"],
+                }
+                if qc_result:
+                    result["passed_data"]["qc_status"] = qc_result.get("qc_status", "")
+                    result["passed_data"]["qc_failure_reasons"] = qc_result.get("qc_failure_reasons", "")
+                result["log_messages"].append(f"[AUTO] {original_filename} -> {date_result.date} ({date_result.confidence}%){blank_str}{qc_str}{docsep_msg}")
+        else:
+            result["status"] = "flagged"
+            result["flagged_data"] = {
+                "original_path": original_path,
+                "division_code": division_code,
+                "company_name": company_name,
+                "original_filename": original_filename,
+                "best_guess_date": date_result.date.isoformat() if date_result.date else None,
+                "confidence": date_result.confidence,
+                "method": date_result.method,
+                "raw_ocr_text": date_result.raw_ocr_text,
+                "blank_pages": result["blank_pages"],
+                "docsep_pages": result["docsep_pages"],
+            }
+            if qc_result:
+                result["flagged_data"]["qc"] = qc_result
+            result["log_messages"].append(f"[FLAGGED] {original_filename} ({date_result.confidence}%){blank_str}{qc_str}{docsep_msg}")
+    except Exception as e:
+        result["status"] = "error"
+        result["log_messages"].append(f"[ERROR] {doc_info['original_filename']}: {e}")
+
+    return result
 
 
 class PipelineThread(QThread):
@@ -53,9 +230,11 @@ class PipelineThread(QThread):
             pipeline_config.rename_enabled = self.config.get("rename_enabled", True)
             pipeline_config.audit_enabled = self.config.get("audit_enabled", True)
 
-            flagged_root = Path(self.config["flagged_root"])
             render_dpi = self.config.get("render_dpi", 150)
             pipeline_config.render_dpi = render_dpi
+            max_workers = self.config.get("max_workers", 4)
+
+            flagged_root = Path(self.config["flagged_root"])
             flagged_root.mkdir(parents=True, exist_ok=True)
             for f in ["flagged_index.json", "passed_index.json"]:
                 p = flagged_root / f
@@ -77,167 +256,96 @@ class PipelineThread(QThread):
             else:
                 self.log_message.emit(f"Found {total} PDFs in {len(batches)} divisions")
 
-            processed = 0
-            start_time = time.time()
+            doc_infos = []
             for batch in batches:
                 for doc in batch.documents:
                     if doc.status == "skipped":
                         continue
-                    try:
-                        # DOCSEP detection: tag separator pages (removal happens at finalize)
-                        docsep_msg = ""
-                        if self.config.get("enable_docsep_removal", True):
-                            try:
-                                ds_result = detect_docsep_flag(doc.original_path, dpi=render_dpi)
-                                doc.docsep_pages = ds_result.get("docsep_pages", [])
-                                if doc.docsep_pages:
-                                    docsep_msg = f" | docsep:{len(doc.docsep_pages)}"
-                                    self.log_message.emit(f"[DOCSEP] {doc.original_filename}: separator page(s) detected at index {doc.docsep_pages}")
-                            except Exception:
-                                pass
+                    doc_infos.append({
+                        "original_path": doc.original_path,
+                        "original_filename": doc.original_filename,
+                        "division_code": doc.division_code,
+                        "company_name": doc.company_name,
+                        "_batch": batch,
+                        "_doc": doc,
+                    })
 
-                        result = extract_document_date(doc.original_path, pipeline_config.page_index, dpi=render_dpi)
-                        doc.date_result = result
-                        doc.blank_pages = list(result.blank_pages or [])
+            processed = 0
+            start_time = time.time()
+            results_by_path = {}
 
-                        # Layer 3: OCR text check — re-check blank-flagged pages with Tesseract
-                        if doc.blank_pages:
-                            try:
-                                pdf_for_ocr = fitz.open(doc.original_path)
-                                for blank_pg in list(doc.blank_pages):
-                                    if blank_pg >= len(pdf_for_ocr):
-                                        continue
-                                    pg = pdf_for_ocr[blank_pg]
-                                    pix = pg.get_pixmap(dpi=render_dpi)
-                                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-                                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-                                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                                    text = pytesseract.image_to_string(gray, config='--psm 6').strip()
-                                    words = [w for w in text.split() if len(w) >= 2]
-                                    if len(words) >= 2:
-                                        doc.blank_pages.remove(blank_pg)
-                                        self.log_message.emit(f"[BLANK-OCR] {doc.original_filename} p{blank_pg+1}: {len(words)} words found — NOT blank")
-                                    else:
-                                        self.log_message.emit(f"[BLANK-OCR] {doc.original_filename} p{blank_pg+1}: {len(words)} word(s) — confirmed blank")
-                                pdf_for_ocr.close()
-                            except Exception:
-                                pass
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_info = {}
+                for info in doc_infos:
+                    future = executor.submit(_process_doc_worker, info, self.config, render_dpi)
+                    future_to_info[future] = info
 
-                        try:
-                            doc_file = fitz.open(doc.original_path)
-                            total_pages = len(doc_file)
-                            doc_file.close()
-                        except Exception:
-                            total_pages = len(doc.blank_pages) + 1
-
-                        qc_result = None
-                        if self.config.get("enable_qc", True) and not result.all_blank:
-                            try:
-                                qc_result = run_qc_on_pdf(
-                                    doc.original_path,
-                                    blank_threshold=self.config.get("qc_blank_threshold", 1.5),
-                                    rotation_threshold=self.config.get("qc_rotation_threshold", 65),
-                                    mirror_threshold=self.config.get("qc_mirror_threshold", 15),
-                                    dpi=render_dpi,
-                                )
-                            except Exception:
-                                pass
-
-                        qc_failed = qc_result and qc_result.get("qc_status") in ("failed", "needs_review")
-                        qc_str = ""
-                        if qc_result:
-                            if qc_failed:
-                                reasons = qc_result.get("qc_failure_reasons", "unknown")
-                                qc_str = f" | QC:FAIL({reasons})"
-                            else:
-                                qc_str = " | QC:Passed"
-
-                        if result.all_blank:
-                            doc.status = "flagged"
-                            doc.flagged_data = {
-                                "original_path": doc.original_path,
-                                "division_code": doc.division_code,
-                                "company_name": doc.company_name,
-                                "original_filename": doc.original_filename,
-                                "error": "Document is entirely blank",
-                                "blank_pages": doc.blank_pages,
-                                "all_blank": True,
-                                "docsep_pages": doc.docsep_pages,
-                            }
-                            if qc_result:
-                                doc.flagged_data["qc"] = qc_result
-                            self.log_message.emit(f"[BLANK] {doc.original_filename}: ALL BLANK ({total_pages} pages){qc_str}{docsep_msg}")
-                            self.doc_processed.emit("pending", doc.flagged_data)
-                        elif result.confidence >= pipeline_config.confidence_threshold and result.date:
-                            blank_str = f" | {len(doc.blank_pages)}/{total_pages} blank" if doc.blank_pages else ""
-                            if qc_failed:
-                                doc.status = "flagged"
-                                doc.flagged_data = {
-                                    "original_path": doc.original_path,
-                                    "division_code": doc.division_code,
-                                    "company_name": doc.company_name,
-                                    "original_filename": doc.original_filename,
-                                    "best_guess_date": result.date.isoformat() if result.date else None,
-                                    "confidence": result.confidence,
-                                    "method": result.method,
-                                    "raw_ocr_text": result.raw_ocr_text,
-                                    "blank_pages": doc.blank_pages,
-                                    "docsep_pages": doc.docsep_pages,
-                                }
-                                if qc_result:
-                                    doc.flagged_data["qc"] = qc_result
-                                self.log_message.emit(f"[FLAGGED] {doc.original_filename} ({result.confidence}%){blank_str}{qc_str}{docsep_msg}")
-                                self.doc_processed.emit("pending", doc.flagged_data)
-                            else:
-                                doc.confirmed_date = result.date
-                                doc.confirmed_method = "auto"
-                                doc.status = "confirmed"
-                                passed_data = {
-                                    "original_path": doc.original_path,
-                                    "division_code": doc.division_code,
-                                    "company_name": doc.company_name,
-                                    "original_filename": doc.original_filename,
-                                    "detected_date": doc.confirmed_date.isoformat(),
-                                    "confidence": result.confidence,
-                                    "method": doc.confirmed_method,
-                                    "blank_pages": doc.blank_pages,
-                                    "docsep_pages": doc.docsep_pages,
-                                }
-                                if qc_result:
-                                    passed_data["qc_status"] = qc_result.get("qc_status", "")
-                                    passed_data["qc_failure_reasons"] = qc_result.get("qc_failure_reasons", "")
-                                self.log_message.emit(f"[AUTO] {doc.original_filename} -> {result.date} ({result.confidence}%){blank_str}{qc_str}{docsep_msg}")
-                                self.doc_processed.emit("passed", passed_data)
-                        else:
-                            doc.status = "flagged"
-                            doc.flagged_data = {
-                                "original_path": doc.original_path,
-                                "division_code": doc.division_code,
-                                "company_name": doc.company_name,
-                                "original_filename": doc.original_filename,
-                                "best_guess_date": result.date.isoformat() if result.date else None,
-                                "confidence": result.confidence,
-                                "method": result.method,
-                                "raw_ocr_text": result.raw_ocr_text,
-                                "blank_pages": doc.blank_pages,
-                                "docsep_pages": doc.docsep_pages,
-                            }
-                            if qc_result:
-                                doc.flagged_data["qc"] = qc_result
-                            blank_str = f" | {len(doc.blank_pages)}/{total_pages} blank" if doc.blank_pages else ""
-                            self.log_message.emit(f"[FLAGGED] {doc.original_filename} ({result.confidence}%){blank_str}{qc_str}{docsep_msg}")
-                            self.doc_processed.emit("pending", doc.flagged_data)
-                    except Exception as e:
-                        doc.status = "error"
-                        self.log_message.emit(f"[ERROR] {doc.original_filename}: {e}")
-
-                    processed += 1
+                for future in as_completed(future_to_info):
                     if self._cancelled:
                         self.log_message.emit("--- Pipeline Cancelled ---")
                         self.progress.emit("Cancelled", 0)
                         self.finished_signal.emit([])
+                        executor.shutdown(wait=False, cancel_futures=True)
                         return
 
+                    info = future_to_info[future]
+                    try:
+                        worker_result = future.result()
+                    except Exception as e:
+                        worker_result = {"status": "error", "log_messages": [f"[ERROR] {info['original_filename']}: {e}"]}
+
+                    doc = info["_doc"]
+                    batch = info["_batch"]
+
+                    results_by_path[info["original_path"]] = worker_result
+
+                    for msg in worker_result.get("log_messages", []):
+                        self.log_message.emit(msg)
+
+                    blank_pages = worker_result.get("blank_pages", [])
+                    docsep_pages = worker_result.get("docsep_pages", [])
+                    total_pages = worker_result.get("total_pages", 0)
+
+                    dr_dict = worker_result.get("date_result")
+                    date_obj = None
+                    all_blank = False
+                    confidence = 0
+                    method = ""
+                    raw_ocr_text = ""
+                    if dr_dict:
+                        if dr_dict.get("date"):
+                            date_obj = _date.fromisoformat(dr_dict["date"])
+                        all_blank = dr_dict.get("all_blank", False)
+                        confidence = dr_dict.get("confidence", 0)
+                        method = dr_dict.get("method", "")
+                        raw_ocr_text = dr_dict.get("raw_ocr_text", "")
+
+                    doc.date_result = DateResult(
+                        date=date_obj,
+                        confidence=confidence,
+                        method=method,
+                        raw_ocr_text=raw_ocr_text,
+                        blank_pages=blank_pages,
+                        all_blank=all_blank,
+                    )
+                    doc.blank_pages = list(blank_pages)
+                    doc.docsep_pages = list(docsep_pages)
+                    doc.status = worker_result["status"]
+
+                    if worker_result["status"] == "flagged" and worker_result.get("flagged_data"):
+                        doc.flagged_data = worker_result["flagged_data"]
+                        self.doc_processed.emit("pending", worker_result["flagged_data"])
+                    elif worker_result["status"] == "confirmed" and worker_result.get("passed_data"):
+                        passed_data = worker_result["passed_data"]
+                        if passed_data.get("detected_date"):
+                            doc.confirmed_date = _date.fromisoformat(passed_data["detected_date"])
+                        doc.confirmed_method = passed_data.get("method", "auto")
+                        doc.flagged_data = None
+                        self.doc_processed.emit("passed", passed_data)
+                    else:
+                        doc.flagged_data = None
+
+                    processed += 1
                     elapsed = time.time() - start_time
                     avg_per = elapsed / max(1, processed)
                     remaining = avg_per * (total - processed)

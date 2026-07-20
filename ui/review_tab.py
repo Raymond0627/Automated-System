@@ -14,7 +14,9 @@ from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence
 
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+from paths import BASE_DIR
 from pipeline import (
     PipelineConfig, parse_folder_structure, load_flagged_index,
     update_document_from_review, finalize_all_divisions, save_confirmed_documents

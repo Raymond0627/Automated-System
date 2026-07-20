@@ -5,13 +5,16 @@ from pathlib import Path
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QColor, QFont, QIcon, QPalette
 
-sys.path.insert(0, str(Path(__file__).parent))
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).parent))
 
+from paths import BASE_DIR, configure_tesseract
 from ui.styles import DARK_THEME
 from ui.main_window import MainWindow
 
 
 def main():
+    configure_tesseract()
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_THEME)
     app.setFont(QFont("Segoe UI", 10))
@@ -32,7 +35,7 @@ def main():
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
     app.setPalette(palette)
 
-    icon_path = Path(__file__).parent / "Lumeed Logo.png"
+    icon_path = BASE_DIR / "Lumeed Logo.png"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
 

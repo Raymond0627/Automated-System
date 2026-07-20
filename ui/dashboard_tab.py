@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 from pathlib import Path
 from datetime import datetime
@@ -11,6 +12,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QPixmap
 
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+from paths import BASE_DIR
 from .widgets import PipelineThread
 
 
@@ -33,7 +37,7 @@ class DashboardTab(QWidget):
         layout.setContentsMargins(14, 10, 14, 10)
 
         header = QHBoxLayout()
-        logo_path = Path(__file__).parent.parent / "Lumeed Logo.png"
+        logo_path = BASE_DIR / "Lumeed Logo.png"
         if logo_path.exists():
             logo_label = QLabel()
             pixmap = QPixmap(str(logo_path))
@@ -179,8 +183,7 @@ class DashboardTab(QWidget):
             self._save_config()
 
     def _save_config(self):
-        base = Path(__file__).parent.parent
-        config_file = base / "config.json"
+        config_file = BASE_DIR / "config.json"
         with open(config_file, "w", encoding="utf-8") as f:
             json.dump(self.config, f, indent=2, ensure_ascii=False)
 

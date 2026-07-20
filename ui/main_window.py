@@ -8,7 +8,9 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+from paths import BASE_DIR
 from .styles import DARK_THEME
 from .dashboard_tab import DashboardTab
 from .review_tab import ReviewTab
@@ -18,7 +20,7 @@ from .settings_tab import SettingsTab
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.config_path = str(Path(__file__).parent.parent / "config.json")
+        self.config_path = str(BASE_DIR / "config.json")
         self.config = self._load_config()
         self._setup_ui()
 
@@ -27,7 +29,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1000, 700)
         self.resize(1200, 800)
 
-        icon_path = Path(__file__).parent.parent / "Lumeed Logo.png"
+        icon_path = BASE_DIR / "Lumeed Logo.png"
         if icon_path.exists():
             icon = QIcon(str(icon_path))
             self.setWindowIcon(icon)
@@ -82,6 +84,9 @@ class MainWindow(QMainWindow):
             "rename_enabled": True,
             "audit_enabled": True,
             "render_dpi": 150,
+            "max_workers": 4,
+            "gpu_mode": "cpu",
+            "remote_gpu_url": "",
         }
         if Path(self.config_path).exists():
             try:

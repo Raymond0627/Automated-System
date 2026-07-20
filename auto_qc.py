@@ -1,6 +1,8 @@
 import cv2
 import numpy as np
 import shutil
+import base64
+import json
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 
@@ -8,6 +10,42 @@ from pathlib import Path
 BLANK_INK_RATIO_THRESHOLD = 1.5       # % of ink pixels below which page is blank
 ROTATION_CONFIDENCE_THRESHOLD = 65    # OSD confidence % threshold
 MIRROR_CONFIDENCE_DELTA_THRESHOLD = 15  # % gap between normal vs flipped OCR scores
+
+# ---- PaddleOCR singleton cache ----
+_paddle_ocr_instance = None
+_paddle_gpu_mode = None
+_remote_gpu_url = ""
+
+
+def reset_paddle_cache():
+    global _paddle_ocr_instance, _paddle_gpu_mode
+    _paddle_ocr_instance = None
+    _paddle_gpu_mode = None
+
+
+def set_remote_gpu_url(url: str):
+    global _remote_gpu_url
+    _remote_gpu_url = url.rstrip("/")
+
+
+def remote_ocr(img: np.ndarray) -> float:
+    if not _remote_gpu_url:
+        return 0.0
+    try:
+        import urllib.request
+        _, buf = cv2.imencode('.png', img)
+        b64 = base64.b64encode(buf.tobytes()).decode('utf-8')
+        payload = json.dumps({"image": b64}).encode('utf-8')
+        req = urllib.request.Request(
+            f"{_remote_gpu_url}/ocr",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            return float(data.get("confidence", 0.0))
+    except Exception:
+        return 0.0
 
 
 def check_blank(page_img: np.ndarray, ink_threshold: float = BLANK_INK_RATIO_THRESHOLD) -> Dict:
@@ -70,6 +108,8 @@ def check_rotation(page_img: np.ndarray, confidence_threshold: float = ROTATION_
 def check_mirrored(
     page_img: np.ndarray,
     delta_threshold: float = MIRROR_CONFIDENCE_DELTA_THRESHOLD,
+    use_gpu: bool = False,
+    gpu_mode: str = "cpu",
 ) -> Dict:
     """
     Detect mirrored pages by comparing OCR confidence on original vs horizontally-flipped copy.
@@ -80,10 +120,14 @@ def check_mirrored(
     flipped = cv2.flip(page_img, 1)
 
     def _ocr_confidence(img: np.ndarray) -> float:
+        if gpu_mode == "remote":
+            return remote_ocr(img)
+        global _paddle_ocr_instance
         try:
             from paddleocr import PaddleOCR
-            ocr = PaddleOCR(use_angle_cls=False, lang="en", show_log=False, use_gpu=False)
-            result = ocr.ocr(img, cls=False)
+            if _paddle_ocr_instance is None:
+                _paddle_ocr_instance = PaddleOCR(use_angle_cls=False, lang="en", show_log=False, use_gpu=use_gpu)
+            result = _paddle_ocr_instance.ocr(img, cls=False)
             if result and result[0]:
                 scores = [line[1][1] for line in result[0] if line[1]]
                 return (sum(scores) / len(scores)) * 100 if scores else 0.0
@@ -118,11 +162,25 @@ def run_qc(
     blank_threshold: float = BLANK_INK_RATIO_THRESHOLD,
     rotation_threshold: float = ROTATION_CONFIDENCE_THRESHOLD,
     mirror_threshold: float = MIRROR_CONFIDENCE_DELTA_THRESHOLD,
+    use_gpu: bool = False,
+    gpu_mode: str = "cpu",
 ) -> Dict:
     """Run all QC checks on a single page image. Returns combined results dict."""
     blank = check_blank(page_img, blank_threshold)
+    if blank["is_blank"]:
+        return {
+            "blank_detected": True,
+            "blank_ink_ratio": blank["ink_ratio"],
+            "rotation_detected": "none",
+            "rotation_confidence": 100.0,
+            "mirrored_detected": False,
+            "mirror_delta": 0.0,
+            "mirror_needs_review": False,
+            "qc_status": "failed",
+            "qc_failure_reasons": f"blank: {blank['ink_ratio']}%",
+        }
     rotation = check_rotation(page_img, rotation_threshold)
-    mirrored = check_mirrored(page_img, mirror_threshold)
+    mirrored = check_mirrored(page_img, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode)
 
     failures = []
     if blank["is_blank"]:
@@ -279,17 +337,19 @@ def run_qc_on_pdf(
     blank_threshold: float = BLANK_INK_RATIO_THRESHOLD,
     rotation_threshold: float = ROTATION_CONFIDENCE_THRESHOLD,
     mirror_threshold: float = MIRROR_CONFIDENCE_DELTA_THRESHOLD,
-    max_pages: int = 3,
+    max_pages: int = 0,
     dpi: int = 150,
+    use_gpu: bool = False,
+    gpu_mode: str = "cpu",
 ) -> Dict:
     """
-    Run QC on a PDF file. Processes up to `max_pages` pages (cheapest to scan all,
-    but limit for speed). Returns aggregated QC results.
+    Run QC on a PDF file. Processes all pages (max_pages=0) or up to max_pages.
+    Returns aggregated QC results.
     """
     import fitz
     doc = fitz.open(pdf_path)
     total = len(doc)
-    pages_to_check = min(total, max_pages)
+    pages_to_check = total if max_pages == 0 else min(total, max_pages)
 
     agg = {
         "blank_detected": False,
@@ -311,7 +371,7 @@ def run_qc_on_pdf(
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-        result = run_qc(img, blank_threshold, rotation_threshold, mirror_threshold)
+        result = run_qc(img, blank_threshold, rotation_threshold, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode)
         if result["blank_detected"]:
             agg["blank_detected"] = True
         agg["blank_ink_ratio"] = max(agg["blank_ink_ratio"], result["blank_ink_ratio"])
