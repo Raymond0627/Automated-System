@@ -267,7 +267,7 @@ def save_confirmed_documents(batches: List[DivisionBatch], config: PipelineConfi
                     "division_code": doc.division_code,
                     "company_name": doc.company_name,
                     "original_filename": doc.original_filename,
-                    "detected_date": doc.confirmed_date.isoformat(),
+                    "detected_date": doc.confirmed_date.isoformat() if hasattr(doc.confirmed_date, 'isoformat') else str(doc.confirmed_date),
                     "confidence": doc.date_result.confidence if doc.date_result else 100,
                     "method": doc.confirmed_method,
                     "blank_pages": doc.blank_pages or [],
@@ -313,7 +313,10 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
         try:
             doc.sequence_number = i
 
-            yyyymm = doc.confirmed_date.strftime("%Y%m")
+            if hasattr(doc.confirmed_date, 'strftime'):
+                yyyymm = doc.confirmed_date.strftime("%Y%m")
+            else:
+                yyyymm = str(doc.confirmed_date)[:7].replace('-', '')
             seq = f"{i:04d}"
             div = doc.division_code
             company = sanitize_filename(doc.company_name)
@@ -369,7 +372,7 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
                 "new_path": str(output_path),
                 "division_code": doc.division_code,
                 "company_name": doc.company_name,
-                "document_date": doc.confirmed_date.isoformat(),
+                "document_date": doc.confirmed_date.isoformat() if hasattr(doc.confirmed_date, 'isoformat') else str(doc.confirmed_date),
                 "yyyymm": yyyymm,
                 "sequence_number": doc.sequence_number,
                 "confidence": doc.date_result.confidence if doc.date_result else 100,
@@ -391,7 +394,7 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
                     "new_path": "",
                     "division_code": doc.division_code,
                     "company_name": doc.company_name,
-                    "document_date": doc.confirmed_date.isoformat() if doc.confirmed_date else "",
+                    "document_date": doc.confirmed_date.isoformat() if hasattr(doc.confirmed_date, 'isoformat') else str(doc.confirmed_date) if doc.confirmed_date else "",
                     "yyyymm": "",
                     "sequence_number": doc.sequence_number,
                     "confidence": doc.date_result.confidence if doc.date_result else "",
