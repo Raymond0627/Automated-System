@@ -48,16 +48,27 @@ def remote_ocr(img: np.ndarray) -> float:
         return 0.0
 
 
-def check_blank(page_img: np.ndarray, ink_threshold: float = BLANK_INK_RATIO_THRESHOLD) -> Dict:
+def check_blank(page_img: np.ndarray, ink_threshold: float = BLANK_INK_RATIO_THRESHOLD, dpi: int = 150) -> Dict:
     """
     Detect blank pages using OpenCV:
-      grayscale -> median blur -> adaptive threshold (Gaussian) -> ink pixel ratio.
+      grayscale -> crop borders -> median blur -> adaptive threshold (Gaussian) -> ink pixel ratio.
+    Crops 15% from each edge to eliminate scanner bed artifacts.
     Returns {'is_blank': bool, 'ink_ratio': float, 'confidence': float}
     """
     gray = cv2.cvtColor(page_img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.medianBlur(gray, 5)
+    
+    # Crop 15% borders to eliminate scanner artifacts
+    h, w = gray.shape
+    margin_x = int(w * 0.15)
+    margin_y = int(h * 0.15)
+    cropped = gray[margin_y:h - margin_y, margin_x:w - margin_x]
+    
+    # Scale block size with DPI (base: 21 at 150 DPI)
+    block_size = max(3, int(21 * dpi / 150) | 1)  # ensure odd
+    
+    blurred = cv2.medianBlur(cropped, 5)
     binary = cv2.adaptiveThreshold(
-        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 4
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, block_size, 4
     )
     ink_pixels = np.count_nonzero(binary)
     total_pixels = binary.shape[0] * binary.shape[1]
@@ -119,9 +130,10 @@ def check_mirrored(
     """
     flipped = cv2.flip(page_img, 1)
 
-    def _ocr_confidence(img: np.ndarray) -> float:
+    def _ocr_confidence(img: np.ndarray) -> Tuple[float, int]:
+        """Returns (confidence_score, word_count)"""
         if gpu_mode == "remote":
-            return remote_ocr(img)
+            return remote_ocr(img), 0
         global _paddle_ocr_instance
         try:
             from paddleocr import PaddleOCR
@@ -130,20 +142,34 @@ def check_mirrored(
             result = _paddle_ocr_instance.ocr(img, cls=False)
             if result and result[0]:
                 scores = [line[1][1] for line in result[0] if line[1]]
-                return (sum(scores) / len(scores)) * 100 if scores else 0.0
+                word_count = len(result[0])
+                return (sum(scores) / len(scores)) * 100 if scores else 0.0, word_count
         except Exception:
             pass
         try:
             import pytesseract
             data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
             confs = [c for c in data["conf"] if c > 0]
-            return sum(confs) / len(confs) if confs else 0.0
+            return (sum(confs) / len(confs) if confs else 0.0), len(confs)
         except Exception:
-            return 0.0
+            return 0.0, 0
 
-    normal_conf = _ocr_confidence(page_img)
-    flipped_conf = _ocr_confidence(flipped)
+    normal_conf, normal_words = _ocr_confidence(page_img)
+    flipped_conf, flipped_words = _ocr_confidence(flipped)
     delta = flipped_conf - normal_conf
+
+    # Skip mirror detection if too few words (unreliable comparison)
+    min_words = 5
+    if normal_words < min_words and flipped_words < min_words:
+        return {
+            "is_mirrored": False,
+            "normal_confidence": round(normal_conf, 1),
+            "flipped_confidence": round(flipped_conf, 1),
+            "confidence_delta": round(delta, 1),
+            "needs_review": False,
+            "threshold": delta_threshold,
+            "skip_reason": f"insufficient_text ({normal_words}/{flipped_words} words)",
+        }
 
     is_mirrored = delta >= delta_threshold
     needs_review = 0 < delta < delta_threshold
@@ -164,9 +190,10 @@ def run_qc(
     mirror_threshold: float = MIRROR_CONFIDENCE_DELTA_THRESHOLD,
     use_gpu: bool = False,
     gpu_mode: str = "cpu",
+    dpi: int = 150,
 ) -> Dict:
     """Run all QC checks on a single page image. Returns combined results dict."""
-    blank = check_blank(page_img, blank_threshold)
+    blank = check_blank(page_img, blank_threshold, dpi=dpi)
     if blank["is_blank"]:
         return {
             "blank_detected": True,
@@ -189,9 +216,10 @@ def run_qc(
         failures.append(f"rotated: {rotation['angle']}deg ({rotation['confidence']}%)")
     if mirrored["is_mirrored"]:
         failures.append(f"mirrored: delta {mirrored['confidence_delta']}%")
-    if mirrored["needs_review"]:
-        failures.append(f"mirror: ambiguous ({mirrored['confidence_delta']}%)")
+    if mirrored.get("skip_reason"):
+        failures.append(f"mirror: skipped ({mirrored['skip_reason']})")
 
+    # Only "failed" blocks auto-confirm; "needs_review" is informational
     is_failure = blank["is_blank"] or rotation["is_rotated"] or mirrored["is_mirrored"]
     needs_review = mirrored["needs_review"]
     qc_status = "failed" if is_failure else ("needs_review" if needs_review else "passed")
@@ -371,7 +399,7 @@ def run_qc_on_pdf(
         img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-        result = run_qc(img, blank_threshold, rotation_threshold, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode)
+        result = run_qc(img, blank_threshold, rotation_threshold, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode, dpi=dpi)
         if result["blank_detected"]:
             agg["blank_detected"] = True
         agg["blank_ink_ratio"] = max(agg["blank_ink_ratio"], result["blank_ink_ratio"])

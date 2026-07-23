@@ -103,7 +103,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
             except Exception:
                 pass
 
-        qc_failed = qc_result and qc_result.get("qc_status") in ("failed", "needs_review")
+        qc_failed = qc_result and qc_result.get("qc_status") == "failed"
         qc_str = ""
         if qc_result:
             if qc_failed:

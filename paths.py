@@ -13,7 +13,9 @@ def configure_tesseract():
     if getattr(sys, 'frozen', False):
         bundled = BASE_DIR / "tesseract" / "tesseract.exe"
         if bundled.exists():
+            tesseract_dir = str(BASE_DIR / "tesseract")
             os.environ["TESSDATA_PREFIX"] = str(BASE_DIR / "tesseract" / "tessdata")
+            os.environ["PATH"] = tesseract_dir + ";" + os.environ.get("PATH", "")
             import pytesseract
             pytesseract.tesseract_cmd = str(bundled)
             return

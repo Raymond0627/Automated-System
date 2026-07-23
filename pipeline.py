@@ -172,9 +172,9 @@ def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> Non
                 doc.flagged_data = doc.flagged_data or {}
                 doc.flagged_data["blank_pages"] = result.blank_pages
             
-            # Determine if QC passes
+            # Determine if QC passes - only "failed" blocks auto-confirm
             qc_passed = True
-            if qc_result and qc_result.get("qc_status") in ("failed", "needs_review"):
+            if qc_result and qc_result.get("qc_status") == "failed":
                 qc_passed = False
             
             if result.confidence >= config.confidence_threshold and result.date:

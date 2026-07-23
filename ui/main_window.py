@@ -3,7 +3,8 @@ import sys
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QTabWidget, QWidget, QVBoxLayout, QLabel, QStatusBar
+    QMainWindow, QTabWidget, QWidget, QVBoxLayout, QLabel, QStatusBar,
+    QMessageBox
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon
@@ -23,6 +24,7 @@ class MainWindow(QMainWindow):
         self.config_path = str(BASE_DIR / "config.json")
         self.config = self._load_config()
         self._setup_ui()
+        self._check_first_run()
 
     def _setup_ui(self):
         self.setWindowTitle("Lumeed QScan")
@@ -98,3 +100,16 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, index):
         self.statusBar().showMessage(f"Tab: {self.tabs.tabText(index)}")
+
+    def _check_first_run(self):
+        input_root = self.config.get("input_root", "")
+        flagged_root = self.config.get("flagged_root", "")
+        if not input_root and not flagged_root:
+            QMessageBox.information(
+                self,
+                "Welcome — First Run Setup",
+                "Lumeed QScan needs file paths configured before use.\n\n"
+                "Please set your Input Root and Flagged Root folders\n"
+                "on the Dashboard tab, then click Save.",
+            )
+            self.tabs.setCurrentIndex(0)
