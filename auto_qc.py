@@ -203,24 +203,20 @@ def run_qc(
             "mirrored_detected": False,
             "mirror_delta": 0.0,
             "mirror_needs_review": False,
-            "qc_status": "failed",
-            "qc_failure_reasons": f"blank: {blank['ink_ratio']}%",
+            "qc_status": "passed",
+            "qc_failure_reasons": "",
         }
     rotation = check_rotation(page_img, rotation_threshold)
     mirrored = check_mirrored(page_img, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode)
 
     failures = []
-    if blank["is_blank"]:
-        failures.append(f"blank: {blank['ink_ratio']}%")
     if rotation["is_rotated"]:
         failures.append(f"rotated: {rotation['angle']}deg ({rotation['confidence']}%)")
     if mirrored["is_mirrored"]:
         failures.append(f"mirrored: delta {mirrored['confidence_delta']}%")
-    if mirrored.get("skip_reason"):
-        failures.append(f"mirror: skipped ({mirrored['skip_reason']})")
 
-    # Only "failed" blocks auto-confirm; "needs_review" is informational
-    is_failure = blank["is_blank"] or rotation["is_rotated"] or mirrored["is_mirrored"]
+    # Only rotation and mirror cause QC failure; blank is informational (handled separately)
+    is_failure = rotation["is_rotated"] or mirrored["is_mirrored"]
     needs_review = mirrored["needs_review"]
     qc_status = "failed" if is_failure else ("needs_review" if needs_review else "passed")
 
