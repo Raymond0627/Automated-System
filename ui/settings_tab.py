@@ -179,6 +179,50 @@ class SettingsTab(QWidget):
 
         layout.addWidget(qc_group)
 
+        enhance_group = QGroupBox("Image Enhancement")
+        enhance_outer = QVBoxLayout(enhance_group)
+        enhance_outer.setSpacing(8)
+
+        self.enhance_enable_check = QCheckBox("Enable Auto Enhancement (right-click on page)")
+        self.enhance_enable_check.setChecked(self.config.get("enhance_enabled", True))
+        enhance_outer.addWidget(self.enhance_enable_check)
+
+        enhance_cols = QHBoxLayout()
+        enhance_cols.setSpacing(30)
+
+        enhance_left = QFormLayout()
+        enhance_left.setSpacing(6)
+
+        self.enhance_dpi_spin = QSpinBox()
+        self.enhance_dpi_spin.setRange(0, 600)
+        self.enhance_dpi_spin.setSpecialValueText("Use pipeline default")
+        self.enhance_dpi_spin.setValue(self.config.get("enhance_dpi", 0))
+        self.enhance_dpi_spin.setFixedWidth(100)
+        enhance_left.addRow("DPI Override (0=default):", self.enhance_dpi_spin)
+
+        self.enhance_denoise_spin = QSpinBox()
+        self.enhance_denoise_spin.setRange(0, 20)
+        self.enhance_denoise_spin.setValue(self.config.get("enhance_denoise_strength", 5))
+        self.enhance_denoise_spin.setFixedWidth(100)
+        enhance_left.addRow("Denoise Strength (0-20):", self.enhance_denoise_spin)
+
+        enhance_right = QFormLayout()
+        enhance_right.setSpacing(6)
+
+        self.enhance_sharpen_spin = QDoubleSpinBox()
+        self.enhance_sharpen_spin.setRange(0.0, 2.0)
+        self.enhance_sharpen_spin.setSingleStep(0.1)
+        self.enhance_sharpen_spin.setDecimals(1)
+        self.enhance_sharpen_spin.setValue(self.config.get("enhance_sharpen_amount", 0.5))
+        self.enhance_sharpen_spin.setFixedWidth(100)
+        enhance_right.addRow("Sharpen Amount (0.0-2.0):", self.enhance_sharpen_spin)
+
+        enhance_cols.addLayout(enhance_left)
+        enhance_cols.addLayout(enhance_right)
+        enhance_outer.addLayout(enhance_cols)
+
+        layout.addWidget(enhance_group)
+
         layout.addSpacing(30)
 
         format_group = QGroupBox("Output Filename Format")
@@ -230,6 +274,10 @@ class SettingsTab(QWidget):
         self.config["qc_blank_threshold"] = self.qc_blank_spin.value()
         self.config["qc_rotation_threshold"] = self.qc_rotation_spin.value()
         self.config["qc_mirror_threshold"] = self.qc_mirror_spin.value()
+        self.config["enhance_enabled"] = self.enhance_enable_check.isChecked()
+        self.config["enhance_dpi"] = self.enhance_dpi_spin.value()
+        self.config["enhance_denoise_strength"] = self.enhance_denoise_spin.value()
+        self.config["enhance_sharpen_amount"] = self.enhance_sharpen_spin.value()
 
         gpu_text = self.gpu_combo.currentText()
         gpu_save_map = {"CPU Only": "cpu", "Local GPU (CUDA)": "local_gpu", "Remote GPU Server": "remote"}

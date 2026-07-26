@@ -21,6 +21,7 @@ from pipeline import (
     PipelineConfig, parse_folder_structure, load_flagged_index,
     update_document_from_review, finalize_all_divisions, save_confirmed_documents
 )
+from enhance import enhance_page
 
 from .widgets import DocCardWidget, PassedDocCardWidget
 
@@ -726,6 +727,10 @@ class ReviewTab(QWidget):
         flip_v.triggered.connect(lambda: self._flip_page(page_num, "v"))
         menu.addAction(flip_v)
         menu.addSeparator()
+        enhance_act = QAction("Auto Enhance Page", self)
+        enhance_act.triggered.connect(lambda: self._enhance_page(page_num))
+        menu.addAction(enhance_act)
+        menu.addSeparator()
         mark_blank = QAction("Mark as Blank Page", self)
         mark_blank.triggered.connect(lambda: self._mark_blank(page_num))
         menu.addAction(mark_blank)
@@ -797,7 +802,7 @@ class ReviewTab(QWidget):
             img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
             cv2.imwrite(tmp.name, img_rgb)
-            page.delete_contents()
+            page.draw_rect(page.rect, color=None, fill=(1, 1, 1))
             rect = page.rect
             img_pix = fitz.Pixmap(tmp.name)
             scale = min(rect.width / img_pix.width, rect.height / img_pix.height)
@@ -812,6 +817,19 @@ class ReviewTab(QWidget):
             self.render_preview()
         except Exception as e:
             QMessageBox.critical(self, "Flip Error", f"Failed to flip page:\n{e}")
+
+    def _enhance_page(self, page_num):
+        if not self.current_pdf_doc:
+            return
+        self._push_undo()
+        try:
+            page = self.current_pdf_doc[page_num]
+            dpi = self.config.get("render_dpi", 150)
+            enhance_page(page, dpi=dpi, config=self.config)
+            self.document_modified = True
+            self.render_preview()
+        except Exception as e:
+            QMessageBox.critical(self, "Enhance Error", f"Failed to enhance page:\n{e}")
 
     def _get_current_doc(self):
         if self.active_list == "pending" and self.active_index >= 0:

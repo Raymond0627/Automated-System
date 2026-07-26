@@ -89,6 +89,20 @@ class MainWindow(QMainWindow):
             "max_workers": 4,
             "gpu_mode": "cpu",
             "remote_gpu_url": "",
+            "enhance_enabled": True,
+            "enhance_dpi": 0,
+            "enhance_sat_threshold": 15,
+            "enhance_color_pct": 2.0,
+            "enhance_bw_clahe_clip": 2.0,
+            "enhance_bw_clahe_tile": 8,
+            "enhance_denoise_strength": 5,
+            "enhance_denoise_template": 7,
+            "enhance_denoise_search": 21,
+            "enhance_sharpen_amount": 0.5,
+            "enhance_sharpen_blur": 1.0,
+            "enhance_white_point": 98.0,
+            "enhance_color_clahe_clip": 2.0,
+            "enhance_color_clahe_tile": 8,
         }
         if Path(self.config_path).exists():
             try:

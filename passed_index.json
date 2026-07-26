@@ -1,0 +1,154 @@
+[
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(10).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(10).pdf",
+    "detected_date": "1986-01-27",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [],
+    "docsep_pages": [],
+    "final_filename": ""
+  },
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(11).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(11).pdf",
+    "detected_date": "1981-08-10",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [
+      2
+    ],
+    "docsep_pages": [
+      0
+    ],
+    "final_filename": ""
+  },
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(2).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(2).pdf",
+    "detected_date": "1993-08-20",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [
+      2,
+      5
+    ],
+    "docsep_pages": [
+      0
+    ],
+    "final_filename": ""
+  },
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(3).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(3).pdf",
+    "detected_date": "1992-05-28",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [
+      2
+    ],
+    "docsep_pages": [
+      0
+    ],
+    "final_filename": ""
+  },
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(4).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(4).pdf",
+    "detected_date": "1990-02-20",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [
+      2
+    ],
+    "docsep_pages": [
+      0
+    ],
+    "final_filename": ""
+  },
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(5).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(5).pdf",
+    "detected_date": "1990-06-07",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [
+      2
+    ],
+    "docsep_pages": [
+      0
+    ],
+    "final_filename": ""
+  },
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(6).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(6).pdf",
+    "detected_date": "1992-04-13",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [
+      2,
+      6
+    ],
+    "docsep_pages": [
+      0
+    ],
+    "final_filename": ""
+  },
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(7).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(7).pdf",
+    "detected_date": "1989-07-26",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [],
+    "docsep_pages": [],
+    "final_filename": ""
+  },
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(8).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(8).pdf",
+    "detected_date": "1989-04-13",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [],
+    "docsep_pages": [
+      0
+    ],
+    "final_filename": ""
+  },
+  {
+    "original_path": "C:\\Users\\Lumeed\\Desktop\\Lumeed\\Systems\\Sample files\\143\\NEW ZEALAND INSURANCE CORPORATION\\__(9).pdf",
+    "division_code": "143",
+    "company_name": "New_Zealand_Insurance_Corporation",
+    "original_filename": "__(9).pdf",
+    "detected_date": "1987-03-09",
+    "confidence": 100,
+    "method": "auto",
+    "blank_pages": [
+      4
+    ],
+    "docsep_pages": [
+      0
+    ],
+    "final_filename": ""
+  }
+]
