@@ -137,6 +137,9 @@ class ReviewTab(QWidget):
         self.passed_cards = []
         self.ocr_dialog = None
         self.zoom_level = 100
+        self._zoom_timer = QTimer(self)
+        self._zoom_timer.setSingleShot(True)
+        self._zoom_timer.timeout.connect(self.render_preview)
         self.page_labels = []
         self.document_modified = False
         self.undo_stack = []
@@ -259,6 +262,7 @@ class ReviewTab(QWidget):
 
         self.preview_scroll = QScrollArea()
         self.preview_scroll.setWidgetResizable(True)
+        self.preview_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self.preview_scroll.setStyleSheet("QScrollArea { background-color: #12131f; border: 1px solid #2d2e45; border-radius: 6px; }")
         self.preview_scroll.installEventFilter(self)
@@ -268,7 +272,7 @@ class ReviewTab(QWidget):
         self.preview_container.installEventFilter(self)
         self.preview_container_layout = QVBoxLayout(self.preview_container)
         self.preview_container_layout.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
-        self.preview_container_layout.setContentsMargins(10, 10, 10, 10)
+        self.preview_container_layout.setContentsMargins(20, 10, 20, 10)
         self.preview_container_layout.setSpacing(8)
 
         self.preview_placeholder = QLabel("Select a document to preview")
@@ -592,18 +596,20 @@ class ReviewTab(QWidget):
             return
         try:
             for lbl in self.page_labels:
+                lbl.hide()
                 lbl.deleteLater()
             self.page_labels = []
 
             while self.preview_container_layout.count():
                 item = self.preview_container_layout.takeAt(0)
-                if item.widget() and item.widget() != self.preview_placeholder:
+                if item.widget():
+                    item.widget().hide()
                     item.widget().deleteLater()
 
             total_pages = len(self.current_pdf_doc)
             blank_pages = self._get_blank_pages()
             docsep_pages = self._get_docsep_pages()
-            preview_width = max(400, self.preview_scroll.viewport().width() - 30)
+            preview_width = max(400, self.preview_scroll.viewport().width() - 50)
 
             if self.view_mode == "one_page":
                 for page_num in range(total_pages):
@@ -615,6 +621,7 @@ class ReviewTab(QWidget):
             elif self.view_mode == "two_pages":
                 col_width = (preview_width - 8) // 2
                 row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
                 row.setSpacing(8)
                 for page_num in range(total_pages):
                     pixmap = self._make_page_pixmap(page_num, col_width)
@@ -623,9 +630,13 @@ class ReviewTab(QWidget):
                     self.page_labels.append(lbl)
                     if len(self.page_labels) % 2 == 0 or page_num == total_pages - 1:
                         row_container = QWidget()
+                        items_in_row = 2 if len(self.page_labels) % 2 == 0 else 1
+                        content_width = col_width * items_in_row + 8 * (items_in_row - 1)
+                        row_container.setFixedWidth(content_width)
                         row_container.setLayout(row)
-                        self.preview_container_layout.addWidget(row_container)
+                        self.preview_container_layout.addWidget(row_container, alignment=Qt.AlignmentFlag.AlignHCenter)
                         row = QHBoxLayout()
+                        row.setContentsMargins(0, 0, 0, 0)
                         row.setSpacing(8)
 
             elif self.view_mode == "two_pages_cover":
@@ -636,6 +647,7 @@ class ReviewTab(QWidget):
                     self.page_labels.append(lbl)
                 col_width = (preview_width - 8) // 2
                 row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
                 row.setSpacing(8)
                 for page_num in range(1, total_pages):
                     pixmap = self._make_page_pixmap(page_num, col_width)
@@ -644,15 +656,14 @@ class ReviewTab(QWidget):
                     self.page_labels.append(lbl)
                     pages_in_row = len([w for w in row.children() if hasattr(w, 'pixmap')])
                     is_last = page_num == total_pages - 1
-                    if is_last:
+                    if is_last or pages_in_row == 2:
                         row_container = QWidget()
+                        content_width = col_width * pages_in_row + 8 * (pages_in_row - 1)
+                        row_container.setFixedWidth(content_width)
                         row_container.setLayout(row)
-                        self.preview_container_layout.addWidget(row_container)
-                    elif len(self.page_labels) % 2 == 0:
-                        row_container = QWidget()
-                        row_container.setLayout(row)
-                        self.preview_container_layout.addWidget(row_container)
+                        self.preview_container_layout.addWidget(row_container, alignment=Qt.AlignmentFlag.AlignHCenter)
                         row = QHBoxLayout()
+                        row.setContentsMargins(0, 0, 0, 0)
                         row.setSpacing(8)
 
             elif self.view_mode == "variable":
@@ -660,6 +671,7 @@ class ReviewTab(QWidget):
                 n = max(1, int(preview_width / target_page_width))
                 col_width = (preview_width - 8 * (n - 1)) // n
                 row = QHBoxLayout()
+                row.setContentsMargins(0, 0, 0, 0)
                 row.setSpacing(8)
                 count = 0
                 for page_num in range(total_pages):
@@ -670,9 +682,12 @@ class ReviewTab(QWidget):
                     count += 1
                     if count == n or page_num == total_pages - 1:
                         row_container = QWidget()
+                        content_width = col_width * count + 8 * (count - 1)
+                        row_container.setFixedWidth(content_width)
                         row_container.setLayout(row)
-                        self.preview_container_layout.addWidget(row_container)
+                        self.preview_container_layout.addWidget(row_container, alignment=Qt.AlignmentFlag.AlignHCenter)
                         row = QHBoxLayout()
+                        row.setContentsMargins(0, 0, 0, 0)
                         row.setSpacing(8)
                         count = 0
 
@@ -880,13 +895,13 @@ class ReviewTab(QWidget):
 
     def zoom_in(self):
         if self.zoom_level < 300:
-            self.zoom_level = min(300, self.zoom_level + 1)
-            self.render_preview()
+            self.zoom_level = min(300, self.zoom_level + 5)
+            self._zoom_timer.start(50)
 
     def zoom_out(self):
         if self.zoom_level > 1:
-            self.zoom_level = max(1, self.zoom_level - 1)
-            self.render_preview()
+            self.zoom_level = max(1, self.zoom_level - 5)
+            self._zoom_timer.start(50)
 
     def zoom_reset(self):
         self.zoom_level = 100
