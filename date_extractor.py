@@ -42,6 +42,7 @@ class DateCandidate:
     source_page: int = 0
     score: float = 0.0
     source_text: str = ""
+    is_ambiguous_numeric: bool = False
 
 
 @dataclass
@@ -53,6 +54,8 @@ class DateResult:
     raw_ocr_text: str
     blank_pages: List[int] = field(default_factory=list)
     all_blank: bool = False
+    needs_review: bool = False
+    top_candidates: List[DateCandidate] = field(default_factory=list)
 
 
 DATE_PATTERNS = [
@@ -172,7 +175,7 @@ def extract_candidates_from_ocr(ocr_data: dict, psm: int, page_width: int, page_
 
     full_text = ' '.join(words)
 
-    for pattern in DATE_PATTERNS:
+    for pattern_idx, pattern in enumerate(DATE_PATTERNS):
         for match in re.finditer(pattern, full_text, re.IGNORECASE):
             matched = match.group(0)
             try:
@@ -185,6 +188,16 @@ def extract_candidates_from_ocr(ocr_data: dict, psm: int, page_width: int, page_
                 parsed_date = parsed.date()
                 if parsed_date.year < 1950 or parsed_date > date.today():
                     continue
+
+                is_ambiguous = False
+                if pattern_idx in (0, 1) and match.lastindex and match.lastindex >= 2:
+                    try:
+                        g1 = int(match.group(1))
+                        g2 = int(match.group(2))
+                        if g1 <= 12 and g2 <= 12:
+                            is_ambiguous = True
+                    except (ValueError, IndexError):
+                        pass
 
                 word_idx = len(full_text[:match.start()].split())
                 if 0 <= word_idx < len(positions):
@@ -214,7 +227,8 @@ def extract_candidates_from_ocr(ocr_data: dict, psm: int, page_width: int, page_
                     keywords_nearby=keywords,
                     source_psm=psm,
                     source_page=page_idx,
-                    source_text=full_text[max(0, match.start()-80):match.end()+80]
+                    source_text=full_text[max(0, match.start()-80):match.end()+80],
+                    is_ambiguous_numeric=is_ambiguous
                 ))
             except Exception:
                 continue
@@ -243,6 +257,11 @@ def score_candidate(candidate: DateCandidate, uniqueness_bonus: float) -> float:
 
     if candidate.source_page == 0:
         score += 10
+
+    if candidate.is_ambiguous_numeric:
+        score -= 35
+    else:
+        score += 20
 
     return score
 
@@ -316,7 +335,9 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
             candidates=[],
             raw_ocr_text=' '.join(raw_texts) if raw_texts else "",
             blank_pages=blank_pages,
-            all_blank=all_blank
+            all_blank=all_blank,
+            needs_review=False,
+            top_candidates=[]
         )
 
     deduped = {}
@@ -335,6 +356,21 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
     best_candidate, best_score = scored[0]
     final_confidence = int(min(best_score, 100))
 
+    needs_review = False
+    top_candidates = []
+    if len(scored) >= 2:
+        seen_dates = set()
+        unique_scored = []
+        for c, s in scored:
+            if c.parsed_date not in seen_dates:
+                seen_dates.add(c.parsed_date)
+                unique_scored.append((c, s))
+        if len(unique_scored) >= 2:
+            score_gap = unique_scored[0][1] - unique_scored[1][1]
+            if score_gap < 20:
+                needs_review = True
+            top_candidates = [c for c, s in unique_scored[:3]]
+
     return DateResult(
         date=best_candidate.parsed_date if best_candidate else None,
         confidence=final_confidence,
@@ -342,5 +378,7 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
         candidates=all_candidates,
         raw_ocr_text=' '.join(raw_texts),
         blank_pages=blank_pages,
-        all_blank=all_blank
+        all_blank=all_blank,
+        needs_review=needs_review,
+        top_candidates=top_candidates
     )

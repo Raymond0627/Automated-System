@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QSpinBox, QScrollArea, QListWidget, QListWidgetItem, QSplitter,
     QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog,
-    QMenu
+    QMenu, QInputDialog, QFrame
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence
@@ -23,6 +23,20 @@ from pipeline import (
 )
 
 from .widgets import DocCardWidget, PassedDocCardWidget
+
+
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal(int)
+
+    def __init__(self, page_num, parent=None):
+        super().__init__(parent)
+        self._page_num = page_num
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._page_num)
+        super().mousePressEvent(event)
 
 
 class FinalizeWorker(QThread):
@@ -127,6 +141,8 @@ class ReviewTab(QWidget):
         self.document_modified = False
         self.undo_stack = []
         self.undo_max = 50
+        self.view_mode = "one_page"
+        self.variable_pages_per_row = 3
         self.build_ui()
 
     def build_ui(self):
@@ -530,6 +546,47 @@ class ReviewTab(QWidget):
             return self.passed_docs[self.active_index].get("docsep_pages", [])
         return []
 
+    def _create_page_label(self, page_num, pixmap, blank_pages, docsep_pages):
+        lbl = ClickableLabel(page_num)
+        lbl.setPixmap(pixmap)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        lbl.customContextMenuRequested.connect(lambda pos, pn=page_num, lb=lbl: self._show_page_menu(pos, pn, lb))
+
+        is_blank = page_num in blank_pages
+        is_docsep = page_num in docsep_pages
+
+        if is_blank:
+            lbl.setStyleSheet("background-color: #1e1f35; border: 3px solid #ff4444; border-radius: 4px; padding: 4px;")
+            blank_badge = QLabel("BLANK", lbl)
+            blank_badge.setStyleSheet("background-color: #ff4444; color: white; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
+            blank_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            blank_badge.move(8, 8)
+            blank_badge.adjustSize()
+            blank_badge.show()
+        elif is_docsep:
+            lbl.setStyleSheet("background-color: #1e1f35; border: 3px solid #ffab00; border-radius: 4px; padding: 4px;")
+            docsep_badge = QLabel("DOCSEP", lbl)
+            docsep_badge.setStyleSheet("background-color: #ffab00; color: #1e1f35; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
+            docsep_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            docsep_badge.move(8, 8)
+            docsep_badge.adjustSize()
+            docsep_badge.show()
+        else:
+            lbl.setStyleSheet("background-color: #1e1f35; border: 1px solid #3a3b55; border-radius: 4px; padding: 4px;")
+
+        return lbl
+
+    def _make_page_pixmap(self, page_num, page_width):
+        page = self.current_pdf_doc[page_num]
+        dpi = max(25, int(150 * (self.zoom_level / 100)))
+        pix = page.get_pixmap(dpi=dpi)
+        img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
+        pixmap = QPixmap.fromImage(img)
+        if pixmap.width() > page_width:
+            pixmap = pixmap.scaledToWidth(page_width, Qt.TransformationMode.SmoothTransformation)
+        return pixmap
+
     def render_preview(self):
         if not self.current_pdf_doc:
             return
@@ -538,52 +595,87 @@ class ReviewTab(QWidget):
                 lbl.deleteLater()
             self.page_labels = []
 
-            preview_width = max(400, self.preview_scroll.viewport().width() - 30)
-            dpi = int(150 * (self.zoom_level / 100))
-            blank_pages = self._get_blank_pages()
-            docsep_pages = self._get_docsep_pages()
-
-            for page_num in range(len(self.current_pdf_doc)):
-                page = self.current_pdf_doc[page_num]
-                pix = page.get_pixmap(dpi=dpi)
-                img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format.Format_RGB888)
-                pixmap = QPixmap.fromImage(img)
-
-                if pixmap.width() > preview_width:
-                    pixmap = pixmap.scaledToWidth(preview_width, Qt.TransformationMode.SmoothTransformation)
-
-                lbl = QLabel()
-                lbl.setPixmap(pixmap)
-                lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-                lbl.customContextMenuRequested.connect(lambda pos, pn=page_num, lb=lbl: self._show_page_menu(pos, pn, lb))
-
-                is_blank = page_num in blank_pages
-                is_docsep = page_num in docsep_pages
-
-                if is_blank:
-                    lbl.setStyleSheet("background-color: #1e1f35; border: 3px solid #ff4444; border-radius: 4px; padding: 4px;")
-                    blank_badge = QLabel("BLANK", lbl)
-                    blank_badge.setStyleSheet("background-color: #ff4444; color: white; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
-                    blank_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    blank_badge.move(8, 8)
-                    blank_badge.adjustSize()
-                    blank_badge.show()
-                elif is_docsep:
-                    lbl.setStyleSheet("background-color: #1e1f35; border: 3px solid #ffab00; border-radius: 4px; padding: 4px;")
-                    docsep_badge = QLabel("DOCSEP", lbl)
-                    docsep_badge.setStyleSheet("background-color: #ffab00; color: #1e1f35; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
-                    docsep_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    docsep_badge.move(8, 8)
-                    docsep_badge.adjustSize()
-                    docsep_badge.show()
-                else:
-                    lbl.setStyleSheet("background-color: #1e1f35; border: 1px solid #3a3b55; border-radius: 4px; padding: 4px;")
-
-                self.preview_container_layout.addWidget(lbl)
-                self.page_labels.append(lbl)
+            while self.preview_container_layout.count():
+                item = self.preview_container_layout.takeAt(0)
+                if item.widget() and item.widget() != self.preview_placeholder:
+                    item.widget().deleteLater()
 
             total_pages = len(self.current_pdf_doc)
+            blank_pages = self._get_blank_pages()
+            docsep_pages = self._get_docsep_pages()
+            preview_width = max(400, self.preview_scroll.viewport().width() - 30)
+
+            if self.view_mode == "one_page":
+                for page_num in range(total_pages):
+                    pixmap = self._make_page_pixmap(page_num, preview_width)
+                    lbl = self._create_page_label(page_num, pixmap, blank_pages, docsep_pages)
+                    self.preview_container_layout.addWidget(lbl)
+                    self.page_labels.append(lbl)
+
+            elif self.view_mode == "two_pages":
+                col_width = (preview_width - 8) // 2
+                row = QHBoxLayout()
+                row.setSpacing(8)
+                for page_num in range(total_pages):
+                    pixmap = self._make_page_pixmap(page_num, col_width)
+                    lbl = self._create_page_label(page_num, pixmap, blank_pages, docsep_pages)
+                    row.addWidget(lbl)
+                    self.page_labels.append(lbl)
+                    if len(self.page_labels) % 2 == 0 or page_num == total_pages - 1:
+                        row_container = QWidget()
+                        row_container.setLayout(row)
+                        self.preview_container_layout.addWidget(row_container)
+                        row = QHBoxLayout()
+                        row.setSpacing(8)
+
+            elif self.view_mode == "two_pages_cover":
+                if total_pages > 0:
+                    pixmap = self._make_page_pixmap(0, preview_width)
+                    lbl = self._create_page_label(0, pixmap, blank_pages, docsep_pages)
+                    self.preview_container_layout.addWidget(lbl)
+                    self.page_labels.append(lbl)
+                col_width = (preview_width - 8) // 2
+                row = QHBoxLayout()
+                row.setSpacing(8)
+                for page_num in range(1, total_pages):
+                    pixmap = self._make_page_pixmap(page_num, col_width)
+                    lbl = self._create_page_label(page_num, pixmap, blank_pages, docsep_pages)
+                    row.addWidget(lbl)
+                    self.page_labels.append(lbl)
+                    pages_in_row = len([w for w in row.children() if hasattr(w, 'pixmap')])
+                    is_last = page_num == total_pages - 1
+                    if is_last:
+                        row_container = QWidget()
+                        row_container.setLayout(row)
+                        self.preview_container_layout.addWidget(row_container)
+                    elif len(self.page_labels) % 2 == 0:
+                        row_container = QWidget()
+                        row_container.setLayout(row)
+                        self.preview_container_layout.addWidget(row_container)
+                        row = QHBoxLayout()
+                        row.setSpacing(8)
+
+            elif self.view_mode == "variable":
+                target_page_width = max(150, 400 * self.zoom_level / 100)
+                n = max(1, int(preview_width / target_page_width))
+                col_width = (preview_width - 8 * (n - 1)) // n
+                row = QHBoxLayout()
+                row.setSpacing(8)
+                count = 0
+                for page_num in range(total_pages):
+                    pixmap = self._make_page_pixmap(page_num, col_width)
+                    lbl = self._create_page_label(page_num, pixmap, blank_pages, docsep_pages)
+                    row.addWidget(lbl)
+                    self.page_labels.append(lbl)
+                    count += 1
+                    if count == n or page_num == total_pages - 1:
+                        row_container = QWidget()
+                        row_container.setLayout(row)
+                        self.preview_container_layout.addWidget(row_container)
+                        row = QHBoxLayout()
+                        row.setSpacing(8)
+                        count = 0
+
             blank_count = len([p for p in blank_pages if p < total_pages])
             docsep_count = len([p for p in docsep_pages if p < total_pages])
             status = f"{total_pages} page(s)"
@@ -632,7 +724,25 @@ class ReviewTab(QWidget):
         ins_after = QAction(f"Insert After Page {page_num + 1}", self)
         ins_after.triggered.connect(lambda: self._insert_image_page(page_num, "after"))
         menu.addAction(ins_after)
+        menu.addSeparator()
+        view_menu = menu.addMenu("View Mode")
+        view_modes = [
+            ("One page", "one_page"),
+            ("Two pages", "two_pages"),
+            ("Two pages with cover sheet", "two_pages_cover"),
+            ("Variable number of pages", "variable"),
+        ]
+        for label, mode in view_modes:
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(self.view_mode == mode)
+            act.triggered.connect(lambda checked, m=mode: self._set_view_mode(m))
+            view_menu.addAction(act)
         menu.exec(lbl.mapToGlobal(pos))
+
+    def _set_view_mode(self, mode):
+        self.view_mode = mode
+        self.render_preview()
 
     def _delete_page(self, page_num):
         if not self.current_pdf_doc or len(self.current_pdf_doc) <= 1:
@@ -770,12 +880,12 @@ class ReviewTab(QWidget):
 
     def zoom_in(self):
         if self.zoom_level < 300:
-            self.zoom_level = min(300, self.zoom_level + 25)
+            self.zoom_level = min(300, self.zoom_level + 1)
             self.render_preview()
 
     def zoom_out(self):
-        if self.zoom_level > 25:
-            self.zoom_level = max(25, self.zoom_level - 25)
+        if self.zoom_level > 1:
+            self.zoom_level = max(1, self.zoom_level - 1)
             self.render_preview()
 
     def zoom_reset(self):
