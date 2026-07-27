@@ -41,7 +41,7 @@ class ClickableLabel(QLabel):
 
 
 class FinalizeWorker(QThread):
-    finished = pyqtSignal()
+    done = pyqtSignal()
     error = pyqtSignal(str)
 
     def __init__(self, passed_docs, all_flagged_docs, config, document_modified, current_pdf_doc, active_index, active_list, pending_docs):
@@ -56,6 +56,9 @@ class FinalizeWorker(QThread):
         self.pending_docs = pending_docs
 
     def run(self):
+        _log = open(Path(__file__).parent.parent / "finalize_debug.log", "a", encoding="utf-8")
+        _log.write("=== FinalizeWorker.run START ===\n")
+        _log.flush()
         try:
             pipeline_config = PipelineConfig(
                 input_root=self.config["input_root"],
@@ -72,8 +75,12 @@ class FinalizeWorker(QThread):
             def _norm(p):
                 return os.path.normcase(os.path.normpath(os.path.abspath(p))) if p else ""
 
+            _log.write("Parsing folder structure...\n")
+            _log.flush()
             batches = parse_folder_structure(pipeline_config.input_root)
 
+            _log.write("Matching passed docs...\n")
+            _log.flush()
             passed_lookup = {_norm(pd.get("original_path")): pd for pd in self.passed_docs if pd.get("original_path")}
 
             matched_doc_paths = set()
@@ -101,6 +108,8 @@ class FinalizeWorker(QThread):
                 for p in unmatched_passed:
                     print("   MISSING MATCH:", p)
 
+            _log.write("Loading flagged data...\n")
+            _log.flush()
             flagged_data = load_flagged_index(pipeline_config)
             flagged_lookup = {_norm(fd.get("original_path")): fd for fd in flagged_data if fd.get("original_path")}
             for batch in batches:
@@ -109,19 +118,39 @@ class FinalizeWorker(QThread):
                     if fd:
                         update_document_from_review(doc, fd)
 
+            _log.write("Finalizing all divisions...\n")
+            _log.flush()
             finalize_all_divisions(batches, pipeline_config)
+            _log.write("Finalize ALL DIVISIONS DONE\n")
+            _log.flush()
 
+            _log.write("Saving confirmed documents...\n")
+            _log.flush()
             save_confirmed_documents(batches, pipeline_config)
+            _log.write("SAVE CONFIRMED DOCUMENTS DONE\n")
+            _log.flush()
 
+            _log.write("Clearing index files...\n")
+            _log.flush()
             for fname in ("passed_index.json", "flagged_index.json"):
                 p = Path(self.config["flagged_root"]) / fname
                 if p.exists():
                     with open(p, "w", encoding="utf-8") as f:
                         json.dump([], f)
 
-            self.finished.emit()
+            _log.write("Emitting done signal...\n")
+            _log.flush()
+            self.done.emit()
+            _log.write("Done signal emitted\n")
+            _log.flush()
         except Exception as e:
+            _log.write(f"EXCEPTION in run: {e}\n")
+            import traceback
+            _log.write(traceback.format_exc() + "\n")
+            _log.flush()
             self.error.emit(str(e))
+        _log.write("=== FinalizeWorker.run END ===\n")
+        _log.close()
 
 
 class ReviewTab(QWidget):
@@ -1101,38 +1130,76 @@ class ReviewTab(QWidget):
             active_list=self.active_list,
             pending_docs=list(self.pending_docs),
         )
-        self._finalize_worker.finished.connect(self._on_finalize_done)
+        self._finalize_worker.done.connect(self._on_finalize_done)
         self._finalize_worker.error.connect(self._on_finalize_error)
         self._finalize_worker.start()
 
     def _on_finalize_done(self):
-        self.pending_docs = []
-        self.passed_docs = []
-        self.all_flagged_docs = []
-        self.pending_cards = []
-        self.passed_cards = []
-        self.pending_list.clear()
-        self.passed_list.clear()
-        self.active_list = None
-        self.active_index = -1
-        self.current_pdf_doc = None
-        self.document_modified = False
-        self.undo_stack.clear()
-        for lbl in self.page_labels:
-            lbl.deleteLater()
-        self.page_labels = []
-        self.preview_placeholder.setText("Select a document to preview")
-        self.preview_placeholder.setStyleSheet("color: #555570; font-size: 12pt;")
-        self.preview_placeholder.show()
-        self.pending_label.setText("Pending Review (0)")
-        self.passed_label.setText("Auto-Confirmed (0)")
-        self.count_label.setText("No documents")
-        self.page_label.setText("No document loaded")
-        self.finalize_btn.setEnabled(True)
-        self.finalize_btn.setText("FINALIZE")
-        QMessageBox.information(self, "Finalize Complete", "All documents have been processed and moved to the output folder.")
+        import traceback
+        _log = open(Path(__file__).parent.parent / "finalize_debug.log", "a", encoding="utf-8")
+        _log.write("=== _on_finalize_done START ===\n")
+        _log.flush()
+        try:
+            self.pending_docs = []
+            _log.write("1\n"); _log.flush()
+            self.passed_docs = []
+            _log.write("2\n"); _log.flush()
+            self.all_flagged_docs = []
+            _log.write("3\n"); _log.flush()
+            self.pending_cards = []
+            _log.write("4\n"); _log.flush()
+            self.passed_cards = []
+            _log.write("5\n"); _log.flush()
+            self.pending_list.clear()
+            _log.write("6\n"); _log.flush()
+            self.passed_list.clear()
+            _log.write("7\n"); _log.flush()
+            self.active_list = None
+            _log.write("8\n"); _log.flush()
+            self.active_index = -1
+            _log.write("9\n"); _log.flush()
+            self.current_pdf_doc = None
+            _log.write("10\n"); _log.flush()
+            self.document_modified = False
+            _log.write("11\n"); _log.flush()
+            self.undo_stack.clear()
+            _log.write("12\n"); _log.flush()
+            for lbl in self.page_labels:
+                lbl.deleteLater()
+            _log.write("13\n"); _log.flush()
+            self.page_labels = []
+            _log.write("14\n"); _log.flush()
+            self.preview_placeholder.setText("Select a document to preview")
+            _log.write("15\n"); _log.flush()
+            self.preview_placeholder.setStyleSheet("color: #555570; font-size: 12pt;")
+            _log.write("16\n"); _log.flush()
+            self.preview_placeholder.show()
+            _log.write("17\n"); _log.flush()
+            self.pending_label.setText("Pending Review (0)")
+            _log.write("18\n"); _log.flush()
+            self.passed_label.setText("Auto-Confirmed (0)")
+            _log.write("19\n"); _log.flush()
+            self.count_label.setText("No documents")
+            _log.write("20\n"); _log.flush()
+            self.page_label.setText("No document loaded")
+            _log.write("21\n"); _log.flush()
+            self.finalize_btn.setEnabled(True)
+            _log.write("22\n"); _log.flush()
+            self.finalize_btn.setText("FINALIZE")
+            _log.write("23\n"); _log.flush()
+            QMessageBox.information(self, "Finalize Complete", "All documents have been processed and moved to the output folder.")
+            _log.write("24\n"); _log.flush()
+        except Exception as e:
+            _log.write(f"EXCEPTION: {e}\n")
+            _log.write(traceback.format_exc() + "\n")
+            _log.flush()
+        _log.write("=== _on_finalize_done END ===\n")
+        _log.close()
 
     def _on_finalize_error(self, msg):
+        _log = open(Path(__file__).parent.parent / "finalize_debug.log", "a", encoding="utf-8")
+        _log.write(f"=== _on_finalize_error: {msg} ===\n")
+        _log.close()
         self.finalize_btn.setEnabled(True)
         self.finalize_btn.setText("FINALIZE")
         QMessageBox.critical(self, "Finalize Error", f"Failed to finalize:\n{msg}")
@@ -1141,3 +1208,9 @@ class ReviewTab(QWidget):
         super().resizeEvent(event)
         if self.current_pdf_doc:
             QTimer.singleShot(100, self.render_preview)
+
+    def closeEvent(self, event):
+        _log = open(Path(__file__).parent.parent / "finalize_debug.log", "a", encoding="utf-8")
+        _log.write(f"=== ReviewTab closeEvent ===\n")
+        _log.close()
+        super().closeEvent(event)
