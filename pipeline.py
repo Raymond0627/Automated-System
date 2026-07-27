@@ -76,7 +76,7 @@ def normalize_division_code(division: str) -> str:
 
 def sanitize_company_name(company: str) -> str:
     words = company.strip().split()
-    title_words = [w.capitalize() for w in words]
+    title_words = [w.upper() for w in words]
     return "_".join(title_words)
 
 
