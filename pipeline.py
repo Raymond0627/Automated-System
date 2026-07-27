@@ -323,7 +323,7 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
 
             doc.final_filename = f"{yyyymm}{seq}_{div}_{company}.pdf"
 
-            output_div_dir = config.output_root / doc.division_code
+            output_div_dir = config.output_root / doc.division_code / company
             output_div_dir.mkdir(parents=True, exist_ok=True)
 
             output_path = output_div_dir / doc.final_filename
@@ -486,7 +486,7 @@ def move_confirmed_to_passed(config: PipelineConfig, batches: List[DivisionBatch
     for batch in batches:
         for doc in batch.documents:
             if doc.status == "confirmed" and doc.final_filename:
-                src = config.output_root / doc.division_code / doc.final_filename
+                src = config.output_root / doc.division_code / sanitize_filename(doc.company_name) / doc.final_filename
                 if src.exists():
                     dst = passed_root / doc.division_code / doc.company_name / doc.final_filename
                     dst.parent.mkdir(parents=True, exist_ok=True)
