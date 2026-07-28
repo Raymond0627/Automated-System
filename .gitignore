@@ -7,4 +7,5 @@ processed/
 data/
 1.1.0 BACKUP/
 dist/
+build/
 config.json
