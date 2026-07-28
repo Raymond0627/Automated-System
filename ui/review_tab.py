@@ -166,6 +166,7 @@ class ReviewTab(QWidget):
         self.pending_cards = []
         self.passed_cards = []
         self.ocr_dialog = None
+        self.reviewed_passed = set()
         self.zoom_level = 100
         self._zoom_timer = QTimer(self)
         self._zoom_timer.setSingleShot(True)
@@ -481,8 +482,10 @@ class ReviewTab(QWidget):
         self.active_index = row
         for i, card in enumerate(self.pending_cards):
             card.set_selected(i == row)
-        for card in self.passed_cards:
+        for i, card in enumerate(self.passed_cards):
             card.set_selected(False)
+            if i in self.reviewed_passed:
+                card.set_reviewed(True)
         self.load_document(self.pending_docs[row])
 
     def _on_passed_selected(self, row: int):
@@ -490,8 +493,11 @@ class ReviewTab(QWidget):
             return
         self.active_list = "passed"
         self.active_index = row
+        self.reviewed_passed.add(row)
         for i, card in enumerate(self.passed_cards):
             card.set_selected(i == row)
+            if i in self.reviewed_passed:
+                card.set_reviewed(True)
         for card in self.pending_cards:
             card.set_selected(False)
         self.load_document(self.passed_docs[row])

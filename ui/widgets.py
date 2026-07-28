@@ -488,6 +488,7 @@ class PassedDocCardWidget(QFrame):
         self.idx = idx
         self.doc = doc
         self._selected = False
+        self._reviewed = False
 
         self.setFixedHeight(58)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -569,8 +570,15 @@ class PassedDocCardWidget(QFrame):
         self._selected = selected
         if selected:
             self.setStyleSheet(self._get_style("selected"))
+        elif self._reviewed:
+            self.setStyleSheet(self._get_style("reviewed"))
         else:
             self.setStyleSheet(self._get_style("normal"))
+
+    def set_reviewed(self, reviewed: bool):
+        self._reviewed = reviewed
+        if not self._selected:
+            self.setStyleSheet(self._get_style("reviewed" if reviewed else "normal"))
 
     def _get_style(self, state: str) -> str:
         if state == "selected":
@@ -579,6 +587,18 @@ class PassedDocCardWidget(QFrame):
                     background-color: #1a3a2a;
                     border: 1px solid #4caf50;
                     border-radius: 8px;
+                }
+            """
+        elif state == "reviewed":
+            return """
+                QFrame {
+                    background-color: #1a2a3a;
+                    border: 1px solid #4a6fa5;
+                    border-radius: 8px;
+                }
+                QFrame:hover {
+                    background-color: #1f3045;
+                    border: 1px solid #5a7fb5;
                 }
             """
         else:
