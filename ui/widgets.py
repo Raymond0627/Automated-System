@@ -141,6 +141,8 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 result["flagged_data"]["qc"] = qc_result
             result["log_messages"].append(f"[BLANK] {original_filename}: ALL BLANK ({total_pages} pages){qc_str}{docsep_msg}")
         elif date_result.confidence >= config.get("confidence_threshold", 70) and date_result.date:
+            company_known = (company_result['source'] in ('header', 'addressee')
+                             and not company_result.get('needs_review', False))
             if qc_failed:
                 result["status"] = "flagged"
                 result["flagged_data"] = {
@@ -159,6 +161,25 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 if qc_result:
                     result["flagged_data"]["qc"] = qc_result
                 result["log_messages"].append(f"[FLAGGED] {original_filename} ({date_result.confidence}%){blank_str}{qc_str}{docsep_msg}")
+            elif not company_known:
+                result["status"] = "flagged"
+                result["flagged_data"] = {
+                    "original_path": original_path,
+                    "division_code": division_code,
+                    "company_name": final_company,
+                    "original_filename": original_filename,
+                    "best_guess_date": date_result.date.isoformat() if date_result.date else None,
+                    "confidence": date_result.confidence,
+                    "method": date_result.method,
+                    "raw_ocr_text": date_result.raw_ocr_text,
+                    "blank_pages": result["blank_pages"],
+                    "docsep_pages": result["docsep_pages"],
+                    "company_source": company_result['source'],
+                    "company_needs_review": True,
+                }
+                if qc_result:
+                    result["flagged_data"]["qc"] = qc_result
+                result["log_messages"].append(f"[FLAGGED-COMPANY] {original_filename} company='{final_company}' source={company_result['source']}")
             else:
                 result["status"] = "confirmed"
                 result["passed_data"] = {
@@ -445,6 +466,13 @@ class DocCardWidget(QFrame):
             qc_label.setStyleSheet("background: transparent; color: #ffa726;")
             bottom_row.addWidget(qc_label)
 
+        if doc.get("company_needs_review"):
+            company_name = doc.get("company_name", "")
+            company_label = QLabel(company_name)
+            company_label.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+            company_label.setStyleSheet("background: transparent; color: #ff4444;")
+            bottom_row.addWidget(company_label)
+
         bottom_row.addStretch()
         info_layout.addLayout(bottom_row)
 
@@ -543,10 +571,7 @@ class PassedDocCardWidget(QFrame):
             docsep_label.setStyleSheet("background: transparent; color: #ffab00;")
             top_row.addWidget(docsep_label)
 
-        status_label = QLabel("PASSED")
-        status_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        status_label.setStyleSheet("background: transparent; color: #4caf50;")
-        top_row.addWidget(status_label)
+        top_row.addStretch()
         info_layout.addLayout(top_row)
 
         bottom_row = QHBoxLayout()
@@ -558,18 +583,8 @@ class PassedDocCardWidget(QFrame):
         conf_label.setFont(QFont("Segoe UI", 8))
         conf_label.setStyleSheet("background: transparent; color: #8888aa;")
         bottom_row.addWidget(conf_label)
-        if method:
-            method_label = QLabel(f"({method})")
-            method_label.setFont(QFont("Segoe UI", 7))
-            method_label.setStyleSheet("background: transparent; color: #666688;")
-            bottom_row.addWidget(method_label)
 
-        if qc_status == "passed":
-            qc_label = QLabel("QC:Passed")
-            qc_label.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-            qc_label.setStyleSheet("background: transparent; color: #66bb6a;")
-            bottom_row.addWidget(qc_label)
-        elif qc_status in ("failed", "needs_review") and qc_reasons:
+        if qc_status in ("failed", "needs_review") and qc_reasons:
             qc_label = QLabel(f"QC:{qc_reasons[:30]}")
             qc_label.setFont(QFont("Segoe UI", 7))
             qc_label.setStyleSheet("background: transparent; color: #ff7043;")
