@@ -98,6 +98,8 @@ class FinalizeWorker(QThread):
                                 doc.original_path = pd["modified_path"]
                             doc.blank_pages = pd.get("blank_pages", [])
                             doc.docsep_pages = pd.get("docsep_pages", [])
+                            if pd.get("company_name"):
+                                doc.company_name = pd["company_name"]
                         except (ValueError, KeyError):
                             pass
 
