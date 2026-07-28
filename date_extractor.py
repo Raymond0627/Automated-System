@@ -174,7 +174,7 @@ def find_labeled_date_candidates(page_ocr_data_list):
     return labeled
 
 
-CONTROL_NO_PATTERN = re.compile(r'\b\d{11}\b')
+CONTROL_NO_PATTERN = re.compile(r'\b\d{0,2}9002000\d{3}\b')
 CONTROL_DATE_PATTERN = re.compile(r'\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b')
 ISO_DATETIME_PATTERN = re.compile(r'\b\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}:\d{2}\b')
 
@@ -528,6 +528,8 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
             scored[i] = (c, s + 100)
         elif in_control:
             scored[i] = (c, s + (90 if control_lookup[key] else 60))
+        elif in_labeled:
+            scored[i] = (c, s + 80)
 
     scored.sort(key=lambda x: x[1], reverse=True)
 
