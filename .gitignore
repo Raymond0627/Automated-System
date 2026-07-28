@@ -6,4 +6,5 @@ flagged/
 processed/
 data/
 1.1.0 BACKUP/
+dist/
 config.json
