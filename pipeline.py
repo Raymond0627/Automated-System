@@ -65,6 +65,7 @@ class PipelineConfig:
         self.rename_enabled = True
         self.audit_enabled = True
         self.render_dpi = 150
+        self.keep_input_structure = False
         
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.flagged_root.mkdir(parents=True, exist_ok=True)
@@ -323,7 +324,19 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
 
             doc.final_filename = f"{yyyymm}{seq}_{div}_{company}.pdf"
 
-            output_div_dir = config.output_root / doc.division_code / company
+            if config.keep_input_structure:
+                try:
+                    rel = Path(doc.original_path).relative_to(config.input_root)
+                    parts = rel.parts
+                    subfolder = parts[1] if len(parts) > 2 else ""
+                except (ValueError, IndexError):
+                    subfolder = ""
+                if subfolder:
+                    output_div_dir = config.output_root / doc.division_code / sanitize_filename(subfolder)
+                else:
+                    output_div_dir = config.output_root / doc.division_code
+            else:
+                output_div_dir = config.output_root / doc.division_code / company
             output_div_dir.mkdir(parents=True, exist_ok=True)
 
             output_path = output_div_dir / doc.final_filename

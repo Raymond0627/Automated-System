@@ -45,7 +45,7 @@ class FinalizeWorker(QThread):
     done = pyqtSignal()
     error = pyqtSignal(str)
 
-    def __init__(self, passed_docs, all_flagged_docs, config, document_modified, current_pdf_doc, active_index, active_list, pending_docs):
+    def __init__(self, passed_docs, all_flagged_docs, config, document_modified, current_pdf_doc, active_index, active_list, pending_docs, keep_input_structure=False):
         super().__init__()
         self.passed_docs = passed_docs
         self.all_flagged_docs = all_flagged_docs
@@ -55,6 +55,7 @@ class FinalizeWorker(QThread):
         self.active_index = active_index
         self.active_list = active_list
         self.pending_docs = pending_docs
+        self.keep_input_structure = keep_input_structure
 
     def run(self):
         _log = open(Path(__file__).parent.parent / "finalize_debug.log", "a", encoding="utf-8")
@@ -72,6 +73,7 @@ class FinalizeWorker(QThread):
             )
             pipeline_config.enable_docsep_removal = self.config.get("enable_docsep_removal", True)
             pipeline_config.enable_blank_removal = self.config.get("enable_blank_removal", True)
+            pipeline_config.keep_input_structure = self.keep_input_structure
 
             def _norm(p):
                 return os.path.normcase(os.path.normpath(os.path.abspath(p))) if p else ""
@@ -1183,6 +1185,13 @@ class ReviewTab(QWidget):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
+        folder_reply = QMessageBox.question(
+            self, "Folder Structure",
+            "Auto-create folders by company name?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        keep_input_structure = (folder_reply == QMessageBox.StandardButton.No)
+
         self.finalize_btn.setEnabled(False)
         self.finalize_btn.setText("Processing...")
 
@@ -1195,6 +1204,7 @@ class ReviewTab(QWidget):
             active_index=self.active_index,
             active_list=self.active_list,
             pending_docs=list(self.pending_docs),
+            keep_input_structure=keep_input_structure,
         )
         self._finalize_worker.done.connect(self._on_finalize_done)
         self._finalize_worker.error.connect(self._on_finalize_error)
