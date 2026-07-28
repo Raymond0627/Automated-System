@@ -106,3 +106,38 @@ Done signal emitted
 23
 24
 === _on_finalize_done END ===
+=== FinalizeWorker.run START ===
+Parsing folder structure...
+Matching passed docs...
+Loading flagged data...
+Finalizing all divisions...
+Finalize ALL DIVISIONS DONE
+Saving confirmed documents...
+SAVE CONFIRMED DOCUMENTS DONE
+Clearing index files...
+Emitting done signal...
+Done signal emitted
+=== FinalizeWorker.run END ===
+=== _on_finalize_done START ===
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+EXCEPTION: wrapped C/C++ object of type QLabel has been deleted
+Traceback (most recent call last):
+  File "c:\Users\Lumeed\Desktop\Lumeed\Customer\IC\VS code\Opencode\Automated System\ui\review_tab.py", line 1178, in _on_finalize_done
+    self.preview_placeholder.setText("Select a document to preview")
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: wrapped C/C++ object of type QLabel has been deleted
+
+=== _on_finalize_done END ===
