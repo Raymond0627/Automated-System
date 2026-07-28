@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QSpinBox, QScrollArea, QListWidget, QListWidgetItem, QSplitter,
     QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog,
-    QMenu, QInputDialog, QFrame
+    QMenu, QInputDialog, QFrame, QLineEdit
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence
@@ -22,6 +22,7 @@ from pipeline import (
     update_document_from_review, finalize_all_divisions, save_confirmed_documents
 )
 from enhance import enhance_page
+from company_extractor import normalize_company_name, learn_company_name
 
 from .widgets import DocCardWidget, PassedDocCardWidget
 
@@ -211,6 +212,12 @@ class ReviewTab(QWidget):
         self.ocr_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.ocr_btn.clicked.connect(self.toggle_ocr_panel)
 
+        self.company_input = QLineEdit()
+        self.company_input.setFixedHeight(26)
+        self.company_input.setFont(QFont("Segoe UI", 9))
+        self.company_input.setMinimumWidth(200)
+        self.company_input.setPlaceholderText("Company name...")
+
         nav_row = QHBoxLayout()
         nav_row.setSpacing(4)
         nav_row.setContentsMargins(0, 0, 0, 4)
@@ -333,6 +340,11 @@ class ReviewTab(QWidget):
         bottom.addWidget(QLabel("Date:"))
         bottom.addWidget(self.month_combo)
         bottom.addWidget(self.year_spin)
+        sep2 = QLabel("|")
+        sep2.setStyleSheet("color: #333455; padding: 0 4px;")
+        bottom.addWidget(sep2)
+        bottom.addWidget(QLabel("Company:"))
+        bottom.addWidget(self.company_input)
         bottom.addWidget(self.confirm_btn)
         bottom.addWidget(self.ocr_btn)
         bottom.addStretch()
@@ -399,6 +411,8 @@ class ReviewTab(QWidget):
             self.passed_list.addItem(item)
             self.passed_list.setItemWidget(item, card)
             self.passed_cards.append(card)
+            if i in self.reviewed_passed:
+                card.set_reviewed(True)
 
         self.pending_label.setText(f"Pending Review ({len(self.pending_docs)})")
         self.passed_label.setText(f"Auto-Confirmed ({len(self.passed_docs)})")
@@ -556,6 +570,9 @@ class ReviewTab(QWidget):
         if date_str:
             self._set_date_to_widgets(date_str)
 
+        company_name = doc.get("company_name", "")
+        self._set_company_to_widgets(company_name)
+
     def _set_date_to_widgets(self, date_str: str):
         if date_str and len(date_str) >= 7:
             try:
@@ -571,6 +588,12 @@ class ReviewTab(QWidget):
         month = self.month_combo.currentIndex() + 1
         year = self.year_spin.value()
         return f"{year}-{month:02d}-01"
+
+    def _set_company_to_widgets(self, company_name: str):
+        self.company_input.setText(company_name or "")
+
+    def _get_company_from_widgets(self) -> str:
+        return self.company_input.text().strip()
 
     def _get_blank_pages(self):
         if self.active_list == "pending" and self.active_index >= 0:
@@ -998,10 +1021,19 @@ class ReviewTab(QWidget):
         if self.active_index < 0 or not self.active_list:
             return
         dt = self._get_date_from_widgets()
+        company_text = self._get_company_from_widgets()
 
         if self.active_list == "pending":
             doc = self.pending_docs[self.active_index]
+            original_company = doc.get("company_name", "")
+            if company_text and company_text != original_company:
+                confirmed_company = normalize_company_name(company_text)
+            else:
+                confirmed_company = original_company
+            learn_company_name(confirmed_company)
+
             doc["confirmed_date"] = dt
+            doc["company_name"] = confirmed_company
             doc["reviewed"] = True
             doc["review_timestamp"] = str(datetime.now())
             self._save_flagged_updates()
@@ -1012,7 +1044,7 @@ class ReviewTab(QWidget):
             self.passed_docs.append({
                 "original_path": doc.get("original_path", ""),
                 "division_code": doc.get("division_code", ""),
-                "company_name": doc.get("company_name", ""),
+                "company_name": confirmed_company,
                 "original_filename": doc.get("original_filename", ""),
                 "detected_date": dt,
                 "confidence": doc.get("confidence", 0),
@@ -1023,7 +1055,7 @@ class ReviewTab(QWidget):
             })
 
             if self.document_modified and self.current_pdf_doc:
-                mod_path = Path(self.config["flagged_root"]) / doc.get("division_code", "") / doc.get("company_name", "") / doc.get("original_filename", "")
+                mod_path = Path(self.config["flagged_root"]) / doc.get("division_code", "") / confirmed_company / doc.get("original_filename", "")
                 mod_path.parent.mkdir(parents=True, exist_ok=True)
                 self.current_pdf_doc.save(str(mod_path), incremental=False, garbage=4, deflate=True)
                 self.passed_docs[-1]["modified_path"] = str(mod_path)
@@ -1034,9 +1066,17 @@ class ReviewTab(QWidget):
 
         elif self.active_list == "passed":
             doc = self.passed_docs[self.active_index]
+            original_company = doc.get("company_name", "")
+            if company_text and company_text != original_company:
+                confirmed_company = normalize_company_name(company_text)
+            else:
+                confirmed_company = original_company
+            learn_company_name(confirmed_company)
+
             doc["detected_date"] = dt
+            doc["company_name"] = confirmed_company
             if self.document_modified and self.current_pdf_doc:
-                mod_path = Path(self.config["flagged_root"]) / doc.get("division_code", "") / doc.get("company_name", "") / doc.get("original_filename", "")
+                mod_path = Path(self.config["flagged_root"]) / doc.get("division_code", "") / confirmed_company / doc.get("original_filename", "")
                 mod_path.parent.mkdir(parents=True, exist_ok=True)
                 self.current_pdf_doc.save(str(mod_path), incremental=False, garbage=4, deflate=True)
                 doc["modified_path"] = str(mod_path)

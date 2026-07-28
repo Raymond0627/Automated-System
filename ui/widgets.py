@@ -20,6 +20,7 @@ from paths import BASE_DIR
 from date_extractor import extract_document_date, DateResult
 from pipeline import PipelineConfig, parse_folder_structure, save_confirmed_documents
 from auto_qc import run_qc_on_pdf, detect_docsep_flag
+from company_extractor import get_company_name_for_filename, learn_company_name
 
 import pytesseract
 
@@ -114,17 +115,27 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
 
         blank_str = f" | {len(result['blank_pages'])}/{total_pages} blank" if result["blank_pages"] else ""
 
+        page_ocr_data_list = []
+        for idx, page_text in enumerate(date_result.page_texts):
+            page_ocr_data_list.append({
+                'page_text': page_text,
+                'page_idx': idx,
+            })
+        company_result = get_company_name_for_filename(page_ocr_data_list, company_name)
+        final_company = company_result['company_name']
+
         if date_result.all_blank:
             result["status"] = "flagged"
             result["flagged_data"] = {
                 "original_path": original_path,
                 "division_code": division_code,
-                "company_name": company_name,
+                "company_name": final_company,
                 "original_filename": original_filename,
                 "error": "Document is entirely blank",
                 "blank_pages": result["blank_pages"],
                 "all_blank": True,
                 "docsep_pages": result["docsep_pages"],
+                "company_source": company_result['source'],
             }
             if qc_result:
                 result["flagged_data"]["qc"] = qc_result
@@ -135,7 +146,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 result["flagged_data"] = {
                     "original_path": original_path,
                     "division_code": division_code,
-                    "company_name": company_name,
+                    "company_name": final_company,
                     "original_filename": original_filename,
                     "best_guess_date": date_result.date.isoformat() if date_result.date else None,
                     "confidence": date_result.confidence,
@@ -143,6 +154,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                     "raw_ocr_text": date_result.raw_ocr_text,
                     "blank_pages": result["blank_pages"],
                     "docsep_pages": result["docsep_pages"],
+                    "company_source": company_result['source'],
                 }
                 if qc_result:
                     result["flagged_data"]["qc"] = qc_result
@@ -152,7 +164,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 result["passed_data"] = {
                     "original_path": original_path,
                     "division_code": division_code,
-                    "company_name": company_name,
+                    "company_name": final_company,
                     "original_filename": original_filename,
                     "detected_date": date_result.date.isoformat(),
                     "confidence": date_result.confidence,
@@ -160,6 +172,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                     "blank_pages": result["blank_pages"],
                     "docsep_pages": result["docsep_pages"],
                     "raw_ocr_text": date_result.raw_ocr_text,
+                    "company_source": company_result['source'],
                 }
                 if qc_result:
                     result["passed_data"]["qc_status"] = qc_result.get("qc_status", "")
@@ -170,7 +183,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
             result["flagged_data"] = {
                 "original_path": original_path,
                 "division_code": division_code,
-                "company_name": company_name,
+                "company_name": final_company,
                 "original_filename": original_filename,
                 "best_guess_date": date_result.date.isoformat() if date_result.date else None,
                 "confidence": date_result.confidence,
@@ -178,6 +191,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 "raw_ocr_text": date_result.raw_ocr_text,
                 "blank_pages": result["blank_pages"],
                 "docsep_pages": result["docsep_pages"],
+                "company_source": company_result['source'],
             }
             if qc_result:
                 result["flagged_data"]["qc"] = qc_result
@@ -310,6 +324,7 @@ class PipelineThread(QThread):
                         doc.confirmed_date = passed_data.get("detected_date")
                         doc.confirmed_method = passed_data.get("method", "auto")
                         doc.flagged_data = None
+                        learn_company_name(passed_data.get("company_name", ""))
                         self.doc_processed.emit("passed", passed_data)
                     else:
                         doc.flagged_data = None
@@ -568,7 +583,9 @@ class PassedDocCardWidget(QFrame):
 
     def set_selected(self, selected: bool):
         self._selected = selected
-        if selected:
+        if selected and self._reviewed:
+            self.setStyleSheet(self._get_style("reviewed"))
+        elif selected:
             self.setStyleSheet(self._get_style("selected"))
         elif self._reviewed:
             self.setStyleSheet(self._get_style("reviewed"))
@@ -577,8 +594,7 @@ class PassedDocCardWidget(QFrame):
 
     def set_reviewed(self, reviewed: bool):
         self._reviewed = reviewed
-        if not self._selected:
-            self.setStyleSheet(self._get_style("reviewed" if reviewed else "normal"))
+        self.setStyleSheet(self._get_style("reviewed" if reviewed else ("selected" if self._selected else "normal")))
 
     def _get_style(self, state: str) -> str:
         if state == "selected":

@@ -56,6 +56,7 @@ class DateResult:
     all_blank: bool = False
     needs_review: bool = False
     top_candidates: List[DateCandidate] = field(default_factory=list)
+    page_texts: List[str] = field(default_factory=list)
 
 
 DATE_PATTERNS = [
@@ -489,7 +490,8 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
             blank_pages=blank_pages,
             all_blank=all_blank,
             needs_review=False,
-            top_candidates=[]
+            top_candidates=[],
+            page_texts=raw_texts,
         )
 
     deduped = {}
@@ -560,5 +562,6 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
         blank_pages=blank_pages,
         all_blank=all_blank,
         needs_review=needs_review,
-        top_candidates=top_candidates
+        top_candidates=top_candidates,
+        page_texts=raw_texts,
     )

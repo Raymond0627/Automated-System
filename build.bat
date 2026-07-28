@@ -34,6 +34,8 @@ pyinstaller ^
     --add-data "pipeline.py;." ^
     --add-data "paths.py;." ^
     --add-data "enhance.py;." ^
+    --add-data "company_extractor.py;." ^
+    --add-data "known_companies.json;." ^
     --add-data "ui;ui" ^
     --hidden-import pytesseract ^
     --hidden-import cv2 ^
@@ -42,6 +44,9 @@ pyinstaller ^
     --hidden-import PIL ^
     --hidden-import dateparser ^
     --hidden-import dateutil ^
+    --hidden-import rapidfuzz ^
+    --hidden-import rapidfuzz.fuzz ^
+    --hidden-import rapidfuzz.process ^
     --hidden-import PyQt6 ^
     --collect-all PyQt6 ^
     --exclude-module torch ^

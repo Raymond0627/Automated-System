@@ -11,3 +11,4 @@ numpy
 dateparser
 python-dateutil
 PyQt6
+rapidfuzz
