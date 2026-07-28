@@ -67,6 +67,145 @@ DATE_PATTERNS = [
 
 KEYWORDS = ['date', 'dated', 'as of', 'issued', 'effective', 'ref', 're:']
 
+DOC_DATE_LABEL = re.compile(
+    r'\b(?:doc\w*|dc\w{1,5})\s+(?:date|dte|dat|dae)',
+    re.IGNORECASE
+)
+
+ROW_TOLERANCE_PCT = 0.02
+
+
+def _build_positions(ocr_data):
+    words = []
+    positions = []
+    for i in range(len(ocr_data['text'])):
+        text = ocr_data['text'][i].strip()
+        if text:
+            words.append(text)
+            positions.append({
+                'left': ocr_data['left'][i],
+                'top': ocr_data['top'][i],
+                'width': ocr_data['width'][i],
+                'height': ocr_data['height'][i],
+                'conf': ocr_data['conf'][i],
+            })
+    return words, positions
+
+
+def _find_date_in_text(text_chunk):
+    for dp in DATE_PATTERNS:
+        m = re.search(dp, text_chunk, re.IGNORECASE)
+        if m:
+            try:
+                parsed = dateparser.parse(m.group(0), settings={
+                    'PREFER_DAY_OF_MONTH': 'first',
+                    'REQUIRE_PARTS': ['year', 'month', 'day'],
+                })
+                if parsed:
+                    d = parsed.date()
+                    if d.year >= 1950 and d <= date.today():
+                        return d, m.group(0)
+            except Exception:
+                pass
+    return None, None
+
+
+def find_labeled_date_candidates(page_ocr_data_list):
+    labeled = set()
+
+    for entry in page_ocr_data_list:
+        ocr_data = entry['ocr_data']
+        page_idx = entry['page_idx']
+        page_h = entry['page_height']
+        page_w = entry['page_width']
+
+        words, positions = _build_positions(ocr_data)
+        if not words:
+            continue
+
+        page_text = ' '.join(words)
+        row_tol = max(page_h * ROW_TOLERANCE_PCT, 10)
+
+        for label_match in DOC_DATE_LABEL.finditer(page_text):
+            label_end_char = label_match.end()
+            label_start_char = label_match.start()
+
+            label_word_idx = len(page_text[:label_start_char].split())
+            label_word_idx_end = len(page_text[:label_end_char].split()) - 1
+            label_word_idx = min(label_word_idx, len(positions) - 1)
+            label_word_idx_end = min(label_word_idx_end, len(positions) - 1)
+
+            if label_word_idx >= len(positions):
+                continue
+
+            label_y = positions[label_word_idx]['top']
+            label_right = (positions[label_word_idx_end]['left']
+                           + positions[label_word_idx_end]['width'])
+
+            found = False
+
+            for wi in range(len(words)):
+                w_top = positions[wi]['top']
+                w_left = positions[wi]['left']
+                if abs(w_top - label_y) <= row_tol and w_left > label_right:
+                    d, _ = _find_date_in_text(words[wi])
+                    if d:
+                        labeled.add((d, page_idx))
+                        found = True
+                        break
+
+            if not found:
+                for wi in range(len(words)):
+                    w_top = positions[wi]['top']
+                    w_left = positions[wi]['left']
+                    if w_top >= label_y and w_left >= label_right:
+                        d, _ = _find_date_in_text(words[wi])
+                        if d:
+                            labeled.add((d, page_idx))
+                            found = True
+                            break
+
+            if not found:
+                after = page_text[label_end_char:label_end_char + 80]
+                d, _ = _find_date_in_text(after)
+                if d:
+                    labeled.add((d, page_idx))
+
+    return labeled
+
+
+CONTROL_NO_PATTERN = re.compile(r'\b\d{11}\b')
+CONTROL_DATE_PATTERN = re.compile(r'\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b')
+ISO_DATETIME_PATTERN = re.compile(r'\b\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}:\d{2}\b')
+
+
+def find_document_date_via_control_anchor(page_text: str):
+    for ctrl_match in CONTROL_NO_PATTERN.finditer(page_text):
+        ctrl_end = ctrl_match.end()
+        window = page_text[ctrl_end:ctrl_end + 60]
+        date_match = CONTROL_DATE_PATTERN.search(window)
+        if not date_match:
+            continue
+        try:
+            parsed = dateparser.parse(date_match.group(0), settings={
+                'PREFER_DAY_OF_MONTH': 'first',
+                'REQUIRE_PARTS': ['year', 'month', 'day'],
+            })
+            if not parsed:
+                continue
+            d = parsed.date()
+            if d.year < 1950 or d > date.today():
+                continue
+        except Exception:
+            continue
+
+        date_end_in_window = date_match.end()
+        confirm_window = window[date_end_in_window:date_end_in_window + 80]
+        confirmed = bool(ISO_DATETIME_PATTERN.search(confirm_window))
+
+        return {'date': d, 'matched_text': date_match.group(0), 'confirmed_by_date_requested': confirmed}
+    return None
+
 
 def preprocess_image(image: np.ndarray, upscale: float = 1.5) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
@@ -269,6 +408,8 @@ def score_candidate(candidate: DateCandidate, uniqueness_bonus: float) -> float:
 def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150) -> DateResult:
     all_candidates = []
     raw_texts = []
+    page_ocr_data_list = []
+    control_results = {}
     method = f"{engine}_heuristic"
     blank_pages = []
 
@@ -293,15 +434,19 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
             if blank_result["is_blank"] is True:
                 continue
 
-        if all_candidates:
-            continue
-
         if engine == "paddle":
             try:
                 ocr_data = run_ocr(img, engine=engine)
                 raw_text = ' '.join([t for t in ocr_data['text'] if t.strip()])
                 raw_texts.append(raw_text)
+                ctrl = find_document_date_via_control_anchor(raw_text)
+                if ctrl:
+                    control_results[page_idx] = ctrl
                 ph, pw = img.shape[:2]
+                page_ocr_data_list.append({
+                    'ocr_data': ocr_data, 'page_idx': page_idx,
+                    'page_height': ph, 'page_width': pw,
+                })
                 candidates = extract_candidates_from_ocr(ocr_data, 6, pw, ph, page_idx)
                 all_candidates.extend(candidates)
             except Exception:
@@ -319,6 +464,13 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
                     ocr_data = run_ocr(processed, psm, engine=engine)
                     raw_text = ' '.join([t for t in ocr_data['text'] if t.strip()])
                     raw_texts.append(raw_text)
+                    ctrl = find_document_date_via_control_anchor(raw_text)
+                    if ctrl:
+                        control_results[page_idx] = ctrl
+                    page_ocr_data_list.append({
+                        'ocr_data': ocr_data, 'page_idx': page_idx,
+                        'page_height': ph, 'page_width': pw,
+                    })
                     candidates = extract_candidates_from_ocr(ocr_data, psm, pw, ph, page_idx)
                     all_candidates.extend(candidates)
                 except Exception:
@@ -351,12 +503,38 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
     uniqueness_bonus = 15.0 if unique_date_count <= 1 else 0.0
 
     scored = [(c, score_candidate(c, uniqueness_bonus)) for c in unique_candidates]
+
+    labeled_set = find_labeled_date_candidates(page_ocr_data_list)
+
+    control_lookup = {}
+    for pg, cr in control_results.items():
+        control_lookup[(cr['date'], pg)] = cr['confirmed_by_date_requested']
+
+    disagree_pages = set()
+    all_tracked_pages = set(d_p[1] for d_p in labeled_set) | set(control_results.keys())
+    for pg in all_tracked_pages:
+        labeled_dates = {d for d, p in labeled_set if p == pg}
+        control_dates_on_page = {d for d, p in control_lookup.keys() if p == pg}
+        if labeled_dates and control_dates_on_page and not labeled_dates & control_dates_on_page:
+            disagree_pages.add(pg)
+
+    for i, (c, s) in enumerate(scored):
+        key = (c.parsed_date, c.source_page)
+        if c.source_page in disagree_pages:
+            continue
+        in_labeled = key in labeled_set
+        in_control = key in control_lookup
+        if in_labeled and in_control:
+            scored[i] = (c, s + 100)
+        elif in_control:
+            scored[i] = (c, s + (90 if control_lookup[key] else 60))
+
     scored.sort(key=lambda x: x[1], reverse=True)
 
     best_candidate, best_score = scored[0]
     final_confidence = int(min(best_score, 100))
 
-    needs_review = False
+    needs_review = bool(disagree_pages)
     top_candidates = []
     if len(scored) >= 2:
         seen_dates = set()

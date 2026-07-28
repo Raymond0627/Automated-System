@@ -159,6 +159,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                     "method": "auto",
                     "blank_pages": result["blank_pages"],
                     "docsep_pages": result["docsep_pages"],
+                    "raw_ocr_text": date_result.raw_ocr_text,
                 }
                 if qc_result:
                     result["passed_data"]["qc_status"] = qc_result.get("qc_status", "")

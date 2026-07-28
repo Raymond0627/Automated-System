@@ -33,6 +33,7 @@ pyinstaller ^
     --add-data "auto_qc.py;." ^
     --add-data "pipeline.py;." ^
     --add-data "paths.py;." ^
+    --add-data "enhance.py;." ^
     --add-data "ui;ui" ^
     --hidden-import pytesseract ^
     --hidden-import cv2 ^
