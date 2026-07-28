@@ -370,6 +370,9 @@ class ReviewTab(QWidget):
         self.undo_shortcut.activated.connect(self._undo)
 
     def refresh_review(self):
+        _prev_flagged = list(self.all_flagged_docs) if self.all_flagged_docs else []
+        _prev_passed = list(self.passed_docs) if self.passed_docs else []
+
         self.pending_list.clear()
         self.passed_list.clear()
         self.pending_cards = []
@@ -386,10 +389,12 @@ class ReviewTab(QWidget):
             try:
                 with open(flagged_file, "r", encoding="utf-8") as f:
                     all_flagged = json.load(f)
+                if not all_flagged:
+                    all_flagged = _prev_flagged
             except Exception:
-                all_flagged = []
+                all_flagged = _prev_flagged
         else:
-            all_flagged = []
+            all_flagged = _prev_flagged
 
         self.all_flagged_docs = all_flagged
         self.pending_docs = [d for d in all_flagged if not d.get("reviewed")]
@@ -399,10 +404,12 @@ class ReviewTab(QWidget):
             try:
                 with open(passed_file, "r", encoding="utf-8") as f:
                     self.passed_docs = json.load(f)
+                if not self.passed_docs:
+                    self.passed_docs = _prev_passed
             except Exception:
-                self.passed_docs = []
+                self.passed_docs = _prev_passed
         else:
-            self.passed_docs = []
+            self.passed_docs = _prev_passed
 
         for i, doc in enumerate(self.pending_docs):
             card = DocCardWidget(doc, i)
