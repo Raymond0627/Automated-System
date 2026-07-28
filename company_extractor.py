@@ -23,8 +23,19 @@ ADDRESSEE_RE = re.compile(
     r'addressee\s*:\s*(.+)',
     re.IGNORECASE
 )
+ADDRESSEE_ADDRESS_RE = re.compile(
+    r'\s+\d{1,4}\s*[A-Z]?\b.*$|'
+    r'\s+(?:floor|flr?|ave(nue)?|st(reet)?\.?|bldg|building|tower|center|centre|road|drive|house|unit|suite|room|rm)\b.*$',
+    re.IGNORECASE
+)
 
 KNOWN_COMPANIES_FILE = Path(__file__).parent / "known_companies.json"
+
+TITLE_PREFIX_RE = re.compile(
+    r'^(?:AND\s+(?:CHIEF\s+EXECUTIVE\s+OFFICER|CEO|PRESIDENT|CHAIRMAN|MANAGING\s+DIRECTOR)\s+|'
+    r'CEO\s+|CHIEF\s+EXECUTIVE\s+OFFICER\s+|PRESIDENT\s+|CHAIRMAN\s+|MANAGING\s+DIRECTOR\s+)',
+    re.IGNORECASE
+)
 
 ABBREVIATIONS = [
     (re.compile(r'\bINCORPORATED\b', re.IGNORECASE), 'INC'),
@@ -58,6 +69,7 @@ def extract_company_name_from_header(page_text: str) -> Optional[str]:
     candidate = page_text[search_start:search_end]
     candidate = re.sub(r'[.,:;\-|]+', ' ', candidate).strip()
     candidate = re.sub(r'\s+', ' ', candidate).strip()
+    candidate = TITLE_PREFIX_RE.sub('', candidate).strip()
 
     if len(candidate) < 4:
         return None
@@ -73,6 +85,11 @@ def extract_company_name_from_addressee(page_text: str) -> Optional[str]:
     candidate = match.group(1).strip()
     candidate = re.sub(r'[.,:;\-|]+', ' ', candidate).strip()
     candidate = re.sub(r'\s+', ' ', candidate).strip()
+    candidate = TITLE_PREFIX_RE.sub('', candidate).strip()
+
+    address_match = ADDRESSEE_ADDRESS_RE.search(candidate)
+    if address_match:
+        candidate = candidate[:address_match.start()].strip()
 
     if len(candidate) < 4:
         return None
@@ -96,7 +113,15 @@ def correct_company_name(normalized: str, known_companies: List[str], threshold:
     if not known_companies or fuzz is None:
         return normalized
 
-    match = extractOne(normalized, known_companies, scorer=fuzz.token_sort_ratio)
+    for company in known_companies:
+        if company.startswith(normalized) and len(normalized) >= len(company) * 0.4:
+            return company
+
+    words = normalized.split()
+    if len(words) < 2:
+        return normalized
+
+    match = extractOne(normalized, known_companies, scorer=fuzz.token_set_ratio)
     if match and match[1] >= threshold:
         return match[0]
 
@@ -143,7 +168,7 @@ def get_company_name_for_filename(page_ocr_data_list: list, fallback_folder_name
             normalized = normalize_company_name(result)
             if known_companies and fuzz is not None:
                 corrected = correct_company_name(normalized, known_companies)
-                score_match = extractOne(normalized, known_companies, scorer=fuzz.token_sort_ratio)
+                score_match = extractOne(normalized, known_companies, scorer=fuzz.token_set_ratio)
                 score = int(score_match[1]) if score_match else None
                 if corrected != normalized:
                     return {
@@ -175,7 +200,7 @@ def get_company_name_for_filename(page_ocr_data_list: list, fallback_folder_name
             normalized = normalize_company_name(result)
             if known_companies and fuzz is not None:
                 corrected = correct_company_name(normalized, known_companies)
-                score_match = extractOne(normalized, known_companies, scorer=fuzz.token_sort_ratio)
+                score_match = extractOne(normalized, known_companies, scorer=fuzz.token_set_ratio)
                 score = int(score_match[1]) if score_match else None
                 if corrected != normalized:
                     return {

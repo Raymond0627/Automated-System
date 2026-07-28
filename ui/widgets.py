@@ -20,7 +20,7 @@ from paths import BASE_DIR
 from date_extractor import extract_document_date, DateResult
 from pipeline import PipelineConfig, parse_folder_structure, save_confirmed_documents
 from auto_qc import run_qc_on_pdf, detect_docsep_flag
-from company_extractor import get_company_name_for_filename, learn_company_name
+from company_extractor import get_company_name_for_filename
 
 import pytesseract
 
@@ -324,7 +324,6 @@ class PipelineThread(QThread):
                         doc.confirmed_date = passed_data.get("detected_date")
                         doc.confirmed_method = passed_data.get("method", "auto")
                         doc.flagged_data = None
-                        learn_company_name(passed_data.get("company_name", ""))
                         self.doc_processed.emit("passed", passed_data)
                     else:
                         doc.flagged_data = None

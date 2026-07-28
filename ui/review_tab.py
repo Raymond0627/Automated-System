@@ -22,7 +22,7 @@ from pipeline import (
     update_document_from_review, finalize_all_divisions, save_confirmed_documents
 )
 from enhance import enhance_page
-from company_extractor import normalize_company_name, learn_company_name
+from company_extractor import normalize_company_name, learn_company_name, load_known_companies, save_known_companies
 
 from .widgets import DocCardWidget, PassedDocCardWidget
 
@@ -212,6 +212,11 @@ class ReviewTab(QWidget):
         self.ocr_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.ocr_btn.clicked.connect(self.toggle_ocr_panel)
 
+        self.add_roster_btn = QPushButton("Add to Roster")
+        self.add_roster_btn.setFixedHeight(26)
+        self.add_roster_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.add_roster_btn.clicked.connect(self._add_to_roster)
+
         self.company_input = QLineEdit()
         self.company_input.setFixedHeight(26)
         self.company_input.setFont(QFont("Segoe UI", 9))
@@ -346,6 +351,7 @@ class ReviewTab(QWidget):
         bottom.addWidget(QLabel("Company:"))
         bottom.addWidget(self.company_input)
         bottom.addWidget(self.confirm_btn)
+        bottom.addWidget(self.add_roster_btn)
         bottom.addWidget(self.ocr_btn)
         bottom.addStretch()
         self.finalize_btn = QPushButton("FINALIZE")
@@ -1017,6 +1023,20 @@ class ReviewTab(QWidget):
         elif self.active_list == "passed" and self.active_index < len(self.passed_docs) - 1:
             self.passed_list.setCurrentRow(self.active_index + 1)
 
+    def _add_to_roster(self):
+        company_text = self._get_company_from_widgets()
+        if not company_text:
+            QMessageBox.information(self, "No Company Name", "Enter a company name in the Company field first.")
+            return
+        normalized = normalize_company_name(company_text)
+        companies = load_known_companies()
+        if normalized in companies:
+            QMessageBox.information(self, "Already Exists", f"'{normalized}' is already in the roster.")
+            return
+        companies.append(normalized)
+        save_known_companies(companies)
+        QMessageBox.information(self, "Added", f"'{normalized}' added to the company roster.")
+
     def confirm_date(self):
         if self.active_index < 0 or not self.active_list:
             return
@@ -1030,7 +1050,6 @@ class ReviewTab(QWidget):
                 confirmed_company = normalize_company_name(company_text)
             else:
                 confirmed_company = original_company
-            learn_company_name(confirmed_company)
 
             doc["confirmed_date"] = dt
             doc["company_name"] = confirmed_company
@@ -1071,7 +1090,6 @@ class ReviewTab(QWidget):
                 confirmed_company = normalize_company_name(company_text)
             else:
                 confirmed_company = original_company
-            learn_company_name(confirmed_company)
 
             doc["detected_date"] = dt
             doc["company_name"] = confirmed_company
