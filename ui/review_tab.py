@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QSpinBox, QScrollArea, QListWidget, QListWidgetItem, QSplitter,
     QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog,
-    QMenu, QInputDialog, QFrame, QLineEdit
+    QMenu, QInputDialog, QFrame, QLineEdit, QCompleter
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence
@@ -226,6 +226,13 @@ class ReviewTab(QWidget):
         self.company_input.setFont(QFont("Segoe UI", 9))
         self.company_input.setMinimumWidth(200)
         self.company_input.setPlaceholderText("Company name...")
+
+        known_companies = load_known_companies()
+        self._company_completer = QCompleter(known_companies, self)
+        self._company_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._company_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self._company_completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        self.company_input.setCompleter(self._company_completer)
 
         nav_row = QHBoxLayout()
         nav_row.setSpacing(4)
@@ -1046,6 +1053,7 @@ class ReviewTab(QWidget):
             return
         companies.append(normalized)
         save_known_companies(companies)
+        self._company_completer.model().setStringList(companies)
         QMessageBox.information(self, "Added", f"'{normalized}' added to the company roster.")
 
     def confirm_date(self):
