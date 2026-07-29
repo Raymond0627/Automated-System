@@ -10,8 +10,12 @@ from PyQt6.QtWidgets import (
     QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog,
     QMenu, QInputDialog, QFrame, QLineEdit, QCompleter
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence
+from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QRectF, QPointF
+from PyQt6.QtGui import (
+    QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence,
+    QPainter, QPen, QBrush, QColor, QCursor
+)
+from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QRectF, QPointF
 
 import sys
 if not getattr(sys, 'frozen', False):
@@ -43,6 +47,127 @@ class ClickableLabel(QLabel):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit(self._page_num)
         super().mousePressEvent(event)
+
+
+class CropOverlay(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self._crop_rect = None
+        self._handle_size = 10
+        self._dragging = None
+        self._drag_start = None
+        self._min_size = 40
+
+    def set_crop_rect(self, rect):
+        self._crop_rect = QRectF(rect)
+        self.update()
+
+    def get_crop_rect(self):
+        return QRectF(self._crop_rect) if self._crop_rect else None
+
+    def _handles(self):
+        r = self._crop_rect
+        if not r:
+            return []
+        hs = self._handle_size / 2
+        cx, cy = r.center().x(), r.center().y()
+        return [
+            ("tl", QRectF(r.left() - hs, r.top() - hs, self._handle_size, self._handle_size)),
+            ("tr", QRectF(r.right() - hs, r.top() - hs, self._handle_size, self._handle_size)),
+            ("bl", QRectF(r.left() - hs, r.bottom() - hs, self._handle_size, self._handle_size)),
+            ("br", QRectF(r.right() - hs, r.bottom() - hs, self._handle_size, self._handle_size)),
+            ("t", QRectF(cx - hs, r.top() - hs, self._handle_size, self._handle_size)),
+            ("b", QRectF(cx - hs, r.bottom() - hs, self._handle_size, self._handle_size)),
+            ("l", QRectF(r.left() - hs, cy - hs, self._handle_size, self._handle_size)),
+            ("r", QRectF(r.right() - hs, cy - hs, self._handle_size, self._handle_size)),
+        ]
+
+    def paintEvent(self, event):
+        if not self._crop_rect:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = self._crop_rect
+        w, h = self.width(), self.height()
+
+        p.setBrush(QColor(0, 0, 0, 120))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRect(QRectF(0, 0, w, r.top()))
+        p.drawRect(QRectF(0, r.bottom(), w, h - r.bottom()))
+        p.drawRect(QRectF(0, r.top(), r.left(), r.height()))
+        p.drawRect(QRectF(r.right(), r.top(), w - r.right(), r.height()))
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255), 1.5, Qt.PenStyle.DashLine))
+        p.drawRect(r)
+
+        p.setBrush(QColor(255, 255, 255))
+        p.setPen(QPen(QColor(0, 0, 0), 1))
+        for _, hr in self._handles():
+            p.drawRect(hr)
+        p.end()
+
+    def _hit_handle(self, pos):
+        for name, hr in self._handles():
+            if hr.adjusted(-2, -2, 2, 2).contains(pos):
+                return name
+        return None
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton or not self._crop_rect:
+            return
+        pos = event.position() if hasattr(event, 'position') else event.pos()
+        handle = self._hit_handle(pos)
+        if handle:
+            self._dragging = handle
+            self._drag_start = pos
+        elif self._crop_rect.contains(pos):
+            self._dragging = "move"
+            self._drag_start = pos
+
+    def mouseMoveEvent(self, event):
+        if not self._dragging or not self._crop_rect:
+            return
+        pos = event.position() if hasattr(event, 'position') else event.pos()
+        dx = pos.x() - self._drag_start.x()
+        dy = pos.y() - self._drag_start.y()
+        self._drag_start = pos
+        r = QRectF(self._crop_rect)
+
+        if self._dragging == "move":
+            r.translate(dx, dy)
+        elif self._dragging == "tl":
+            r.setTopLeft(r.topLeft() + QPointF(dx, dy))
+        elif self._dragging == "tr":
+            r.setTopRight(r.topRight() + QPointF(dx, dy))
+        elif self._dragging == "bl":
+            r.setBottomLeft(r.bottomLeft() + QPointF(dx, dy))
+        elif self._dragging == "br":
+            r.setBottomRight(r.bottomRight() + QPointF(dx, dy))
+        elif self._dragging == "t":
+            r.setTop(r.top() + dy)
+        elif self._dragging == "b":
+            r.setBottom(r.bottom() + dy)
+        elif self._dragging == "l":
+            r.setLeft(r.left() + dx)
+        elif self._dragging == "r":
+            r.setRight(r.right() + dx)
+
+        if r.width() >= self._min_size and r.height() >= self._min_size:
+            self._crop_rect = r
+        self.update()
+
+    def mouseReleaseEvent(self, event):
+        if self._dragging and self._crop_rect:
+            bounds = QRectF(0, 0, self.width(), self.height())
+            self._crop_rect = self._crop_rect.intersected(bounds)
+            if self._crop_rect.width() < self._min_size or self._crop_rect.height() < self._min_size:
+                self._crop_rect = bounds
+        self._dragging = None
+        self._drag_start = None
+        self.update()
 
 
 class FinalizeWorker(QThread):
@@ -185,6 +310,9 @@ class ReviewTab(QWidget):
         self._zoom_timer.timeout.connect(self.render_preview)
         self.page_labels = []
         self.document_modified = False
+        self._crop_mode = False
+        self._crop_page_num = -1
+        self._crop_overlay = None
         self.undo_stack = []
         self.undo_max = 50
         self.view_mode = "one_page"
@@ -369,6 +497,12 @@ class ReviewTab(QWidget):
         bottom.addWidget(QLabel("Company:"))
         bottom.addWidget(self.company_input)
         bottom.addWidget(self.confirm_btn)
+        self.save_crop_btn = QPushButton("Save")
+        self.save_crop_btn.setFixedHeight(26)
+        self.save_crop_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.save_crop_btn.clicked.connect(self.apply_crop)
+        self.save_crop_btn.setVisible(False)
+        bottom.addWidget(self.save_crop_btn)
         bottom.addWidget(self.add_roster_btn)
         bottom.addWidget(self.ocr_btn)
         bottom.addStretch()
@@ -563,6 +697,7 @@ class ReviewTab(QWidget):
         self.load_document(self.passed_docs[row])
 
     def load_document(self, doc: dict):
+        self.exit_crop_mode()
         if self.current_pdf_doc:
             try:
                 self.current_pdf_doc.close()
@@ -847,6 +982,10 @@ class ReviewTab(QWidget):
         enhance_act.triggered.connect(lambda: self._enhance_page(page_num))
         menu.addAction(enhance_act)
         menu.addSeparator()
+        crop_act = QAction("Crop Page", self)
+        crop_act.triggered.connect(lambda: self.enter_crop_mode(page_num))
+        menu.addAction(crop_act)
+        menu.addSeparator()
         mark_blank = QAction("Mark as Blank Page", self)
         mark_blank.triggered.connect(lambda: self._mark_blank(page_num))
         menu.addAction(mark_blank)
@@ -947,6 +1086,68 @@ class ReviewTab(QWidget):
         except Exception as e:
             QMessageBox.critical(self, "Enhance Error", f"Failed to enhance page:\n{e}")
 
+    def enter_crop_mode(self, page_num):
+        if not self.current_pdf_doc or self._crop_mode:
+            return
+        if page_num < 0 or page_num >= len(self.page_labels):
+            return
+        self._push_undo()
+        self._crop_mode = True
+        self._crop_page_num = page_num
+        lbl = self.page_labels[page_num]
+        self._crop_label = lbl
+        overlay = CropOverlay(lbl)
+        overlay.setGeometry(0, 0, lbl.width(), lbl.height())
+        overlay.set_crop_rect(QRectF(0, 0, lbl.width(), lbl.height()))
+        overlay.show()
+        self._crop_overlay = overlay
+        self.save_crop_btn.setVisible(True)
+        self.confirm_btn.setEnabled(False)
+
+    def apply_crop(self):
+        if not self._crop_mode or not self._crop_overlay or not self.current_pdf_doc:
+            return
+        crop_rect = self._crop_overlay.get_crop_rect()
+        if not crop_rect:
+            self.exit_crop_mode()
+            return
+        lbl = self._crop_label
+        page_num = self._crop_page_num
+        page = self.current_pdf_doc[page_num]
+        page_w_pts = page.rect.width
+        page_h_pts = page.rect.height
+        if lbl.width() <= 0 or lbl.height() <= 0:
+            self.exit_crop_mode()
+            return
+        sx = page_w_pts / lbl.width()
+        sy = page_h_pts / lbl.height()
+        pdf_rect = fitz.Rect(
+            crop_rect.left() * sx,
+            crop_rect.top() * sy,
+            crop_rect.right() * sx,
+            crop_rect.bottom() * sy,
+        )
+        full = page.rect
+        if (abs(pdf_rect.x0 - full.x0) < 1 and abs(pdf_rect.y0 - full.y0) < 1
+                and abs(pdf_rect.x1 - full.x1) < 1 and abs(pdf_rect.y1 - full.y1) < 1):
+            self.exit_crop_mode()
+            return
+        page.set_cropbox(pdf_rect)
+        self.document_modified = True
+        self.exit_crop_mode()
+        self.render_preview()
+
+    def exit_crop_mode(self):
+        if self._crop_overlay:
+            self._crop_overlay.setParent(None)
+            self._crop_overlay.deleteLater()
+            self._crop_overlay = None
+        self._crop_mode = False
+        self._crop_page_num = -1
+        self._crop_label = None
+        self.save_crop_btn.setVisible(False)
+        self.confirm_btn.setEnabled(True)
+
     def _get_current_doc(self):
         if self.active_list == "pending" and self.active_index >= 0:
             return self.pending_docs[self.active_index]
@@ -1015,6 +1216,7 @@ class ReviewTab(QWidget):
             self.undo_stack.pop(0)
 
     def _undo(self):
+        self.exit_crop_mode()
         if not self.undo_stack or not self.current_pdf_doc:
             return
         state = self.undo_stack.pop()
