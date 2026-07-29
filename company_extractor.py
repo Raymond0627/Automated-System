@@ -31,6 +31,11 @@ ADDRESSEE_ADDRESS_RE = re.compile(
 
 KNOWN_COMPANIES_FILE = Path(__file__).parent / "known_companies.json"
 
+COMPANY_SUFFIX_RE = re.compile(
+    r'\b(\w*(?:INSURANCE|INS|CO|LTD|COMPANY|CORP|CORPORATION|ASSURANCE|POLICY))\b',
+    re.IGNORECASE
+)
+
 TITLE_PREFIX_RE = re.compile(
     r'^(?:AND\s+(?:CHIEF\s+EXECUTIVE\s+OFFICER|CEO|PRESIDENT|CHAIRMAN|MANAGING\s+DIRECTOR)\s+|'
     r'CEO\s+|CHIEF\s+EXECUTIVE\s+OFFICER\s+|PRESIDENT\s+|CHAIRMAN\s+|MANAGING\s+DIRECTOR\s+)',
@@ -95,6 +100,51 @@ def extract_company_name_from_addressee(page_text: str) -> Optional[str]:
         return None
 
     return candidate
+
+
+def extract_company_name_from_keywords(page_text: str, known_companies: List[str]) -> Optional[dict]:
+    if not known_companies or fuzz is None:
+        return None
+
+    for match in COMPANY_SUFFIX_RE.finditer(page_text):
+        suffix_word = match.group(1)
+        match_pos = match.start()
+
+        words_before = page_text[:match_pos].split()
+        words_after = page_text[match_pos + len(suffix_word):].split()
+
+        before = words_before[-10:] if len(words_before) > 10 else words_before
+        after = words_after[:5] if len(words_after) > 5 else words_after
+
+        window = ' '.join(before + [suffix_word] + after)
+        window = re.sub(r'[.,:;\-|]+', ' ', window).strip()
+        window = re.sub(r'\s+', ' ', window).strip()
+
+        if len(window) < 4:
+            continue
+
+        normalized = normalize_company_name(window)
+        corrected = correct_company_name(normalized, known_companies)
+
+        if corrected != normalized:
+            return {
+                'company_name': corrected,
+                'source': 'keyword',
+                'fuzzy_match_score': None,
+                'needs_review': False,
+            }
+
+        score_match = extractOne(normalized, known_companies, scorer=fuzz.token_set_ratio)
+        score = int(score_match[1]) if score_match else None
+        if score is not None and score >= 80:
+            return {
+                'company_name': score_match[0],
+                'source': 'keyword',
+                'fuzzy_match_score': score,
+                'needs_review': False,
+            }
+
+    return None
 
 
 def normalize_company_name(raw: str) -> str:
@@ -221,6 +271,15 @@ def get_company_name_for_filename(page_ocr_data_list: list, fallback_folder_name
                 'fuzzy_match_score': None,
                 'needs_review': False,
             }
+
+    for entry in page_ocr_data_list:
+        page_text = entry.get('page_text', '')
+        if not page_text:
+            continue
+
+        keyword_result = extract_company_name_from_keywords(page_text, known_companies)
+        if keyword_result:
+            return keyword_result
 
     normalized_folder = normalize_company_name(fallback_folder_name)
     return {

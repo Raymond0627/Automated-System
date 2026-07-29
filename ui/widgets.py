@@ -141,7 +141,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 result["flagged_data"]["qc"] = qc_result
             result["log_messages"].append(f"[BLANK] {original_filename}: ALL BLANK ({total_pages} pages){qc_str}{docsep_msg}")
         elif date_result.confidence >= config.get("confidence_threshold", 70) and date_result.date:
-            company_known = (company_result['source'] in ('header', 'addressee')
+            company_known = (company_result['source'] in ('header', 'addressee', 'keyword')
                              and not company_result.get('needs_review', False))
             if qc_failed:
                 result["status"] = "flagged"
