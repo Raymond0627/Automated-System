@@ -21,8 +21,6 @@ from company_extractor import (
     KNOWN_COMPANIES_FILE
 )
 
-COMPANY_SAMPLE_CSV = "company_name\nFWD LIFE INS CORP\nSUN LIFE OF CANADA PHILS INC\nALLIANZ PNB LIFE INS INC\nMAXICARE HEALTHCARE CORP\nPIONEER LIFE INC\n"
-
 # ---------------------------------------------------------------------------
 # Minimal, flat style constants
 # ---------------------------------------------------------------------------
@@ -198,15 +196,15 @@ class CompanyRosterDialog(QDialog):
         self.import_csv_btn.clicked.connect(self._import_csv)
         btn_row.addWidget(self.import_csv_btn)
 
+        self.export_csv_btn = QPushButton("Export CSV")
+        self.export_csv_btn.clicked.connect(self._export_csv)
+        btn_row.addWidget(self.export_csv_btn)
+
         self.delete_btn = QPushButton("Delete Selected")
         self.delete_btn.clicked.connect(self._delete_selected)
         btn_row.addWidget(self.delete_btn)
 
         btn_row.addStretch()
-
-        self.download_sample_btn = QPushButton("Download Sample CSV")
-        self.download_sample_btn.clicked.connect(self._download_sample_csv)
-        btn_row.addWidget(self.download_sample_btn)
 
         layout.addLayout(btn_row)
 
@@ -328,18 +326,21 @@ class CompanyRosterDialog(QDialog):
                     self.all_companies.remove(name)
             self._refresh_list(self.search_input.text())
 
-    def _download_sample_csv(self):
+    def _export_csv(self):
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save Sample CSV", "company_roster_sample.csv", "CSV Files (*.csv)"
+            self, "Export Company Roster", "company_roster.csv", "CSV Files (*.csv)"
         )
         if not file_path:
             return
         try:
             with open(file_path, "w", encoding="utf-8", newline="") as f:
-                f.write(COMPANY_SAMPLE_CSV)
-            QMessageBox.information(self, "Saved", f"Sample CSV saved to:\n{file_path}")
+                writer = csv.writer(f)
+                writer.writerow(["company_name"])
+                for company in sorted(self.all_companies):
+                    writer.writerow([company])
+            QMessageBox.information(self, "Exported", f"Exported {len(self.all_companies)} companies to:\n{file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Failed to save file:\n{e}")
+            QMessageBox.critical(self, "Export Error", f"Failed to export CSV:\n{e}")
 
     def _save_and_close(self):
         save_known_companies(self.all_companies)

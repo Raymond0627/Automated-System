@@ -27,6 +27,10 @@ from company_extractor import normalize_company_name, learn_company_name, load_k
 from .widgets import DocCardWidget, PassedDocCardWidget
 
 
+def _norm_path(p):
+    return os.path.normcase(os.path.normpath(os.path.abspath(p))) if p else ""
+
+
 class ClickableLabel(QLabel):
     clicked = pyqtSignal(int)
 
@@ -96,7 +100,10 @@ class FinalizeWorker(QThread):
                             doc.confirmed_date = date.fromisoformat(pd["detected_date"])
                             doc.confirmed_method = pd.get("method", "auto")
                             doc.status = "confirmed"
-                            if pd.get("modified_path"):
+                            if pd.get("_pending_pdf_bytes"):
+                                doc._pending_pdf_bytes = pd["_pending_pdf_bytes"]
+                            elif pd.get("modified_path"):
+                                doc._original_input_path = doc.original_path
                                 doc.original_path = pd["modified_path"]
                             doc.blank_pages = pd.get("blank_pages", [])
                             doc.docsep_pages = pd.get("docsep_pages", [])
@@ -376,9 +383,19 @@ class ReviewTab(QWidget):
         self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
         self.undo_shortcut.activated.connect(self._undo)
 
+    def refresh_completer(self):
+        companies = load_known_companies()
+        self._company_completer.model().setStringList(companies)
+
     def refresh_review(self):
         _prev_flagged = list(self.all_flagged_docs) if self.all_flagged_docs else []
         _prev_passed = list(self.passed_docs) if self.passed_docs else []
+
+        _old_pending_bytes = {}
+        for pd in _prev_passed:
+            pb = pd.get("_pending_pdf_bytes")
+            if pb:
+                _old_pending_bytes[_norm_path(pd.get("original_path", ""))] = pb
 
         self.pending_list.clear()
         self.passed_list.clear()
@@ -417,6 +434,11 @@ class ReviewTab(QWidget):
                 self.passed_docs = _prev_passed
         else:
             self.passed_docs = _prev_passed
+
+        for pd in self.passed_docs:
+            key = _norm_path(pd.get("original_path", ""))
+            if key in _old_pending_bytes and "_pending_pdf_bytes" not in pd:
+                pd["_pending_pdf_bytes"] = _old_pending_bytes[key]
 
         for i, doc in enumerate(self.pending_docs):
             card = DocCardWidget(doc, i)
@@ -558,16 +580,28 @@ class ReviewTab(QWidget):
         else:
             self.doc_nav_label.setText(f"Passed {self.active_index + 1} of {len(self.passed_docs)}")
 
-        mod_path = doc.get("modified_path", "")
-        pdf_path = mod_path if (mod_path and os.path.exists(mod_path)) else doc.get("original_path", "")
         loaded = False
-        if pdf_path and os.path.exists(pdf_path):
+
+        pending_bytes = doc.get("_pending_pdf_bytes")
+        if pending_bytes:
             try:
-                self.current_pdf_doc = fitz.open(pdf_path)
+                self.current_pdf_doc = fitz.open("pdf", pending_bytes)
                 self.total_pages = len(self.current_pdf_doc)
                 loaded = True
+                self.document_modified = True
             except Exception:
                 pass
+
+        if not loaded:
+            mod_path = doc.get("modified_path", "")
+            pdf_path = mod_path if (mod_path and os.path.exists(mod_path)) else doc.get("original_path", "")
+            if pdf_path and os.path.exists(pdf_path):
+                try:
+                    self.current_pdf_doc = fitz.open(pdf_path)
+                    self.total_pages = len(self.current_pdf_doc)
+                    loaded = True
+                except Exception:
+                    pass
 
         if not loaded:
             flagged_pdf = Path(self.config["flagged_root"]) / doc.get("division_code", "") / doc.get("company_name", "") / doc.get("original_filename", "")
@@ -1093,10 +1127,7 @@ class ReviewTab(QWidget):
             })
 
             if self.document_modified and self.current_pdf_doc:
-                mod_path = Path(self.config["flagged_root"]) / doc.get("division_code", "") / confirmed_company / doc.get("original_filename", "")
-                mod_path.parent.mkdir(parents=True, exist_ok=True)
-                self.current_pdf_doc.save(str(mod_path), incremental=False, garbage=4, deflate=True)
-                self.passed_docs[-1]["modified_path"] = str(mod_path)
+                self.passed_docs[-1]["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
 
             self._save_passed_updates()
 
@@ -1113,10 +1144,7 @@ class ReviewTab(QWidget):
             doc["detected_date"] = dt
             doc["company_name"] = confirmed_company
             if self.document_modified and self.current_pdf_doc:
-                mod_path = Path(self.config["flagged_root"]) / doc.get("division_code", "") / confirmed_company / doc.get("original_filename", "")
-                mod_path.parent.mkdir(parents=True, exist_ok=True)
-                self.current_pdf_doc.save(str(mod_path), incremental=False, garbage=4, deflate=True)
-                doc["modified_path"] = str(mod_path)
+                doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
             self._save_passed_updates()
 
             card = self.passed_cards[self.active_index]
@@ -1172,14 +1200,16 @@ class ReviewTab(QWidget):
     def _save_flagged_updates(self):
         flagged_file = Path(self.config["flagged_root"]) / "flagged_index.json"
         flagged_file.parent.mkdir(parents=True, exist_ok=True)
+        clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.all_flagged_docs]
         with open(flagged_file, "w", encoding="utf-8") as f:
-            json.dump(self.all_flagged_docs, f, indent=2, ensure_ascii=False)
+            json.dump(clean, f, indent=2, ensure_ascii=False)
 
     def _save_passed_updates(self):
         passed_file = Path(self.config["flagged_root"]) / "passed_index.json"
         passed_file.parent.mkdir(parents=True, exist_ok=True)
+        clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.passed_docs]
         with open(passed_file, "w", encoding="utf-8") as f:
-            json.dump(self.passed_docs, f, indent=2, ensure_ascii=False)
+            json.dump(clean, f, indent=2, ensure_ascii=False)
 
     def finalize_all(self):
         if not self.passed_docs and not any(d.get("reviewed") for d in self.all_flagged_docs):

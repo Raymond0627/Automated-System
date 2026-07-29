@@ -326,7 +326,8 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
 
             if config.keep_input_structure:
                 try:
-                    rel = Path(doc.original_path).relative_to(config.input_root)
+                    path_for_rel = getattr(doc, '_original_input_path', doc.original_path)
+                    rel = Path(path_for_rel).relative_to(config.input_root)
                     parts = rel.parts
                     subfolder = parts[1] if len(parts) > 2 else ""
                 except (ValueError, IndexError):
@@ -348,7 +349,12 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
                 output_path = original_output_path.parent / f"{stem}_{counter}{original_output_path.suffix}"
                 counter += 1
 
-            shutil.copy2(doc.original_path, output_path)
+            pending_bytes = getattr(doc, '_pending_pdf_bytes', None)
+            if pending_bytes:
+                with open(str(output_path), "wb") as f:
+                    f.write(pending_bytes)
+            else:
+                shutil.copy2(doc.original_path, output_path)
 
             blank_removed_count = 0
             docsep_removed_count = 0

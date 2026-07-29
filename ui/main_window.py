@@ -72,7 +72,7 @@ class MainWindow(QMainWindow):
             "input_root": "",
             "output_root": "",
             "flagged_root": "",
-            "confidence_threshold": 20,
+            "confidence_threshold": 85,
             "page_index": 0,
             "earliest_year": 1950,
             "ocr_engine": "tesseract",
@@ -83,9 +83,9 @@ class MainWindow(QMainWindow):
             "qc_blank_threshold": 1.5,
             "qc_rotation_threshold": 65,
             "qc_mirror_threshold": 15,
-            "rename_enabled": True,
+            "rename_enabled": False,
             "audit_enabled": True,
-            "render_dpi": 150,
+            "render_dpi": 200,
             "max_workers": 4,
             "gpu_mode": "cpu",
             "remote_gpu_url": "",
@@ -98,7 +98,7 @@ class MainWindow(QMainWindow):
             "enhance_denoise_strength": 5,
             "enhance_denoise_template": 7,
             "enhance_denoise_search": 21,
-            "enhance_sharpen_amount": 0.5,
+            "enhance_sharpen_amount": 1.0,
             "enhance_sharpen_blur": 1.0,
             "enhance_white_point": 98.0,
             "enhance_color_clahe_clip": 2.0,
@@ -114,6 +114,9 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, index):
         self.statusBar().showMessage(f"Tab: {self.tabs.tabText(index)}")
+        tab_name = self.tabs.tabText(index)
+        if tab_name == "Review":
+            self.review_tab.refresh_completer()
 
     def _check_first_run(self):
         input_root = self.config.get("input_root", "")

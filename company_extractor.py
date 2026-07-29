@@ -15,7 +15,7 @@ TITLE_LINE_RE = re.compile(
     re.IGNORECASE
 )
 ADDRESS_LINE_RE = re.compile(
-    r'(\d{1,4}\s|floor|ave(nue)?|st(reet)?\.?|bldg|building|tower|center|centre|road|drive)',
+    r'(\d{1,4}\s|floor|bldg|building|tower|center|centre|drive)',
     re.IGNORECASE
 )
 SUBJECT_RE = re.compile(r'\bSUBJECT\s*:', re.IGNORECASE)
