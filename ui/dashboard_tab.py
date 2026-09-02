@@ -23,12 +23,15 @@ class DashboardTab(QWidget):
     pipeline_finished = pyqtSignal()
     doc_update = pyqtSignal(str, dict)
     pipeline_started = pyqtSignal()
+    state_changed = pyqtSignal()
 
     def __init__(self, config: dict):
         super().__init__()
         self.config = config
         self.pipeline_thread = None
         self._cancel_requested = False
+        self._scan_plan = None
+        self._processed_paths = set()
         self.build_ui()
 
     def build_ui(self):
@@ -372,6 +375,9 @@ class DashboardTab(QWidget):
         self.cancel_btn.setEnabled(True)
         self.log_signal.emit("=== Pipeline Started ===")
         self.pipeline_started.emit()
+        self._scan_plan = None
+        self._processed_paths = set()
+        self._emit_state_changed()
 
         self.pipeline_thread = PipelineThread(self.config, 0)
         self.pipeline_thread.progress.connect(self._on_progress)
@@ -379,7 +385,71 @@ class DashboardTab(QWidget):
         self.pipeline_thread.finished_signal.connect(self._on_finished)
         self.pipeline_thread.error_signal.connect(self._on_error)
         self.pipeline_thread.doc_processed.connect(self.doc_update)
+        self.pipeline_thread.doc_completed.connect(self._on_doc_completed)
+        self.pipeline_thread.scan_plan.connect(self._on_scan_plan)
         self.pipeline_thread.start()
+
+    def _on_scan_plan(self, paths):
+        self._scan_plan = list(paths)
+        self._emit_state_changed()
+
+    def resume_scan(self, scan_info, rt):
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
+        plan = (scan_info or {}).get("plan") or []
+        processed = (scan_info or {}).get("processed") or []
+        remaining = [p for p in plan if p not in set(processed)]
+        merged_flagged = list(rt.all_flagged_docs) if rt else []
+        merged_confirmed = list(rt.auto_confirmed_docs) if rt else []
+
+        self.run_btn.setEnabled(False)
+        self.run_btn.setText("Resuming...")
+        self.progress_bar.setValue(5)
+        self.progress_bar.setFormat(f"Resuming ({len(remaining)} remaining)...")
+        self.cancel_btn.setEnabled(True)
+        self.log_signal.emit(f"=== Resuming Pipeline ({len(remaining)} remaining) ===")
+        self._scan_plan = list(plan)
+        self._processed_paths = set(processed)
+        self._emit_state_changed()
+
+        self.pipeline_thread = PipelineThread(
+            self.config,
+            0,
+            plan=plan,
+            existing_paths=set(processed),
+            merged_flagged=merged_flagged,
+            merged_confirmed=merged_confirmed,
+        )
+        self.pipeline_thread.progress.connect(self._on_progress)
+        self.pipeline_thread.log_message.connect(self._append_log)
+        self.pipeline_thread.finished_signal.connect(self._on_finished)
+        self.pipeline_thread.error_signal.connect(self._on_error)
+        self.pipeline_thread.doc_processed.connect(self.doc_update)
+        self.pipeline_thread.doc_completed.connect(self._on_doc_completed)
+        self.pipeline_thread.scan_plan.connect(self._on_scan_plan)
+        self.pipeline_thread.start()
+
+    def _emit_state_changed(self):
+        try:
+            self.state_changed.emit()
+        except RuntimeError:
+            pass
+
+    def _current_scan_state(self):
+        if not self._scan_plan:
+            return None
+        return {
+            "plan": list(self._scan_plan),
+            "processed": sorted(self._processed_paths),
+        }
+
+    def _on_doc_completed(self, kind, path):
+        if kind == "doc":
+            self._processed_paths.add(path)
+            self._emit_state_changed()
+
+    def get_scan_state(self):
+        return self._current_scan_state()
 
     def _on_progress(self, msg: str, pct: int):
         self.progress_bar.setValue(pct)
@@ -394,7 +464,10 @@ class DashboardTab(QWidget):
             self._cancel_requested = False
         else:
             self.progress_bar.setFormat("Complete!")
+            self._scan_plan = None
+            self._processed_paths = set()
         self.progress_bar.setValue(100)
+        self._emit_state_changed()
 
     def _on_error(self, msg: str):
         self._append_log(f"Pipeline error: {msg}")
@@ -402,6 +475,7 @@ class DashboardTab(QWidget):
         self.run_btn.setText("Run Pipeline")
         self.cancel_btn.setEnabled(False)
         self.progress_bar.setFormat("Error")
+        self._emit_state_changed()
 
     def cancel_pipeline(self):
         if self.pipeline_thread and self.pipeline_thread.isRunning():

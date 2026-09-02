@@ -35,6 +35,7 @@ pyinstaller ^
     --add-data "paths.py;." ^
     --add-data "enhance.py;." ^
     --add-data "company_extractor.py;." ^
+    --add-data "session.py;." ^
     --add-data "known_companies.json;." ^
     --add-data "ui;ui" ^
     --hidden-import pytesseract ^

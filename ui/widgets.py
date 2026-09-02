@@ -240,12 +240,26 @@ class PipelineThread(QThread):
     finished_signal = pyqtSignal(list)
     error_signal = pyqtSignal(str)
     doc_processed = pyqtSignal(str, dict)
+    scan_plan = pyqtSignal(list)
+    doc_completed = pyqtSignal(str, str)
 
-    def __init__(self, config: dict, max_files: int = 0):
+    def __init__(
+        self,
+        config: dict,
+        max_files: int = 0,
+        plan: list = None,
+        existing_paths: set = None,
+        merged_flagged: list = None,
+        merged_confirmed: list = None,
+    ):
         super().__init__()
         self.config = config
         self.max_files = max_files
         self._cancelled = False
+        self.plan = plan
+        self.existing_paths = set(existing_paths or ())
+        self.merged_flagged = list(merged_flagged or [])
+        self.merged_confirmed = list(merged_confirmed or [])
 
     def cancel(self):
         self._cancelled = True
@@ -273,44 +287,73 @@ class PipelineThread(QThread):
             batch_size = self.config.get("batch_size", 50)
 
             flagged_root = Path(self.config["flagged_root"])
-            flagged_root.mkdir(parents=True, exist_ok=True)
-            for f in ["flagged_index.json", "passed_index.json"]:
-                p = flagged_root / f
-                if p.exists():
-                    p.unlink()
 
-            batches = parse_folder_structure(pipeline_config.input_root)
-            total = sum(len(b.documents) for b in batches)
+            if self.plan is not None:
+                remaining = [p for p in self.plan if p not in self.existing_paths]
+                self.doc_completed.emit("plan", f"Resuming scan: {len(remaining)}/{len(self.plan)} remaining, {len(self.existing_paths)} already processed")
+                doc_infos = []
+                seen = set()
+                for p in sorted(remaining):
+                    norm = os.path.normcase(p)
+                    c = os.path.normcase(self.config["input_root"])
+                    if not norm.startswith(c):
+                        c2 = os.path.normcase(os.path.dirname(c))
+                        rel = os.path.relpath(p, c2)
+                    else:
+                        rel = os.path.relpath(p, c)
+                    if rel.startswith(".."):
+                        rel = os.path.basename(p)
+                    doc_infos.append({
+                        "original_path": p,
+                        "original_filename": os.path.basename(p),
+                        "division_code": "",
+                        "company_name": "",
+                        "rel_path": rel,
+                    })
+                total = len(doc_infos)
+                self.log_message.emit(f"Resume scan: {total} document(s) remaining")
+            else:
+                flagged_root.mkdir(parents=True, exist_ok=True)
+                for f in ["flagged_index.json", "passed_index.json"]:
+                    pp = flagged_root / f
+                    if pp.exists():
+                        pp.unlink()
 
-            if self.max_files > 0:
-                count = 0
+                batches = parse_folder_structure(pipeline_config.input_root)
+                total = sum(len(b.documents) for b in batches)
+
+                if self.max_files > 0:
+                    count = 0
+                    for batch in batches:
+                        for doc in batch.documents:
+                            if count >= self.max_files:
+                                doc.status = "skipped"
+                            count += 1
+                    total = min(total, self.max_files)
+                    self.log_message.emit(f"Found {total} PDFs (limited to {self.max_files}) in {len(batches)} divisions")
+                else:
+                    self.log_message.emit(f"Found {total} PDFs in {len(batches)} divisions")
+
+                doc_infos = []
                 for batch in batches:
                     for doc in batch.documents:
-                        if count >= self.max_files:
-                            doc.status = "skipped"
-                        count += 1
-                total = min(total, self.max_files)
-                self.log_message.emit(f"Found {total} PDFs (limited to {self.max_files}) in {len(batches)} divisions")
-            else:
-                self.log_message.emit(f"Found {total} PDFs in {len(batches)} divisions")
+                        if doc.status == "skipped":
+                            continue
+                        doc_infos.append({
+                            "original_path": doc.original_path,
+                            "original_filename": doc.original_filename,
+                            "division_code": doc.division_code,
+                            "company_name": doc.company_name,
+                            "_batch": batch,
+                            "_doc": doc,
+                        })
 
-            doc_infos = []
-            for batch in batches:
-                for doc in batch.documents:
-                    if doc.status == "skipped":
-                        continue
-                    doc_infos.append({
-                        "original_path": doc.original_path,
-                        "original_filename": doc.original_filename,
-                        "division_code": doc.division_code,
-                        "company_name": doc.company_name,
-                        "_batch": batch,
-                        "_doc": doc,
-                    })
+            self.scan_plan.emit([info["original_path"] for info in doc_infos])
 
             processed = 0
             start_time = time.time()
             results_by_path = {}
+            new_flagged = []
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_info = {}
@@ -340,33 +383,39 @@ class PipelineThread(QThread):
                     except Exception as e:
                         worker_result = {"status": "error", "log_messages": [f"[ERROR] {info['original_filename']}: {e}"]}
 
-                    doc = info["_doc"]
-                    batch = info["_batch"]
+                    doc = info.get("_doc")
+                    batch = info.get("_batch")
+                    original_path = info["original_path"]
 
-                    results_by_path[info["original_path"]] = worker_result
+                    results_by_path[original_path] = worker_result
 
                     for msg in worker_result.get("log_messages", []):
                         self.log_message.emit(msg)
 
-                    blank_pages = worker_result.get("blank_pages", [])
-                    docsep_pages = worker_result.get("docsep_pages", [])
-                    total_pages = worker_result.get("total_pages", 0)
+                    status = worker_result["status"]
 
-                    doc.blank_pages = list(blank_pages)
-                    doc.docsep_pages = list(docsep_pages)
-                    doc.status = worker_result["status"]
-
-                    if worker_result["status"] == "flagged" and worker_result.get("flagged_data"):
-                        doc.flagged_data = worker_result["flagged_data"]
-                        self.doc_processed.emit("pending", worker_result["flagged_data"])
-                    elif worker_result["status"] == "confirmed" and worker_result.get("passed_data"):
+                    if status == "confirmed" and worker_result.get("passed_data"):
                         passed_data = worker_result["passed_data"]
-                        doc.confirmed_date = passed_data.get("detected_date")
-                        doc.confirmed_method = passed_data.get("method", "auto")
-                        doc.flagged_data = None
                         self.doc_processed.emit("passed", passed_data)
-                    else:
-                        doc.flagged_data = None
+                    elif worker_result.get("flagged_data"):
+                        flagged_data = worker_result["flagged_data"]
+                        new_flagged.append(flagged_data)
+                        self.doc_processed.emit("pending", flagged_data)
+
+                    if doc is not None:
+                        doc.blank_pages = list(worker_result.get("blank_pages", []))
+                        doc.docsep_pages = list(worker_result.get("docsep_pages", []))
+                        doc.status = status
+                        if status == "flagged" and worker_result.get("flagged_data"):
+                            doc.flagged_data = worker_result["flagged_data"]
+                        elif status == "confirmed" and worker_result.get("passed_data"):
+                            doc.confirmed_date = passed_data.get("detected_date")
+                            doc.confirmed_method = passed_data.get("method", "auto")
+                            doc.flagged_data = None
+                        else:
+                            doc.flagged_data = None
+
+                    self.doc_completed.emit("doc", original_path)
 
                     processed += 1
                     elapsed = time.time() - start_time
@@ -379,27 +428,37 @@ class PipelineThread(QThread):
                     if processed % 50 == 0:
                         gc.collect()
 
-            flagged = []
-            for b in batches:
-                for d in b.documents:
-                    if d.status == "flagged" and d.flagged_data:
-                        flagged.append(d.flagged_data)
-            flagged_root = Path(self.config["flagged_root"])
-            flagged_root.mkdir(parents=True, exist_ok=True)
-            with open(flagged_root / "flagged_index.json", "w", encoding="utf-8") as f:
-                json.dump(flagged, f, indent=2, ensure_ascii=False)
+            flagged = list(self.merged_flagged)
+            if self.plan is None:
+                for b in batches:
+                    for d in b.documents:
+                        if d.status == "flagged" and d.flagged_data:
+                            flagged.append(d.flagged_data)
+            else:
+                flagged.extend(new_flagged)
 
-            confirmed = sum(1 for b in batches for d in b.documents if d.status == "confirmed")
-            flagged_count = sum(1 for b in batches for d in b.documents if d.status == "flagged")
-            errors = sum(1 for b in batches for d in b.documents if d.status == "error")
-            blank_docs = sum(1 for b in batches for d in b.documents if d.date_result and d.date_result.all_blank)
-            blank_pages_total = sum(len(d.date_result.blank_pages) for b in batches for d in b.documents if d.date_result and d.date_result.blank_pages)
+            confirmed = list(self.merged_confirmed)
+            if self.plan is not None:
+                confirmed_count = len(confirmed)
+                flagged_count = len(self.merged_flagged) + len(new_flagged)
+                errors = 0
+            else:
+                confirmed_count = sum(1 for b in batches for d in b.documents if d.status == "confirmed")
+                flagged_count = sum(1 for b in batches for d in b.documents if d.status == "flagged")
+                errors = sum(1 for b in batches for d in b.documents if d.status == "error")
+            blank_docs = 0
 
-            save_confirmed_documents(batches, pipeline_config)
+            if self.plan is not None:
+                if new_flagged:
+                    self.progress.emit("Writing flagged index...", 95)
+                self._write_merged_indexes(pipeline_config, flagged)
+            else:
+                flagged_root.mkdir(parents=True, exist_ok=True)
+                with open(flagged_root / "flagged_index.json", "w", encoding="utf-8") as f:
+                    json.dump(flagged, f, indent=2, ensure_ascii=False)
+                save_confirmed_documents(batches, pipeline_config)
 
-            summary = f"--- Done: {confirmed} confirmed, {flagged_count} flagged, {errors} errors"
-            if blank_pages_total > 0:
-                summary += f" | {blank_pages_total} blank page(s) in {blank_docs} doc(s)"
+            summary = f"--- Done: {confirmed_count} confirmed, {flagged_count} flagged, {errors} errors"
             summary += " ---"
             self.log_message.emit(summary)
             self.progress.emit("Complete!", 100)
@@ -411,6 +470,12 @@ class PipelineThread(QThread):
             self.log_message.emit(traceback.format_exc())
         finally:
             gc.collect()
+
+    def _write_merged_indexes(self, config, flagged):
+        flagged_root = Path(config.flagged_root)
+        flagged_root.mkdir(parents=True, exist_ok=True)
+        with open(flagged_root / "flagged_index.json", "w", encoding="utf-8") as f:
+            json.dump(flagged, f, indent=2, ensure_ascii=False)
 
 
 class DocCardWidget(QFrame):

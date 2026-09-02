@@ -16,6 +16,7 @@ from .styles import DARK_THEME
 from .dashboard_tab import DashboardTab
 from .review_tab import ReviewTab
 from .settings_tab import SettingsTab
+from session import set_scan_info
 
 
 class MainWindow(QMainWindow):
@@ -56,6 +57,8 @@ class MainWindow(QMainWindow):
 
         self.dashboard_tab.pipeline_started.connect(self.review_tab.clear_all)
         self.dashboard_tab.doc_update.connect(self.review_tab.add_doc)
+        self.dashboard_tab.state_changed.connect(self._sync_scan_to_session)
+        self.review_tab.session_restored.connect(self._on_session_restored)
 
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
         self.tabs.addTab(self.review_tab, "Review")
@@ -130,3 +133,17 @@ class MainWindow(QMainWindow):
                 "on the Dashboard tab, then click Save.",
             )
             self.tabs.setCurrentIndex(0)
+        else:
+            self.tabs.setCurrentIndex(1)
+
+    def _sync_scan_to_session(self):
+        state = self.dashboard_tab.get_scan_state()
+        if state and state.get("plan"):
+            set_scan_info(state)
+            self.review_tab._schedule_session_save()
+        else:
+            set_scan_info(None)
+
+    def _on_session_restored(self, snap):
+        scan = (snap or {}).get("scan")
+        self.dashboard_tab.resume_scan(scan, self.review_tab)

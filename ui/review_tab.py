@@ -29,6 +29,16 @@ from enhance import enhance_page
 from company_extractor import normalize_company_name, learn_company_name, load_known_companies, save_known_companies
 
 from .widgets import DocCardWidget, PassedDocCardWidget
+from session import (
+    serialize as serialize_session,
+    apply as apply_session,
+    load_snapshot,
+    discard_snapshot,
+    SESSION_FILE as SESSION_FILE,
+    atomic_write as atomic_write_session,
+    get_scan_info,
+    set_scan_info,
+)
 
 
 def _norm_path(p):
@@ -283,6 +293,8 @@ class FinalizeAllWorker(QThread):
 
 
 class ReviewTab(QWidget):
+    session_restored = pyqtSignal(dict)
+
     def __init__(self, config: dict):
         super().__init__()
         self.config = config
@@ -301,6 +313,7 @@ class ReviewTab(QWidget):
         self._confirm_all_worker = None
         self.ocr_dialog = None
         self.reviewed_passed = set()
+        self._reviewed_active_index = -1
         self._toast = None
         self._toast_timer = None
         self.zoom_level = 100
@@ -322,6 +335,11 @@ class ReviewTab(QWidget):
         self._sort_ghost = None
         self._sort_ghost_src = None
         self._sort_indicator = None
+        self._session_dirty = False
+        self._session_timer = QTimer(self)
+        self._session_timer.setSingleShot(True)
+        self._session_timer.setInterval(500)
+        self._session_timer.timeout.connect(self._save_session_now)
         self.build_ui()
 
     def build_ui(self):
@@ -554,9 +572,74 @@ class ReviewTab(QWidget):
         self.esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         self.esc_shortcut.activated.connect(self._on_escape)
 
+        QTimer.singleShot(0, self._restore_session_if_present)
+
     def refresh_completer(self):
         companies = load_known_companies()
         self._company_completer.model().setStringList(companies)
+
+    def _session_changed(self):
+        if get_scan_info():
+            return
+        self._session_timer.start()
+
+    def _schedule_session_save(self):
+        self._session_timer.start()
+
+    def _save_session_now(self):
+        if not self.all_flagged_docs and not self.auto_confirmed_docs and not get_scan_info():
+            discard_snapshot()
+            return
+        try:
+            atomic_write_session(SESSION_FILE, serialize_session(self))
+        except Exception:
+            pass
+
+    def _restore_session_if_present(self):
+        snap = load_snapshot()
+        if not snap:
+            return
+        saved_at = snap.get("saved_at", "unknown time")
+        answer = QMessageBox.question(
+            self,
+            "Restore Session",
+            f"An unsaved session from {saved_at} was found.\n\nRestore it now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            discard_snapshot()
+            return
+        try:
+            self._restore_from_snapshot(snap)
+        except Exception:
+            pass
+        try:
+            self.session_restored.emit(snap)
+        except RuntimeError:
+            pass
+
+    def _restore_from_snapshot(self, snap: dict):
+        restore = apply_session(self, snap)
+        tab = restore.get("active_tab", "pending")
+        idx = restore.get("active_index", -1)
+
+        self.switch_tab(tab)
+        if tab == "reviewed":
+            reviewed_idx = restore.get("reviewed_active_index", -1)
+            if reviewed_idx >= 0:
+                self._reviewed_active_index = reviewed_idx
+            return
+
+        docs = self._get_current_docs()
+        if docs and 0 <= idx < len(docs):
+            self.active_index = idx
+            self.load_document(docs[idx])
+            if tab == "pending":
+                self.doc_list.setCurrentRow(idx)
+            elif tab == "auto_confirmed":
+                self.doc_list.setCurrentRow(idx)
+        self._session_changed()
 
     def refresh_review(self):
         self._exit_sort_mode(rerender=False)
@@ -615,6 +698,7 @@ class ReviewTab(QWidget):
             self.refresh_doc_list()
             if self.active_tab == "pending" and self.pending_docs:
                 self.doc_list.setCurrentRow(0)
+        self._session_changed()
 
     def switch_tab(self, tab_name: str):
         self._exit_sort_mode(rerender=False)
@@ -640,6 +724,7 @@ class ReviewTab(QWidget):
         else:
             self.list_stack.setCurrentWidget(self.doc_list)
             self.refresh_doc_list()
+        self._session_changed()
 
     def refresh_doc_list(self, select_row=None):
         if self.active_tab == "reviewed":
@@ -739,6 +824,16 @@ class ReviewTab(QWidget):
         self.reviewed_docs = reviewed
         if self.active_tab == "reviewed":
             self._populate_reviewed_tree(reviewed)
+            if self._reviewed_active_index >= 0:
+                idx = self._reviewed_active_index
+                self._reviewed_active_index = -1
+                item = self.reviewed_index_to_item.get(idx)
+                if item:
+                    self.reviewed_tree.setCurrentItem(item)
+                    self.reviewed_tree.scrollToItem(item)
+                self.active_index = idx
+                self.load_document(reviewed[idx])
+                self._session_changed()
 
     def _populate_reviewed_tree(self, docs: list):
         self.reviewed_tree.blockSignals(True)
@@ -825,6 +920,7 @@ class ReviewTab(QWidget):
         clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.auto_confirmed_docs]
         with open(auto_file, "w", encoding="utf-8") as f:
             json.dump(clean, f, indent=2, ensure_ascii=False)
+        self._session_changed()
 
     def clear_all(self):
         self.doc_list.blockSignals(True)
@@ -854,6 +950,8 @@ class ReviewTab(QWidget):
         self.confirm_all_btn.setVisible(False)
         self.confirm_all_btn.setEnabled(False)
         self.confirm_all_btn.setText("CONFIRM ALL")
+        discard_snapshot()
+        self._session_changed()
 
     def add_doc(self, doc_type: str, data: dict):
         if doc_type == "pending":
@@ -864,6 +962,7 @@ class ReviewTab(QWidget):
         self.tab_pending_btn.setText(f"Pending ({len(self.pending_docs)})")
         self.tab_auto_confirmed_btn.setText(f"Auto-Confirmed ({len(self.auto_confirmed_docs)})")
         self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.auto_confirmed_docs)} auto | {len(self.reviewed_docs)} reviewed")
+        self._session_changed()
 
     def load_document(self, doc: dict):
         self.exit_crop_mode()
@@ -933,6 +1032,7 @@ class ReviewTab(QWidget):
 
         company_name = doc.get("company_name", "")
         self._set_company_to_widgets(company_name)
+        self._session_changed()
 
     def _set_date_to_widgets(self, date_str: str):
         if date_str and len(date_str) >= 7:
@@ -1216,6 +1316,7 @@ class ReviewTab(QWidget):
     def _set_view_mode(self, mode):
         self.view_mode = mode
         self.render_preview()
+        self._session_changed()
 
     def _delete_page(self, page_num):
         if not self.current_pdf_doc or len(self.current_pdf_doc) <= 1:
@@ -1225,6 +1326,7 @@ class ReviewTab(QWidget):
         self.current_pdf_doc.delete_page(page_num)
         self.document_modified = True
         self.render_preview()
+        self._session_changed()
 
 
     def _rotate_page(self, page_num, degrees):
@@ -1236,6 +1338,7 @@ class ReviewTab(QWidget):
         page.set_rotation((current + degrees) % 360)
         self.document_modified = True
         self.render_preview()
+        self._session_changed()
 
 
     def _flip_page(self, page_num, direction):
@@ -1270,6 +1373,7 @@ class ReviewTab(QWidget):
             os.unlink(tmp.name)
             self.document_modified = True
             self.render_preview()
+            self._session_changed()
     
         except Exception as e:
             QMessageBox.critical(self, "Flip Error", f"Failed to flip page:\n{e}")
@@ -1284,6 +1388,7 @@ class ReviewTab(QWidget):
             enhance_page(page, dpi=dpi, config=self.config)
             self.document_modified = True
             self.render_preview()
+            self._session_changed()
     
         except Exception as e:
             QMessageBox.critical(self, "Enhance Error", f"Failed to enhance page:\n{e}")
@@ -1338,6 +1443,7 @@ class ReviewTab(QWidget):
         self.document_modified = True
         self.exit_crop_mode()
         self.render_preview()
+        self._session_changed()
 
 
     def exit_crop_mode(self):
@@ -1408,6 +1514,7 @@ class ReviewTab(QWidget):
             self.document_modified = True
             self._exit_sort_mode()
             self._show_toast("Sort applied — press Enter again to save")
+            self._session_changed()
         except Exception as e:
             QMessageBox.critical(self, "Sort Error", f"Failed to apply sort:\n{e}")
             self.render_preview()
@@ -1539,6 +1646,7 @@ class ReviewTab(QWidget):
             self.current_pdf_doc.save(out_path, garbage=4, deflate=True)
             self.document_modified = False
             self._show_toast(f"Re-saved: {os.path.basename(out_path)}\n→ {os.path.dirname(out_path)}")
+            self._session_changed()
         except Exception as e:
             QMessageBox.critical(self, "Save Failed", f"Could not save reviewed document:\n{e}")
 
@@ -1560,6 +1668,7 @@ class ReviewTab(QWidget):
         if page_num in docsep_pages:
             docsep_pages.remove(page_num)
         self.render_preview()
+        self._session_changed()
 
 
     def _remove_mark(self, page_num):
@@ -1574,6 +1683,7 @@ class ReviewTab(QWidget):
         if page_num in docsep_pages:
             docsep_pages.remove(page_num)
         self.render_preview()
+        self._session_changed()
 
 
     def _insert_image_page(self, page_num, position):
@@ -1594,6 +1704,7 @@ class ReviewTab(QWidget):
             new_page.insert_image(img_rect, pixmap=img_pix)
             self.document_modified = True
             self.render_preview()
+            self._session_changed()
     
         except Exception as e:
             QMessageBox.critical(self, "Insert Error", f"Failed to insert image:\n{e}")
@@ -1624,6 +1735,7 @@ class ReviewTab(QWidget):
             doc["docsep_pages"] = state["docsep_pages"]
         self.document_modified = True
         self.render_preview()
+        self._session_changed()
 
     def zoom_in(self):
         if self.zoom_level < 300:
@@ -1731,6 +1843,7 @@ class ReviewTab(QWidget):
                     lbl.deleteLater()
                 self.page_labels = []
                 self.refresh_doc_list()
+                self._session_changed()
             else:
                 QMessageBox.warning(self, "Finalize Failed", f"Could not save: {result.get('error', 'Unknown')}")
 
@@ -1757,6 +1870,7 @@ class ReviewTab(QWidget):
                     lbl.deleteLater()
                 self.page_labels = []
                 self.refresh_doc_list()
+                self._session_changed()
             else:
                 QMessageBox.warning(self, "Finalize Failed", f"Could not save: {result.get('error', 'Unknown')}")
 
@@ -1809,6 +1923,7 @@ class ReviewTab(QWidget):
         clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.all_flagged_docs]
         with open(flagged_file, "w", encoding="utf-8") as f:
             json.dump(clean, f, indent=2, ensure_ascii=False)
+        self._session_changed()
 
     def _pipeline_config(self):
         from pipeline import PipelineConfig
@@ -1883,6 +1998,7 @@ class ReviewTab(QWidget):
         next_row = min(self.active_index, len(self.pending_docs if self.active_tab == "pending" else self.auto_confirmed_docs) - 1)
         self.active_index = next_row
         self.refresh_doc_list(select_row=next_row if next_row >= 0 else None)
+        self._session_changed()
 
     def confirm_all_auto(self):
         if self.active_tab != "auto_confirmed" or not self.auto_confirmed_docs:
@@ -1924,6 +2040,7 @@ class ReviewTab(QWidget):
             self._save_auto_confirmed_updates()
             QMessageBox.information(self, "Confirm All", f"All {done} documents finalized and moved to the output folder.")
         self.refresh_doc_list()
+        self._session_changed()
 
     def _show_toast(self, message: str):
         if self._toast is None:
@@ -1958,6 +2075,10 @@ class ReviewTab(QWidget):
             QTimer.singleShot(100, self.render_preview)
 
     def closeEvent(self, event):
+        try:
+            self._save_session_now()
+        except Exception:
+            pass
         _log = open(Path(__file__).parent.parent / "finalize_debug.log", "a", encoding="utf-8")
         _log.write(f"=== ReviewTab closeEvent ===\n")
         _log.close()

@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('Lumeed Logo.png', '.'), ('config.json', '.'), ('blank_page_detector.py', '.'), ('date_extractor.py', '.'), ('auto_qc.py', '.'), ('pipeline.py', '.'), ('paths.py', '.'), ('enhance.py', '.'), ('company_extractor.py', '.'), ('known_companies.json', '.'), ('ui', 'ui')]
+datas = [('Lumeed Logo.png', '.'), ('config.json', '.'), ('blank_page_detector.py', '.'), ('date_extractor.py', '.'), ('auto_qc.py', '.'), ('pipeline.py', '.'), ('paths.py', '.'), ('enhance.py', '.'), ('company_extractor.py', '.'), ('session.py', '.'), ('known_companies.json', '.'), ('ui', 'ui')]
 binaries = []
 hiddenimports = ['pytesseract', 'cv2', 'numpy', 'fitz', 'PIL', 'dateparser', 'dateutil', 'rapidfuzz', 'rapidfuzz.fuzz', 'rapidfuzz.process', 'PyQt6']
 tmp_ret = collect_all('PyQt6')
