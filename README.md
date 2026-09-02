@@ -4,7 +4,7 @@ Automatically extracts document dates from PDFs using OCR and renames files acco
 
 ## Features
 
-- **OCR Date Extraction**: Extracts dates from scanned PDFs using Tesseract or PaddleOCR
+- **OCR Date Extraction**: Extracts dates from scanned PDFs using Tesseract
 - **Blank Page Detection**: Automatically detects and skips blank pages (back sides of documents)
 - **Desktop GUI**: Modern PyQt6 interface with dark theme for reviewing flagged documents
 - **Batch Processing**: Process entire folders of PDFs with automatic date extraction

@@ -427,7 +427,7 @@ class SettingsTab(QWidget):
         row.addWidget(make_field_column("PDF Page Index", self.page_spin))
 
         self.ocr_combo = QComboBox()
-        self.ocr_combo.addItems(["tesseract", "paddleocr"])
+        self.ocr_combo.addItems(["tesseract"])
         self.ocr_combo.setCurrentText(self.config.get("ocr_engine", "tesseract"))
         row.addWidget(make_field_column("OCR Engine", self.ocr_combo))
 
@@ -622,6 +622,18 @@ class SettingsTab(QWidget):
         example.setStyleSheet(f"color: {TEXT_FAINT}; font-size: 8.5pt;")
         col.addWidget(example)
 
+        layout_row = QHBoxLayout()
+        layout_row.setSpacing(8)
+        layout_row.addWidget(QLabel("Save location:"))
+        self.layout_combo = QComboBox()
+        self.layout_combo.addItem("Per-company folders (Division / Company)", "company")
+        self.layout_combo.addItem("Single folder (all documents)", "flat")
+        idx = self.layout_combo.findData(self.config.get("output_layout", "company"))
+        self.layout_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        layout_row.addWidget(self.layout_combo)
+        layout_row.addStretch()
+        col.addLayout(layout_row)
+
         return group
 
     # ------------------------------------------------------------------
@@ -638,18 +650,8 @@ class SettingsTab(QWidget):
         self.detect_gpu_btn.setEnabled(text != "Remote GPU Server")
 
     def _detect_cuda(self):
-        try:
-            import paddle
-            has_cuda = paddle.device.is_compiled_with_cuda()
-            if has_cuda:
-                self.gpu_status_label.setText("CUDA available")
-                self.gpu_status_label.setStyleSheet(f"color: {GOOD}; font-size: 8.5pt;")
-            else:
-                self.gpu_status_label.setText("CUDA not available - CPU only")
-                self.gpu_status_label.setStyleSheet(f"color: {WARN}; font-size: 8.5pt;")
-        except ImportError:
-            self.gpu_status_label.setText("PaddlePaddle not installed")
-            self.gpu_status_label.setStyleSheet(f"color: {BAD}; font-size: 8.5pt;")
+        self.gpu_status_label.setText("GPU acceleration not available (Tesseract only)")
+        self.gpu_status_label.setStyleSheet(f"color: {TEXT_DIM}; font-size: 8.5pt;")
 
     def _open_roster_manager(self):
         dlg = CompanyRosterDialog(self)
@@ -664,6 +666,7 @@ class SettingsTab(QWidget):
         self.config["ocr_engine"] = self.ocr_combo.currentText()
         self.config["render_dpi"] = self.dpi_spin.value()
         self.config["max_workers"] = self.workers_spin.value()
+        self.config["output_layout"] = self.layout_combo.currentData()
         self.config["enable_qc"] = self.enable_qc_check.isChecked()
         self.config["enable_docsep_removal"] = self.enable_docsep.isChecked()
         self.config["enable_blank_removal"] = self.enable_blank_rm.isChecked()

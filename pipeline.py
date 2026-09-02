@@ -4,6 +4,7 @@ import shutil
 import json
 import csv
 import re
+import gc
 from pathlib import Path
 from datetime import date, datetime
 from typing import List, Dict, Optional, Tuple
@@ -66,6 +67,7 @@ class PipelineConfig:
         self.audit_enabled = True
         self.render_dpi = 150
         self.keep_input_structure = False
+        self.output_layout = "company"
         
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.flagged_root.mkdir(parents=True, exist_ok=True)
@@ -448,6 +450,8 @@ def run_pipeline(config: PipelineConfig, progress_callback=None) -> List[Divisio
         if progress_callback:
             progress_callback({"stage": "extracting", "message": f"Processing division {batch.division_code}...", "progress": 10 + int(70 * i / max(1, len(batches)))})
         extract_dates_for_batch(batch, config)
+        if (i + 1) % 5 == 0:
+            gc.collect()
     
     if progress_callback:
         progress_callback({"stage": "saving", "message": "Saving results...", "progress": 85})
@@ -514,6 +518,127 @@ def move_confirmed_to_passed(config: PipelineConfig, batches: List[DivisionBatch
     print(f"Confirmed documents moved to: {passed_root}")
 
 
+def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
+    from datetime import datetime as _dt
+    output_root = Path(config.output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    original_path = doc_data.get("original_path", "")
+    division_code = doc_data.get("division_code", "")
+    company_name = doc_data.get("company_name", "")
+    detected_date = doc_data.get("detected_date", "")
+    blank_pages = doc_data.get("blank_pages", [])
+    docsep_pages = doc_data.get("docsep_pages", [])
+    pending_bytes = doc_data.get("_pending_pdf_bytes", None)
+
+    try:
+        parts = detected_date.split("-")
+        yyyymm = f"{parts[0]}{parts[1]}"
+    except (ValueError, IndexError):
+        yyyymm = _dt.now().strftime("%Y%m")
+
+    import csv
+    log_path = output_root / "rename_log.csv"
+    log_exists = log_path.exists()
+    fieldnames = [
+        "timestamp", "original_path", "new_filename", "new_path",
+        "division_code", "company_name", "document_date", "yyyymm",
+        "sequence_number", "confidence", "method", "blank_pages",
+        "blank_removed", "docsep_pages", "docsep_removed", "status"
+    ]
+
+    company_dir = sanitize_filename(company_name)
+    if getattr(config, "output_layout", "company") == "flat":
+        output_div_dir = output_root
+        flat_glob = output_root.glob(f"{yyyymm}*_{division_code}_{company_dir}.pdf")
+    else:
+        output_div_dir = output_root / division_code / company_dir
+        flat_glob = output_div_dir.glob(f"{yyyymm}*_{division_code}_{company_dir}.pdf")
+    output_div_dir.mkdir(parents=True, exist_ok=True)
+
+    existing = list(flat_glob)
+    seq = len(existing) + 1
+    final_filename = f"{yyyymm}{seq:04d}_{division_code}_{company_dir}.pdf"
+    output_path = output_div_dir / final_filename
+
+    counter = 1
+    original_output_path = output_path
+    while output_path.exists():
+        stem = original_output_path.stem
+        output_path = original_output_path.parent / f"{stem}_{counter}{original_output_path.suffix}"
+        counter += 1
+
+    if pending_bytes:
+        with open(str(output_path), "wb") as f:
+            f.write(pending_bytes)
+    elif original_path and os.path.exists(original_path):
+        shutil.copy2(original_path, output_path)
+    else:
+        return {"success": False, "error": "Source file not found"}
+
+    blank_removed_count = 0
+    docsep_removed_count = 0
+    all_remove = set()
+    if config.enable_blank_removal and blank_pages:
+        all_remove.update(blank_pages)
+    if config.enable_docsep_removal and docsep_pages:
+        all_remove.update(docsep_pages)
+
+    if all_remove:
+        import fitz as _fitz
+        d = _fitz.open(str(output_path))
+        for pn in reversed(sorted(all_remove)):
+            if pn < len(d):
+                d.delete_page(pn)
+                if pn in blank_pages:
+                    blank_removed_count += 1
+                if pn in docsep_pages:
+                    docsep_removed_count += 1
+        if blank_removed_count > 0 or docsep_removed_count > 0:
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+            tmp.close()
+            d.save(tmp.name, incremental=False, garbage=4, deflate=True)
+            d.close()
+            shutil.move(tmp.name, str(output_path))
+        else:
+            d.close()
+
+    try:
+        with open(log_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if not log_exists:
+                writer.writeheader()
+            writer.writerow({
+                "timestamp": _dt.now().isoformat(),
+                "original_path": original_path,
+                "new_filename": output_path.name,
+                "new_path": str(output_path),
+                "division_code": division_code,
+                "company_name": company_name,
+                "document_date": detected_date,
+                "yyyymm": yyyymm,
+                "sequence_number": seq,
+                "confidence": doc_data.get("confidence", 100),
+                "method": doc_data.get("method", "auto"),
+                "blank_pages": str(blank_pages) if blank_pages else "",
+                "blank_removed": blank_removed_count,
+                "docsep_pages": str(docsep_pages) if docsep_pages else "",
+                "docsep_removed": docsep_removed_count,
+                "status": "copied",
+            })
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "final_filename": output_path.name,
+        "output_path": str(output_path),
+        "blank_removed": blank_removed_count,
+        "docsep_removed": docsep_removed_count,
+    }
+
+
 if __name__ == "__main__":
     config_path = Path(__file__).parent / "config.json"
     
@@ -546,7 +671,7 @@ if __name__ == "__main__":
         parser.add_argument("--threshold", type=int, default=70, help="Confidence threshold (0-100)")
         parser.add_argument("--page", type=int, default=0, help="PDF page index to OCR (0-based)")
         parser.add_argument("--earliest-year", type=int, default=1990, help="Earliest valid document year")
-        parser.add_argument("--ocr-engine", type=str, default="tesseract", choices=["tesseract", "paddle"], help="OCR engine to use")
+        parser.add_argument("--ocr-engine", type=str, default="tesseract", choices=["tesseract"], help="OCR engine to use")
         
         args = parser.parse_args()
         

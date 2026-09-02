@@ -17,7 +17,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'torchvision', 'torchaudio', 'sklearn', 'scikit-learn', 'transformers', 'onnxruntime', 'tensorflow', 'paddle', 'paddleocr', 'paddlepaddle', 'sympy', 'scipy', 'pandas', 'matplotlib', 'networkx', 'lxml', 'openpyxl'],
+    excludes=['torch', 'torchvision', 'torchaudio', 'sklearn', 'scikit-learn', 'transformers', 'onnxruntime', 'tensorflow', 'sympy', 'scipy', 'pandas', 'matplotlib', 'networkx', 'lxml', 'openpyxl'],
     noarchive=False,
     optimize=0,
 )

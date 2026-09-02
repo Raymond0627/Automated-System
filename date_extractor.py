@@ -3,6 +3,7 @@ from datetime import date, datetime
 from typing import Optional, List
 import re
 import io
+import gc
 import cv2
 import numpy as np
 import fitz
@@ -14,19 +15,6 @@ try:
     import pytesseract
 except ImportError:
     pytesseract = None
-
-
-_paddle_ocr_instance = None
-
-
-def _get_paddle_ocr():
-    global _paddle_ocr_instance
-    if _paddle_ocr_instance is None:
-        import os
-        os.environ['PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK'] = 'True'
-        from paddleocr import PaddleOCR
-        _paddle_ocr_instance = PaddleOCR(use_textline_orientation=True, lang='en')
-    return _paddle_ocr_instance
 
 
 @dataclass
@@ -220,6 +208,7 @@ def preprocess_image(image: np.ndarray, upscale: float = 1.5) -> np.ndarray:
 
 
 def pdf_to_image(pdf_path: str, page_index: int = 0, dpi: int = 200) -> Optional[np.ndarray]:
+    doc = None
     try:
         doc = fitz.open(pdf_path)
         if page_index >= len(doc):
@@ -227,18 +216,25 @@ def pdf_to_image(pdf_path: str, page_index: int = 0, dpi: int = 200) -> Optional
         page = doc[page_index]
         pix = page.get_pixmap(dpi=dpi)
         img_data = pix.tobytes("png")
+        del pix
         img = Image.open(io.BytesIO(img_data))
         img_np = np.array(img)
+        del img, img_data
         if len(img_np.shape) == 3:
             if img_np.shape[2] == 4:
                 img_np = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
             else:
                 img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-        doc.close()
         return img_np
     except Exception as e:
         print(f"Error converting PDF to image: {e}")
         return None
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def run_ocr_tesseract(image: np.ndarray, psm: int = 6) -> dict:
@@ -248,50 +244,7 @@ def run_ocr_tesseract(image: np.ndarray, psm: int = 6) -> dict:
     return pytesseract.image_to_data(image, config=config, output_type=pytesseract.Output.DICT)
 
 
-def run_ocr_paddle(image: np.ndarray) -> dict:
-    ocr = _get_paddle_ocr()
-    result = list(ocr.predict(image))
-
-    texts, lefts, tops, widths, heights, confs = [], [], [], [], [], []
-
-    if result:
-        r = result[0]
-        rec_texts = r['rec_texts']
-        rec_scores = r['rec_scores']
-        rec_boxes = r['rec_boxes']
-
-        for text, score, box in zip(rec_texts, rec_scores, rec_boxes):
-            if not text.strip():
-                continue
-
-            if hasattr(box, '__iter__') and len(box) >= 4:
-                if len(box) == 4 and hasattr(box[0], '__iter__'):
-                    xs = [p[0] for p in box]
-                    ys = [p[1] for p in box]
-                else:
-                    xs = [box[0], box[2]]
-                    ys = [box[1], box[3]]
-                x, y = int(min(xs)), int(min(ys))
-                w, h = int(max(xs) - min(xs)), int(max(ys) - min(y))
-            else:
-                x, y, w, h = 0, 0, 0, 0
-
-            texts.append(text)
-            lefts.append(x)
-            tops.append(y)
-            widths.append(w)
-            heights.append(h)
-            confs.append(int(float(score) * 100))
-
-    return {
-        'text': texts, 'left': lefts, 'top': tops,
-        'width': widths, 'height': heights, 'conf': confs
-    }
-
-
 def run_ocr(image: np.ndarray, psm: int = 6, engine: str = "tesseract") -> dict:
-    if engine == "paddle":
-        return run_ocr_paddle(image)
     return run_ocr_tesseract(image, psm)
 
 
@@ -414,12 +367,18 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
     method = f"{engine}_heuristic"
     blank_pages = []
 
+    doc = None
     try:
         doc = fitz.open(pdf_path)
         num_pages = len(doc) if max_pages is None else min(len(doc), max_pages)
-        doc.close()
     except Exception:
         num_pages = 1
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
     for page_idx in range(num_pages):
         img = pdf_to_image(pdf_path, page_idx, dpi=dpi)
@@ -435,47 +394,34 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
             if blank_result["is_blank"] is True:
                 continue
 
-        if engine == "paddle":
+        try:
+            processed = preprocess_image(img, upscale=1.5)
+        except Exception:
+            del img
+            continue
+
+        del img
+        ph, pw = processed.shape[:2]
+
+        for psm in [6]:
             try:
-                ocr_data = run_ocr(img, engine=engine)
+                ocr_data = run_ocr(processed, psm, engine=engine)
+                del processed
                 raw_text = ' '.join([t for t in ocr_data['text'] if t.strip()])
                 raw_texts.append(raw_text)
                 ctrl = find_document_date_via_control_anchor(raw_text)
                 if ctrl:
                     control_results[page_idx] = ctrl
-                ph, pw = img.shape[:2]
                 page_ocr_data_list.append({
                     'ocr_data': ocr_data, 'page_idx': page_idx,
                     'page_height': ph, 'page_width': pw,
                 })
-                candidates = extract_candidates_from_ocr(ocr_data, 6, pw, ph, page_idx)
+                candidates = extract_candidates_from_ocr(ocr_data, psm, pw, ph, page_idx)
                 all_candidates.extend(candidates)
+                del ocr_data
             except Exception:
+                del processed
                 continue
-        else:
-            try:
-                processed = preprocess_image(img, upscale=1.5)
-            except Exception:
-                continue
-
-            ph, pw = processed.shape[:2]
-
-            for psm in [6]:
-                try:
-                    ocr_data = run_ocr(processed, psm, engine=engine)
-                    raw_text = ' '.join([t for t in ocr_data['text'] if t.strip()])
-                    raw_texts.append(raw_text)
-                    ctrl = find_document_date_via_control_anchor(raw_text)
-                    if ctrl:
-                        control_results[page_idx] = ctrl
-                    page_ocr_data_list.append({
-                        'ocr_data': ocr_data, 'page_idx': page_idx,
-                        'page_height': ph, 'page_width': pw,
-                    })
-                    candidates = extract_candidates_from_ocr(ocr_data, psm, pw, ph, page_idx)
-                    all_candidates.extend(candidates)
-                except Exception:
-                    continue
 
     # Check if all pages were blank
     all_blank = len(blank_pages) == num_pages

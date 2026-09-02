@@ -6,7 +6,8 @@ from datetime import date, datetime
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
-    QSpinBox, QScrollArea, QListWidget, QListWidgetItem, QSplitter,
+    QSpinBox, QScrollArea, QListWidget, QListWidgetItem, QTreeWidget,
+    QTreeWidgetItem, QStackedWidget, QSplitter,
     QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog,
     QMenu, QInputDialog, QFrame, QLineEdit, QCompleter
 )
@@ -15,15 +16,13 @@ from PyQt6.QtGui import (
     QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence,
     QPainter, QPen, QBrush, QColor, QCursor
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QRectF, QPointF
 
 import sys
 if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).parent.parent))
 from paths import BASE_DIR
 from pipeline import (
-    PipelineConfig, parse_folder_structure, load_flagged_index,
-    update_document_from_review, finalize_all_divisions, save_confirmed_documents
+    PipelineConfig, parse_folder_structure, load_flagged_index
 )
 from enhance import enhance_page
 from company_extractor import normalize_company_name, learn_company_name, load_known_companies, save_known_companies
@@ -170,124 +169,86 @@ class CropOverlay(QWidget):
         self.update()
 
 
-class FinalizeWorker(QThread):
-    done = pyqtSignal()
-    error = pyqtSignal(str)
 
-    def __init__(self, passed_docs, all_flagged_docs, config, document_modified, current_pdf_doc, active_index, active_list, pending_docs, keep_input_structure=False):
+class ReviewedScanWorker(QThread):
+    finished = pyqtSignal(list)
+
+    def __init__(self, output_root: str):
         super().__init__()
-        self.passed_docs = passed_docs
-        self.all_flagged_docs = all_flagged_docs
-        self.config = config
-        self.document_modified = document_modified
-        self.current_pdf_doc = current_pdf_doc
-        self.active_index = active_index
-        self.active_list = active_list
-        self.pending_docs = pending_docs
-        self.keep_input_structure = keep_input_structure
+        self.output_root = output_root
 
     def run(self):
-        _log = open(Path(__file__).parent.parent / "finalize_debug.log", "a", encoding="utf-8")
-        _log.write("=== FinalizeWorker.run START ===\n")
-        _log.flush()
+        from pathlib import Path
+        root = Path(self.output_root)
+        reviewed = []
+        if not root.exists():
+            self.finished.emit(reviewed)
+            return
+        for div_dir in root.iterdir():
+            if not div_dir.is_dir() or div_dir.name.startswith("."):
+                continue
+            try:
+                for company_dir in div_dir.iterdir():
+                    if not company_dir.is_dir():
+                        continue
+                    try:
+                        for pdf_file in company_dir.glob("*.pdf"):
+                            reviewed.append({
+                                "original_path": str(pdf_file),
+                                "original_filename": pdf_file.name,
+                                "division_code": div_dir.name,
+                                "company_name": company_dir.name,
+                                "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
+                                "confidence": 100,
+                                "method": "finalized",
+                                "blank_pages": [],
+                                "docsep_pages": [],
+                            })
+                    except PermissionError:
+                        continue
+            except PermissionError:
+                continue
         try:
-            pipeline_config = PipelineConfig(
-                input_root=self.config["input_root"],
-                output_root=self.config["output_root"],
-                flagged_root=self.config["flagged_root"],
-                confidence_threshold=self.config["confidence_threshold"],
-                page_index=self.config["page_index"],
-                earliest_year=self.config["earliest_year"],
-                ocr_engine=self.config.get("ocr_engine", "tesseract"),
-            )
-            pipeline_config.enable_docsep_removal = self.config.get("enable_docsep_removal", True)
-            pipeline_config.enable_blank_removal = self.config.get("enable_blank_removal", True)
-            pipeline_config.keep_input_structure = self.keep_input_structure
+            for pdf_file in root.iterdir():
+                if pdf_file.is_file() and pdf_file.suffix.lower() == ".pdf":
+                    reviewed.append({
+                        "original_path": str(pdf_file),
+                        "original_filename": pdf_file.name,
+                        "division_code": "",
+                        "company_name": "All Documents",
+                        "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
+                        "confidence": 100,
+                        "method": "finalized",
+                        "blank_pages": [],
+                        "docsep_pages": [],
+                    })
+        except PermissionError:
+            pass
+        self.finished.emit(reviewed)
 
-            def _norm(p):
-                return os.path.normcase(os.path.normpath(os.path.abspath(p))) if p else ""
 
-            _log.write("Parsing folder structure...\n")
-            _log.flush()
-            batches = parse_folder_structure(pipeline_config.input_root)
+class FinalizeAllWorker(QThread):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(int, list)
 
-            _log.write("Matching passed docs...\n")
-            _log.flush()
-            passed_lookup = {_norm(pd.get("original_path")): pd for pd in self.passed_docs if pd.get("original_path")}
+    def __init__(self, docs: list, config, parent=None):
+        super().__init__(parent)
+        self.docs = docs
+        self.config = config
 
-            matched_doc_paths = set()
-            for batch in batches:
-                for doc in batch.documents:
-                    pd = passed_lookup.get(_norm(doc.original_path))
-                    if pd:
-                        matched_doc_paths.add(_norm(doc.original_path))
-                        try:
-                            doc.confirmed_date = date.fromisoformat(pd["detected_date"])
-                            doc.confirmed_method = pd.get("method", "auto")
-                            doc.status = "confirmed"
-                            if pd.get("_pending_pdf_bytes"):
-                                doc._pending_pdf_bytes = pd["_pending_pdf_bytes"]
-                            elif pd.get("modified_path"):
-                                doc._original_input_path = doc.original_path
-                                doc.original_path = pd["modified_path"]
-                            doc.blank_pages = pd.get("blank_pages", [])
-                            doc.docsep_pages = pd.get("docsep_pages", [])
-                            if pd.get("company_name"):
-                                doc.company_name = pd["company_name"]
-                        except (ValueError, KeyError):
-                            pass
-
-            unmatched_passed = [pd.get("original_path") for pd in self.passed_docs
-                                if _norm(pd.get("original_path")) not in matched_doc_paths]
-            if unmatched_passed:
-                print(f"[Finalize] WARNING: {len(unmatched_passed)}/{len(self.passed_docs)} "
-                      f"passed docs did not match any parsed batch doc:")
-                for p in unmatched_passed:
-                    print("   MISSING MATCH:", p)
-
-            _log.write("Loading flagged data...\n")
-            _log.flush()
-            flagged_data = load_flagged_index(pipeline_config)
-            flagged_lookup = {_norm(fd.get("original_path")): fd for fd in flagged_data if fd.get("original_path")}
-            for batch in batches:
-                for doc in batch.documents:
-                    fd = flagged_lookup.get(_norm(doc.original_path))
-                    if fd:
-                        update_document_from_review(doc, fd)
-
-            _log.write("Finalizing all divisions...\n")
-            _log.flush()
-            finalize_all_divisions(batches, pipeline_config)
-            _log.write("Finalize ALL DIVISIONS DONE\n")
-            _log.flush()
-
-            _log.write("Saving confirmed documents...\n")
-            _log.flush()
-            save_confirmed_documents(batches, pipeline_config)
-            _log.write("SAVE CONFIRMED DOCUMENTS DONE\n")
-            _log.flush()
-
-            _log.write("Clearing index files...\n")
-            _log.flush()
-            for fname in ("passed_index.json", "flagged_index.json"):
-                p = Path(self.config["flagged_root"]) / fname
-                if p.exists():
-                    with open(p, "w", encoding="utf-8") as f:
-                        json.dump([], f)
-
-            _log.write("Emitting done signal...\n")
-            _log.flush()
-            self.done.emit()
-            _log.write("Done signal emitted\n")
-            _log.flush()
-        except Exception as e:
-            _log.write(f"EXCEPTION in run: {e}\n")
-            import traceback
-            _log.write(traceback.format_exc() + "\n")
-            _log.flush()
-            self.error.emit(str(e))
-        _log.write("=== FinalizeWorker.run END ===\n")
-        _log.close()
+    def run(self):
+        from pipeline import finalize_single_document
+        failures = []
+        done = 0
+        total = len(self.docs)
+        for doc in self.docs:
+            result = finalize_single_document(doc, self.config)
+            if result.get("success"):
+                done += 1
+            else:
+                failures.append((doc.get("original_path", ""), doc.get("original_filename", ""), result.get("error", "Unknown")))
+            self.progress.emit(done, total)
+        self.finished.emit(done, failures)
 
 
 class ReviewTab(QWidget):
@@ -296,14 +257,21 @@ class ReviewTab(QWidget):
         self.config = config
         self.all_flagged_docs = []
         self.pending_docs = []
-        self.passed_docs = []
-        self.active_list = None
+        self.auto_confirmed_docs = []
+        self.reviewed_docs = []
+        self.active_tab = "pending"
         self.active_index = -1
         self.current_pdf_doc = None
-        self.pending_cards = []
-        self.passed_cards = []
+        self.doc_card_widgets = []
+        self.reviewed_card_widgets = []
+        self.reviewed_index_to_item = {}
+        self._reviewed_scan_worker = None
+        self._reviewed_scan_token = 0
+        self._confirm_all_worker = None
         self.ocr_dialog = None
         self.reviewed_passed = set()
+        self._toast = None
+        self._toast_timer = None
         self.zoom_level = 100
         self._zoom_timer = QTimer(self)
         self._zoom_timer.setSingleShot(True)
@@ -393,39 +361,63 @@ class ReviewTab(QWidget):
         nav_row.addWidget(self.refresh_btn)
         left_layout.addLayout(nav_row)
 
-        list_splitter = QSplitter(Qt.Orientation.Vertical)
-        list_splitter.setHandleWidth(4)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(4)
+        filter_row.setContentsMargins(0, 4, 0, 4)
+        self.tab_pending_btn = QPushButton("Pending (0)")
+        self.tab_pending_btn.setCheckable(True)
+        self.tab_pending_btn.setChecked(True)
+        self.tab_pending_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self.tab_pending_btn.setFixedHeight(26)
+        self.tab_pending_btn.clicked.connect(lambda: self.switch_tab("pending"))
+        filter_row.addWidget(self.tab_pending_btn)
+        self.tab_auto_confirmed_btn = QPushButton("Auto-Confirmed (0)")
+        self.tab_auto_confirmed_btn.setCheckable(True)
+        self.tab_auto_confirmed_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self.tab_auto_confirmed_btn.setFixedHeight(26)
+        self.tab_auto_confirmed_btn.clicked.connect(lambda: self.switch_tab("auto_confirmed"))
+        filter_row.addWidget(self.tab_auto_confirmed_btn)
+        self.tab_reviewed_btn = QPushButton("Reviewed (0)")
+        self.tab_reviewed_btn.setCheckable(True)
+        self.tab_reviewed_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self.tab_reviewed_btn.setFixedHeight(26)
+        self.tab_reviewed_btn.clicked.connect(lambda: self.switch_tab("reviewed"))
+        filter_row.addWidget(self.tab_reviewed_btn)
+        left_layout.addLayout(filter_row)
 
-        pending_container = QWidget()
-        pending_layout = QVBoxLayout(pending_container)
-        pending_layout.setContentsMargins(0, 0, 0, 0)
-        pending_layout.setSpacing(2)
-        self.pending_label = QLabel("Pending Review (0)")
-        self.pending_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.pending_label.setStyleSheet("color: #ff9800; padding: 2px 4px;")
-        pending_layout.addWidget(self.pending_label)
-        self.pending_list = QListWidget()
-        self.pending_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.pending_list.currentRowChanged.connect(self._on_pending_selected)
-        pending_layout.addWidget(self.pending_list, 1)
-        list_splitter.addWidget(pending_container)
+        self.doc_list = QListWidget()
+        self.doc_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.doc_list.currentRowChanged.connect(self._on_doc_selected)
 
-        passed_container = QWidget()
-        passed_layout = QVBoxLayout(passed_container)
-        passed_layout.setContentsMargins(0, 0, 0, 0)
-        passed_layout.setSpacing(2)
-        self.passed_label = QLabel("Auto-Confirmed (0)")
-        self.passed_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.passed_label.setStyleSheet("color: #4caf50; padding: 2px 4px;")
-        passed_layout.addWidget(self.passed_label)
-        self.passed_list = QListWidget()
-        self.passed_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.passed_list.currentRowChanged.connect(self._on_passed_selected)
-        passed_layout.addWidget(self.passed_list, 1)
-        list_splitter.addWidget(passed_container)
+        self.reviewed_tree = QTreeWidget()
+        self.reviewed_tree.setHeaderHidden(True)
+        self.reviewed_tree.setRootIsDecorated(True)
+        self.reviewed_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.reviewed_tree.itemClicked.connect(self._on_reviewed_item_clicked)
+        self.reviewed_tree.setStyleSheet("""
+            QTreeWidget {
+                background-color: #1a1e2e;
+                border: 1px solid #2d2e45;
+                border-radius: 6px;
+                font-family: 'Segoe UI';
+                font-size: 9pt;
+            }
+            QTreeWidget::item {
+                padding: 2px 4px;
+            }
+            QTreeWidget::item:selected {
+                background-color: #1a2a3a;
+                color: #4fc3f7;
+            }
+            QTreeWidget::item:hover {
+                background-color: #1e2535;
+            }
+        """)
 
-        list_splitter.setSizes([250, 250])
-        left_layout.addWidget(list_splitter, 1)
+        self.list_stack = QStackedWidget()
+        self.list_stack.addWidget(self.doc_list)
+        self.list_stack.addWidget(self.reviewed_tree)
+        left_layout.addWidget(self.list_stack, 1)
 
         splitter.addWidget(left_widget)
 
@@ -506,16 +498,20 @@ class ReviewTab(QWidget):
         bottom.addWidget(self.add_roster_btn)
         bottom.addWidget(self.ocr_btn)
         bottom.addStretch()
-        self.finalize_btn = QPushButton("FINALIZE")
-        self.finalize_btn.setObjectName("success")
-        self.finalize_btn.setFixedHeight(26)
-        self.finalize_btn.setFont(QFont("Segoe UI", 8))
-        self.finalize_btn.clicked.connect(self.finalize_all)
-        bottom.addWidget(self.finalize_btn)
+        self.confirm_all_btn = QPushButton("CONFIRM ALL")
+        self.confirm_all_btn.setObjectName("accent")
+        self.confirm_all_btn.setFixedHeight(26)
+        self.confirm_all_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        self.confirm_all_btn.clicked.connect(self.confirm_all_auto)
+        bottom.addWidget(self.confirm_all_btn)
         main_layout.addLayout(bottom)
 
         self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
         self.undo_shortcut.activated.connect(self._undo)
+        self.enter_shortcut_return = QShortcut(QKeySequence(Qt.Key.Key_Return), self)
+        self.enter_shortcut_return.activated.connect(self._on_enter_key)
+        self.enter_shortcut_enter = QShortcut(QKeySequence(Qt.Key.Key_Enter), self)
+        self.enter_shortcut_enter.activated.connect(self._on_enter_key)
 
     def refresh_completer(self):
         companies = load_known_companies()
@@ -523,19 +519,16 @@ class ReviewTab(QWidget):
 
     def refresh_review(self):
         _prev_flagged = list(self.all_flagged_docs) if self.all_flagged_docs else []
-        _prev_passed = list(self.passed_docs) if self.passed_docs else []
+        _prev_auto = list(self.auto_confirmed_docs) if self.auto_confirmed_docs else []
 
         _old_pending_bytes = {}
-        for pd in _prev_passed:
+        for pd in _prev_auto:
             pb = pd.get("_pending_pdf_bytes")
             if pb:
                 _old_pending_bytes[_norm_path(pd.get("original_path", ""))] = pb
 
-        self.pending_list.clear()
-        self.passed_list.clear()
-        self.pending_cards = []
-        self.passed_cards = []
-        self.active_list = None
+        self.doc_list.clear()
+        self.doc_card_widgets = []
         self.active_index = -1
         self.current_pdf_doc = None
         for lbl in self.page_labels:
@@ -557,144 +550,277 @@ class ReviewTab(QWidget):
         self.all_flagged_docs = all_flagged
         self.pending_docs = [d for d in all_flagged if not d.get("reviewed")]
 
-        passed_file = Path(self.config["flagged_root"]) / "passed_index.json"
-        if passed_file.exists():
+        auto_file = Path(self.config["flagged_root"]) / "auto_confirmed_index.json"
+        if auto_file.exists():
             try:
-                with open(passed_file, "r", encoding="utf-8") as f:
-                    self.passed_docs = json.load(f)
-                if not self.passed_docs:
-                    self.passed_docs = _prev_passed
+                with open(auto_file, "r", encoding="utf-8") as f:
+                    self.auto_confirmed_docs = json.load(f)
+                if not self.auto_confirmed_docs:
+                    self.auto_confirmed_docs = _prev_auto
             except Exception:
-                self.passed_docs = _prev_passed
+                self.auto_confirmed_docs = _prev_auto
         else:
-            self.passed_docs = _prev_passed
+            self.auto_confirmed_docs = _prev_auto
 
-        for pd in self.passed_docs:
+        for pd in self.auto_confirmed_docs:
             key = _norm_path(pd.get("original_path", ""))
             if key in _old_pending_bytes and "_pending_pdf_bytes" not in pd:
                 pd["_pending_pdf_bytes"] = _old_pending_bytes[key]
 
-        for i, doc in enumerate(self.pending_docs):
-            card = DocCardWidget(doc, i)
-            card.clicked.connect(self._on_pending_card_clicked)
-            item = QListWidgetItem()
-            item.setSizeHint(QSize(0, 62))
-            self.pending_list.addItem(item)
-            self.pending_list.setItemWidget(item, card)
-            self.pending_cards.append(card)
+        if self.active_tab == "reviewed":
+            self._start_reviewed_scan()
+        else:
+            self.refresh_doc_list()
+            if self.active_tab == "pending" and self.pending_docs:
+                self.doc_list.setCurrentRow(0)
 
-        for i, doc in enumerate(self.passed_docs):
-            card = PassedDocCardWidget(doc, i)
-            card.clicked.connect(self._on_passed_card_clicked)
-            item = QListWidgetItem()
-            item.setSizeHint(QSize(0, 62))
-            self.passed_list.addItem(item)
-            self.passed_list.setItemWidget(item, card)
-            self.passed_cards.append(card)
-            if i in self.reviewed_passed:
-                card.set_reviewed(True)
-
-        self.pending_label.setText(f"Pending Review ({len(self.pending_docs)})")
-        self.passed_label.setText(f"Auto-Confirmed ({len(self.passed_docs)})")
-        self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.passed_docs)} passed")
-
-        if self.pending_docs:
-            self.pending_list.setCurrentRow(0)
-
-    def clear_all(self):
-        self.pending_list.blockSignals(True)
-        self.passed_list.blockSignals(True)
-        self.pending_list.clear()
-        self.passed_list.clear()
-        self.pending_cards = []
-        self.passed_cards = []
-        self.all_flagged_docs = []
-        self.pending_docs = []
-        self.passed_docs = []
-        self.active_list = None
+    def switch_tab(self, tab_name: str):
+        self.active_tab = tab_name
         self.active_index = -1
-        if self.current_pdf_doc:
-            try:
-                self.current_pdf_doc.close()
-            except Exception:
-                pass
-            self.current_pdf_doc = None
+        self.current_pdf_doc = None
+        self.document_modified = False
         self.undo_stack.clear()
         for lbl in self.page_labels:
             lbl.deleteLater()
         self.page_labels = []
         self.preview_placeholder.setText("Select a document to preview")
         self.preview_placeholder.setStyleSheet("color: #555570; font-size: 12pt;")
-        self.pending_label.setText("Pending Review (0)")
-        self.passed_label.setText("Auto-Confirmed (0)")
-        self.count_label.setText("0 pending | 0 passed")
+        self.preview_placeholder.show()
+        self.tab_pending_btn.setChecked(tab_name == "pending")
+        self.tab_auto_confirmed_btn.setChecked(tab_name == "auto_confirmed")
+        self.tab_reviewed_btn.setChecked(tab_name == "reviewed")
+        self.confirm_all_btn.setVisible(tab_name == "auto_confirmed")
+        self.confirm_all_btn.setEnabled(tab_name == "auto_confirmed" and bool(self.auto_confirmed_docs))
+        if tab_name == "reviewed":
+            self.list_stack.setCurrentWidget(self.reviewed_tree)
+            self._start_reviewed_scan()
+        else:
+            self.list_stack.setCurrentWidget(self.doc_list)
+            self.refresh_doc_list()
+
+    def refresh_doc_list(self, select_row=None):
+        if self.active_tab == "reviewed":
+            return
+        self.doc_list.blockSignals(True)
+        self.doc_list.clear()
+        self.doc_card_widgets = []
+        if self.active_tab == "pending":
+            docs = self.pending_docs
+            for i, doc in enumerate(docs):
+                card = DocCardWidget(doc, i)
+                card.clicked.connect(self._on_card_clicked)
+                item = QListWidgetItem()
+                item.setSizeHint(QSize(0, 62))
+                self.doc_list.addItem(item)
+                self.doc_list.setItemWidget(item, card)
+                self.doc_card_widgets.append(card)
+        elif self.active_tab == "auto_confirmed":
+            docs = self.auto_confirmed_docs
+            for i, doc in enumerate(docs):
+                card = PassedDocCardWidget(doc, i)
+                card.clicked.connect(self._on_card_clicked)
+                item = QListWidgetItem()
+                item.setSizeHint(QSize(0, 62))
+                self.doc_list.addItem(item)
+                self.doc_list.setItemWidget(item, card)
+                self.doc_card_widgets.append(card)
+        self.tab_pending_btn.setText(f"Pending ({len(self.pending_docs)})")
+        self.tab_auto_confirmed_btn.setText(f"Auto-Confirmed ({len(self.auto_confirmed_docs)})")
+        self.tab_reviewed_btn.setText(f"Reviewed ({len(self.reviewed_docs)})")
+        self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.auto_confirmed_docs)} auto | {len(self.reviewed_docs)} reviewed")
+        self.doc_nav_label.setText(f"{len(docs)} docs")
+        self.confirm_all_btn.setVisible(self.active_tab == "auto_confirmed")
+        self.confirm_all_btn.setEnabled(self.active_tab == "auto_confirmed" and bool(docs))
+        self.doc_list.blockSignals(False)
+        if docs:
+            row = select_row if select_row is not None else 0
+            self.doc_list.setCurrentRow(row)
+
+    def _load_reviewed_from_output(self):
+        output_root = Path(self.config.get("output_root", ""))
+        if not output_root.exists():
+            self.reviewed_docs = []
+            return
+        reviewed = []
+        for div_dir in sorted(output_root.iterdir()):
+            if not div_dir.is_dir() or div_dir.name.startswith("."):
+                continue
+            for company_dir in sorted(div_dir.iterdir()):
+                if not company_dir.is_dir():
+                    continue
+                for pdf_file in company_dir.glob("*.pdf"):
+                    reviewed.append({
+                        "original_path": str(pdf_file),
+                        "original_filename": pdf_file.name,
+                        "division_code": div_dir.name,
+                        "company_name": company_dir.name,
+                        "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
+                        "confidence": 100,
+                        "method": "finalized",
+                        "blank_pages": [],
+                        "docsep_pages": [],
+                    })
+        for pdf_file in sorted(output_root.iterdir()):
+            if pdf_file.is_file() and pdf_file.suffix.lower() == ".pdf":
+                reviewed.append({
+                    "original_path": str(pdf_file),
+                    "original_filename": pdf_file.name,
+                    "division_code": "",
+                    "company_name": "All Documents",
+                    "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
+                    "confidence": 100,
+                    "method": "finalized",
+                    "blank_pages": [],
+                    "docsep_pages": [],
+                })
+        self.reviewed_docs = reviewed
+
+    def _start_reviewed_scan(self):
+        self.reviewed_tree.blockSignals(True)
+        self.reviewed_tree.clear()
+        self.reviewed_tree.blockSignals(False)
+        self.reviewed_index_to_item = {}
+        loading_item = QTreeWidgetItem(["Scanning output folder..."])
+        loading_item.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.reviewed_tree.addTopLevelItem(loading_item)
+        self._reviewed_scan_token += 1
+        token = self._reviewed_scan_token
+        self._reviewed_scan_worker = ReviewedScanWorker(self.config.get("output_root", ""))
+        self._reviewed_scan_worker.finished.connect(lambda docs, t=token: self._on_reviewed_scan_done(docs, t))
+        self._reviewed_scan_worker.start()
+
+    def _on_reviewed_scan_done(self, reviewed: list, token: int):
+        if token != self._reviewed_scan_token:
+            return
+        reviewed.sort(key=lambda d: d.get("original_filename", ""))
+        self.reviewed_docs = reviewed
+        if self.active_tab == "reviewed":
+            self._populate_reviewed_tree(reviewed)
+
+    def _populate_reviewed_tree(self, docs: list):
+        self.reviewed_tree.blockSignals(True)
+        self.reviewed_tree.clear()
+        self.reviewed_index_to_item = {}
+
+        grouped = {}
+        for i, doc in enumerate(docs):
+            div = doc.get("division_code", "")
+            comp = doc.get("company_name", "")
+            key = (div, comp)
+            grouped.setdefault(key, []).append((i, doc))
+
+        for key in sorted(grouped.keys()):
+            div, comp = key
+            label = f"{div} / {comp}" if comp else (div or "Unknown")
+            folder_item = QTreeWidgetItem([label])
+            folder_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            folder_item.setToolTip(0, label)
+            self.reviewed_tree.addTopLevelItem(folder_item)
+            for i, doc in grouped[key]:
+                file_item = QTreeWidgetItem([doc.get("original_filename", "Unknown")])
+                file_item.setData(0, Qt.ItemDataRole.UserRole, i)
+                file_item.setToolTip(0, doc.get("original_path", ""))
+                folder_item.addChild(file_item)
+                self.reviewed_index_to_item[i] = file_item
+
+        self.reviewed_tree.resizeColumnToContents(0)
+        self.reviewed_tree.expandAll()
+        self.reviewed_tree.blockSignals(False)
+
+        self.tab_reviewed_btn.setText(f"Reviewed ({len(self.reviewed_docs)})")
+        self.tab_pending_btn.setText(f"Pending ({len(self.pending_docs)})")
+        self.tab_auto_confirmed_btn.setText(f"Auto-Confirmed ({len(self.auto_confirmed_docs)})")
+        self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.auto_confirmed_docs)} auto | {len(self.reviewed_docs)} reviewed")
+        self.doc_nav_label.setText(f"{len(self.reviewed_docs)} docs")
+
+    def _on_reviewed_item_clicked(self, item, column):
+        if item.childCount() > 0:
+            item.setExpanded(not item.isExpanded())
+            return
+        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if idx is None or idx >= len(self.reviewed_docs):
+            return
+        self.active_index = idx
+        self.load_document(self.reviewed_docs[idx])
+
+    def _nav_reviewed(self, delta: int):
+        docs = self.reviewed_docs
+        if not docs:
+            return
+        new_idx = self.active_index + delta
+        if new_idx < 0 or new_idx >= len(docs):
+            return
+        self.active_index = new_idx
+        item = self.reviewed_index_to_item.get(new_idx)
+        if item:
+            self.reviewed_tree.setCurrentItem(item)
+            self.reviewed_tree.scrollToItem(item)
+        self.load_document(docs[new_idx])
+
+    def _on_card_clicked(self, idx: int):
+        self.doc_list.setCurrentRow(idx)
+
+    def _on_doc_selected(self, row: int):
+        if row < 0:
+            return
+        docs = self._get_current_docs()
+        if row >= len(docs):
+            return
+        self.active_index = row
+        for i, card in enumerate(self.doc_card_widgets):
+            card.set_selected(i == row)
+        if self.active_tab == "pending":
+            self.load_document(self.pending_docs[row])
+        elif self.active_tab == "auto_confirmed":
+            self.load_document(self.auto_confirmed_docs[row])
+        elif self.active_tab == "reviewed":
+            self.load_document(self.reviewed_docs[row])
+
+    def _save_auto_confirmed_updates(self):
+        auto_file = Path(self.config["flagged_root"]) / "auto_confirmed_index.json"
+        auto_file.parent.mkdir(parents=True, exist_ok=True)
+        clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.auto_confirmed_docs]
+        with open(auto_file, "w", encoding="utf-8") as f:
+            json.dump(clean, f, indent=2, ensure_ascii=False)
+
+    def clear_all(self):
+        self.doc_list.blockSignals(True)
+        self.doc_list.clear()
+        self.doc_list.blockSignals(False)
+        self.doc_card_widgets = []
+        self.reviewed_tree.clear()
+        self.reviewed_index_to_item = {}
+        self.all_flagged_docs = []
+        self.pending_docs = []
+        self.auto_confirmed_docs = []
+        self.reviewed_docs = []
+        self.active_index = -1
+        self.current_pdf_doc = None
+        self.undo_stack.clear()
+        for lbl in self.page_labels:
+            lbl.deleteLater()
+        self.page_labels = []
+        self.preview_placeholder.setText("Select a document to preview")
+        self.preview_placeholder.setStyleSheet("color: #555570; font-size: 12pt;")
+        self.tab_pending_btn.setText("Pending (0)")
+        self.tab_auto_confirmed_btn.setText("Auto-Confirmed (0)")
+        self.tab_reviewed_btn.setText("Reviewed (0)")
+        self.count_label.setText("No documents")
         self.doc_nav_label.setText("No docs")
         self.page_label.setText("No document loaded")
-        self.pending_list.blockSignals(False)
-        self.passed_list.blockSignals(False)
+        self.confirm_all_btn.setVisible(False)
+        self.confirm_all_btn.setEnabled(False)
+        self.confirm_all_btn.setText("CONFIRM ALL")
 
     def add_doc(self, doc_type: str, data: dict):
         if doc_type == "pending":
             self.all_flagged_docs.append(data)
-            idx = len(self.pending_docs)
             self.pending_docs.append(data)
-            card = DocCardWidget(data, idx)
-            card.clicked.connect(self._on_pending_card_clicked)
-            self.pending_list.blockSignals(True)
-            item = QListWidgetItem()
-            item.setSizeHint(QSize(0, 62))
-            self.pending_list.addItem(item)
-            self.pending_list.setItemWidget(item, card)
-            self.pending_list.blockSignals(False)
-            self.pending_cards.append(card)
-            self.pending_label.setText(f"Pending Review ({len(self.pending_docs)})")
         elif doc_type == "passed":
-            idx = len(self.passed_docs)
-            self.passed_docs.append(data)
-            card = PassedDocCardWidget(data, idx)
-            card.clicked.connect(self._on_passed_card_clicked)
-            self.passed_list.blockSignals(True)
-            item = QListWidgetItem()
-            item.setSizeHint(QSize(0, 62))
-            self.passed_list.addItem(item)
-            self.passed_list.setItemWidget(item, card)
-            self.passed_list.blockSignals(False)
-            self.passed_cards.append(card)
-            self.passed_label.setText(f"Auto-Confirmed ({len(self.passed_docs)})")
-        self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.passed_docs)} passed")
-
-    def _on_pending_card_clicked(self, idx: int):
-        self.pending_list.setCurrentRow(idx)
-
-    def _on_passed_card_clicked(self, idx: int):
-        self.passed_list.setCurrentRow(idx)
-
-    def _on_pending_selected(self, row: int):
-        if row < 0:
-            return
-        self.active_list = "pending"
-        self.active_index = row
-        for i, card in enumerate(self.pending_cards):
-            card.set_selected(i == row)
-        for i, card in enumerate(self.passed_cards):
-            card.set_selected(False)
-            if i in self.reviewed_passed:
-                card.set_reviewed(True)
-        self.load_document(self.pending_docs[row])
-
-    def _on_passed_selected(self, row: int):
-        if row < 0:
-            return
-        self.active_list = "passed"
-        self.active_index = row
-        self.reviewed_passed.add(row)
-        for i, card in enumerate(self.passed_cards):
-            card.set_selected(i == row)
-            if i in self.reviewed_passed:
-                card.set_reviewed(True)
-        for card in self.pending_cards:
-            card.set_selected(False)
-        self.load_document(self.passed_docs[row])
+            self.auto_confirmed_docs.append(data)
+        self.tab_pending_btn.setText(f"Pending ({len(self.pending_docs)})")
+        self.tab_auto_confirmed_btn.setText(f"Auto-Confirmed ({len(self.auto_confirmed_docs)})")
+        self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.auto_confirmed_docs)} auto | {len(self.reviewed_docs)} reviewed")
 
     def load_document(self, doc: dict):
         self.exit_crop_mode()
@@ -709,11 +835,9 @@ class ReviewTab(QWidget):
         self.document_modified = False
         self.undo_stack.clear()
 
-        total = len(self.pending_docs) + len(self.passed_docs)
-        if self.active_list == "pending":
-            self.doc_nav_label.setText(f"Pending {self.active_index + 1} of {len(self.pending_docs)}")
-        else:
-            self.doc_nav_label.setText(f"Passed {self.active_index + 1} of {len(self.passed_docs)}")
+        total = len(self._get_current_docs())
+        docs = self._get_current_docs()
+        self.doc_nav_label.setText(f"{self.active_tab.title()} {self.active_index + 1} of {total}")
 
         loaded = False
 
@@ -755,7 +879,7 @@ class ReviewTab(QWidget):
             self.preview_placeholder.setStyleSheet("color: #ff5555; font-size: 12pt;")
             self.page_label.setText("PDF not found")
 
-        if self.active_list == "passed":
+        if self.active_tab in ("auto_confirmed", "reviewed"):
             date_str = doc.get("detected_date", "")
         else:
             date_str = doc.get("best_guess_date", "") or doc.get("confirmed_date", "")
@@ -789,18 +913,12 @@ class ReviewTab(QWidget):
         return self.company_input.text().strip()
 
     def _get_blank_pages(self):
-        if self.active_list == "pending" and self.active_index >= 0:
-            return self.pending_docs[self.active_index].get("blank_pages", [])
-        elif self.active_list == "passed" and self.active_index >= 0:
-            return self.passed_docs[self.active_index].get("blank_pages", [])
-        return []
+        doc = self._get_current_doc()
+        return doc.get("blank_pages", []) if doc else []
 
     def _get_docsep_pages(self):
-        if self.active_list == "pending" and self.active_index >= 0:
-            return self.pending_docs[self.active_index].get("docsep_pages", [])
-        elif self.active_list == "passed" and self.active_index >= 0:
-            return self.passed_docs[self.active_index].get("docsep_pages", [])
-        return []
+        doc = self._get_current_doc()
+        return doc.get("docsep_pages", []) if doc else []
 
     def _create_page_label(self, page_num, pixmap, blank_pages, docsep_pages):
         lbl = ClickableLabel(page_num)
@@ -854,9 +972,10 @@ class ReviewTab(QWidget):
 
             while self.preview_container_layout.count():
                 item = self.preview_container_layout.takeAt(0)
-                if item.widget():
-                    item.widget().hide()
-                    item.widget().deleteLater()
+                w = item.widget()
+                if w and w is not self.preview_placeholder:
+                    w.hide()
+                    w.deleteLater()
 
             total_pages = len(self.current_pdf_doc)
             blank_pages = self._get_blank_pages()
@@ -1028,6 +1147,7 @@ class ReviewTab(QWidget):
         self.document_modified = True
         self.render_preview()
 
+
     def _rotate_page(self, page_num, degrees):
         if not self.current_pdf_doc:
             return
@@ -1037,6 +1157,7 @@ class ReviewTab(QWidget):
         page.set_rotation((current + degrees) % 360)
         self.document_modified = True
         self.render_preview()
+
 
     def _flip_page(self, page_num, direction):
         if not self.current_pdf_doc:
@@ -1070,6 +1191,7 @@ class ReviewTab(QWidget):
             os.unlink(tmp.name)
             self.document_modified = True
             self.render_preview()
+    
         except Exception as e:
             QMessageBox.critical(self, "Flip Error", f"Failed to flip page:\n{e}")
 
@@ -1083,6 +1205,7 @@ class ReviewTab(QWidget):
             enhance_page(page, dpi=dpi, config=self.config)
             self.document_modified = True
             self.render_preview()
+    
         except Exception as e:
             QMessageBox.critical(self, "Enhance Error", f"Failed to enhance page:\n{e}")
 
@@ -1137,6 +1260,7 @@ class ReviewTab(QWidget):
         self.exit_crop_mode()
         self.render_preview()
 
+
     def exit_crop_mode(self):
         if self._crop_overlay:
             self._crop_overlay.setParent(None)
@@ -1149,10 +1273,9 @@ class ReviewTab(QWidget):
         self.confirm_btn.setEnabled(True)
 
     def _get_current_doc(self):
-        if self.active_list == "pending" and self.active_index >= 0:
-            return self.pending_docs[self.active_index]
-        elif self.active_list == "passed" and self.active_index >= 0:
-            return self.passed_docs[self.active_index]
+        docs = self._get_current_docs()
+        if self.active_index >= 0 and self.active_index < len(docs):
+            return docs[self.active_index]
         return None
 
     def _mark_blank(self, page_num):
@@ -1168,6 +1291,7 @@ class ReviewTab(QWidget):
             docsep_pages.remove(page_num)
         self.render_preview()
 
+
     def _remove_mark(self, page_num):
         doc = self._get_current_doc()
         if not doc:
@@ -1180,6 +1304,7 @@ class ReviewTab(QWidget):
         if page_num in docsep_pages:
             docsep_pages.remove(page_num)
         self.render_preview()
+
 
     def _insert_image_page(self, page_num, position):
         if not self.current_pdf_doc:
@@ -1199,6 +1324,7 @@ class ReviewTab(QWidget):
             new_page.insert_image(img_rect, pixmap=img_pix)
             self.document_modified = True
             self.render_preview()
+    
         except Exception as e:
             QMessageBox.critical(self, "Insert Error", f"Failed to insert image:\n{e}")
 
@@ -1266,16 +1392,27 @@ class ReviewTab(QWidget):
             super().wheelEvent(event)
 
     def prev_document(self):
-        if self.active_list == "pending" and self.active_index > 0:
-            self.pending_list.setCurrentRow(self.active_index - 1)
-        elif self.active_list == "passed" and self.active_index > 0:
-            self.passed_list.setCurrentRow(self.active_index - 1)
+        if self.active_tab == "reviewed":
+            self._nav_reviewed(-1)
+        elif self.active_index > 0:
+            self.doc_list.setCurrentRow(self.active_index - 1)
 
     def next_document(self):
-        if self.active_list == "pending" and self.active_index < len(self.pending_docs) - 1:
-            self.pending_list.setCurrentRow(self.active_index + 1)
-        elif self.active_list == "passed" and self.active_index < len(self.passed_docs) - 1:
-            self.passed_list.setCurrentRow(self.active_index + 1)
+        if self.active_tab == "reviewed":
+            self._nav_reviewed(1)
+        else:
+            docs = self._get_current_docs()
+            if self.active_index < len(docs) - 1:
+                self.doc_list.setCurrentRow(self.active_index + 1)
+
+    def _get_current_docs(self):
+        if self.active_tab == "pending":
+            return self.pending_docs
+        elif self.active_tab == "auto_confirmed":
+            return self.auto_confirmed_docs
+        elif self.active_tab == "reviewed":
+            return self.reviewed_docs
+        return []
 
     def _add_to_roster(self):
         company_text = self._get_company_from_widgets()
@@ -1293,74 +1430,71 @@ class ReviewTab(QWidget):
         QMessageBox.information(self, "Added", f"'{normalized}' added to the company roster.")
 
     def confirm_date(self):
-        if self.active_index < 0 or not self.active_list:
+        if self.active_index < 0:
             return
         dt = self._get_date_from_widgets()
         company_text = self._get_company_from_widgets()
+        from pipeline import finalize_single_document
+        config = self._pipeline_config()
 
-        if self.active_list == "pending":
+        if self.active_tab == "pending":
             doc = self.pending_docs[self.active_index]
             original_company = doc.get("company_name", "")
             if company_text and company_text != original_company:
                 confirmed_company = normalize_company_name(company_text)
             else:
                 confirmed_company = original_company
-
             doc["confirmed_date"] = dt
             doc["company_name"] = confirmed_company
             doc["reviewed"] = True
             doc["review_timestamp"] = str(datetime.now())
-            self._save_flagged_updates()
-
-            card = self.pending_cards[self.active_index]
-            card.set_selected(False)
-
-            self.passed_docs.append({
-                "original_path": doc.get("original_path", ""),
-                "division_code": doc.get("division_code", ""),
-                "company_name": confirmed_company,
-                "original_filename": doc.get("original_filename", ""),
-                "detected_date": dt,
-                "confidence": doc.get("confidence", 0),
-                "method": "manual",
-                "blank_pages": doc.get("blank_pages", []),
-                "docsep_pages": doc.get("docsep_pages", []),
-                "final_filename": "",
-            })
-
             if self.document_modified and self.current_pdf_doc:
-                self.passed_docs[-1]["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
+                doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
+            result = finalize_single_document(doc, config)
+            if result.get("success"):
+                self.pending_docs.pop(self.active_index)
+                self._save_flagged_updates()
+                self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
+                self.current_pdf_doc = None
+                self.active_index = -1
+                for lbl in self.page_labels:
+                    lbl.deleteLater()
+                self.page_labels = []
+                self.refresh_doc_list()
+            else:
+                QMessageBox.warning(self, "Finalize Failed", f"Could not save: {result.get('error', 'Unknown')}")
 
-            self._save_passed_updates()
-
-            self.refresh_review()
-
-        elif self.active_list == "passed":
-            doc = self.passed_docs[self.active_index]
+        elif self.active_tab == "auto_confirmed":
+            doc = self.auto_confirmed_docs[self.active_index]
             original_company = doc.get("company_name", "")
             if company_text and company_text != original_company:
                 confirmed_company = normalize_company_name(company_text)
             else:
                 confirmed_company = original_company
-
             doc["detected_date"] = dt
             doc["company_name"] = confirmed_company
+            doc["reviewed"] = True
             if self.document_modified and self.current_pdf_doc:
                 doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
-            self._save_passed_updates()
-
-            card = self.passed_cards[self.active_index]
-            card.set_selected(False)
-
-            self.refresh_review()
+            result = finalize_single_document(doc, config)
+            if result.get("success"):
+                self.auto_confirmed_docs.pop(self.active_index)
+                self._save_auto_confirmed_updates()
+                self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
+                self.current_pdf_doc = None
+                self.active_index = -1
+                for lbl in self.page_labels:
+                    lbl.deleteLater()
+                self.page_labels = []
+                self.refresh_doc_list()
+            else:
+                QMessageBox.warning(self, "Finalize Failed", f"Could not save: {result.get('error', 'Unknown')}")
 
     def toggle_ocr_panel(self):
-        if self.active_index < 0 or not self.active_list:
+        if self.active_index < 0:
             return
-        if self.active_list == "pending":
-            doc = self.pending_docs[self.active_index]
-        else:
-            doc = self.passed_docs[self.active_index]
+        docs = self._get_current_docs()
+        doc = docs[self.active_index]
         raw = doc.get("raw_ocr_text", "")
 
         if self.ocr_dialog:
@@ -1406,129 +1540,145 @@ class ReviewTab(QWidget):
         with open(flagged_file, "w", encoding="utf-8") as f:
             json.dump(clean, f, indent=2, ensure_ascii=False)
 
-    def _save_passed_updates(self):
-        passed_file = Path(self.config["flagged_root"]) / "passed_index.json"
-        passed_file.parent.mkdir(parents=True, exist_ok=True)
-        clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.passed_docs]
-        with open(passed_file, "w", encoding="utf-8") as f:
-            json.dump(clean, f, indent=2, ensure_ascii=False)
+    def _pipeline_config(self):
+        from pipeline import PipelineConfig
+        config = PipelineConfig(
+            input_root=self.config.get("input_root", ""),
+            output_root=self.config.get("output_root", ""),
+            flagged_root=self.config.get("flagged_root", ""),
+            confidence_threshold=self.config.get("confidence_threshold", 70),
+            page_index=self.config.get("page_index", 0),
+            earliest_year=self.config.get("earliest_year", 1990),
+            ocr_engine=self.config.get("ocr_engine", "tesseract"),
+        )
+        config.enable_qc = self.config.get("enable_qc", None)
+        config.enable_docsep_removal = self.config.get("enable_docsep_removal", True)
+        config.enable_blank_removal = self.config.get("enable_blank_removal", True)
+        config.qc_blank_threshold = self.config.get("qc_blank_threshold", 1.5)
+        config.qc_rotation_threshold = self.config.get("qc_rotation_threshold", 65)
+        config.qc_min_text_threshold = self.config.get("qc_min_text_threshold", 5)
+        config.qc_oversized_margin = self.config.get("qc_oversized_margin", 0.3)
+        config.qc_blur_threshold = self.config.get("qc_blur_threshold", 100)
+        config.min_file_size_kb = self.config.get("min_file_size_kb", 10)
+        config.output_layout = self.config.get("output_layout", "company")
+        return config
 
-    def finalize_all(self):
-        if not self.passed_docs and not any(d.get("reviewed") for d in self.all_flagged_docs):
-            QMessageBox.information(self, "Info", "No documents to finalize")
+    def _on_enter_key(self):
+        focus = self.focusWidget()
+        if focus in (self.company_input, self.month_combo, self.year_spin) or isinstance(focus, QPushButton):
+            return
+        if self.active_tab in ("pending", "auto_confirmed"):
+            self._finalize_current_and_advance()
+
+    def _finalize_current_and_advance(self):
+        if self.active_tab not in ("pending", "auto_confirmed"):
+            return
+        if self.active_index < 0:
+            QMessageBox.information(self, "Info", "Select a document first")
+            return
+        from pipeline import finalize_single_document
+        docs = self.pending_docs if self.active_tab == "pending" else self.auto_confirmed_docs
+        if self.active_index >= len(docs):
+            return
+        config = self._pipeline_config()
+        doc = docs[self.active_index]
+
+        if self.document_modified and self.current_pdf_doc:
+            doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
+
+        result = finalize_single_document(doc, config)
+        if not result.get("success"):
+            QMessageBox.warning(self, "Finalize Failed", f"Could not save: {result.get('error', 'Unknown')}")
             return
 
-        total_blank = sum(len(pd.get("blank_pages", [])) for pd in self.passed_docs)
-        total_docsep = sum(len(pd.get("docsep_pages", [])) for pd in self.passed_docs)
-        msg = f"Finalize {len(self.passed_docs)} document(s)?"
-        if total_blank > 0:
-            msg += f"\n\n{total_blank} blank page(s) will be removed."
-        if total_docsep > 0:
-            msg += f"\n{total_docsep} DOCSEP separator page(s) will be removed."
-        if total_blank > 0 or total_docsep > 0:
-            msg += "\n\nThis action cannot be undone."
+        if self.active_tab == "pending":
+            doc["reviewed"] = True
+            self.pending_docs.pop(self.active_index)
+            self._save_flagged_updates()
+        else:
+            self.auto_confirmed_docs.pop(self.active_index)
+            self._save_auto_confirmed_updates()
 
-        reply = QMessageBox.question(self, "Confirm Finalize", msg)
-        if reply != QMessageBox.StandardButton.Yes:
+        self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
+
+        self.current_pdf_doc = None
+        for lbl in self.page_labels:
+            lbl.deleteLater()
+        self.page_labels = []
+        next_row = min(self.active_index, len(self.pending_docs if self.active_tab == "pending" else self.auto_confirmed_docs) - 1)
+        self.active_index = next_row
+        self.refresh_doc_list(select_row=next_row if next_row >= 0 else None)
+
+    def confirm_all_auto(self):
+        if self.active_tab != "auto_confirmed" or not self.auto_confirmed_docs:
             return
+        import copy
+        if self.document_modified and self.current_pdf_doc and 0 <= self.active_index < len(self.auto_confirmed_docs):
+            self.auto_confirmed_docs[self.active_index]["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
+        self._set_confirm_all_running(True)
+        snapshot = copy.deepcopy(self.auto_confirmed_docs)
+        self._confirm_all_worker = FinalizeAllWorker(snapshot, self._pipeline_config())
+        self._confirm_all_worker.progress.connect(self._on_confirm_all_progress)
+        self._confirm_all_worker.finished.connect(self._on_confirm_all_finished)
+        self._confirm_all_worker.start()
 
-        folder_reply = QMessageBox.question(
-            self, "Folder Structure",
-            "Auto-create folders by company name?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        keep_input_structure = (folder_reply == QMessageBox.StandardButton.No)
+    def _set_confirm_all_running(self, running: bool):
+        self.confirm_all_btn.setEnabled(not running)
+        self.confirm_all_btn.setText("Confirming..." if running else "CONFIRM ALL")
 
-        self.finalize_btn.setEnabled(False)
-        self.finalize_btn.setText("Processing...")
+    def _on_confirm_all_progress(self, done: int, total: int):
+        if total > 0:
+            self.confirm_all_btn.setText(f"Confirming... {done}/{total}")
 
-        self._finalize_worker = FinalizeWorker(
-            passed_docs=list(self.passed_docs),
-            all_flagged_docs=list(self.all_flagged_docs),
-            config=self.config,
-            document_modified=self.document_modified,
-            current_pdf_doc=self.current_pdf_doc,
-            active_index=self.active_index,
-            active_list=self.active_list,
-            pending_docs=list(self.pending_docs),
-            keep_input_structure=keep_input_structure,
-        )
-        self._finalize_worker.done.connect(self._on_finalize_done)
-        self._finalize_worker.error.connect(self._on_finalize_error)
-        self._finalize_worker.start()
+    def _on_confirm_all_finished(self, done: int, failures: list):
+        self._set_confirm_all_running(False)
+        self.current_pdf_doc = None
+        for lbl in self.page_labels:
+            lbl.deleteLater()
+        self.page_labels = []
+        self.active_index = -1
+        if failures:
+            failed_paths = {f[0] for f in failures}
+            self.auto_confirmed_docs = [d for d in self.auto_confirmed_docs if d.get("original_path", "") in failed_paths]
+            self._save_auto_confirmed_updates()
+            lines = [f"{name}: {err}" for _, name, err in failures[:20]]
+            extra = "" if len(failures) <= 20 else f"\n... and {len(failures) - 20} more"
+            QMessageBox.warning(self, "Confirm All", f"Finalized {done}.\n{len(failures)} failed:\n" + "\n".join(lines) + extra)
+        else:
+            self.auto_confirmed_docs = []
+            self._save_auto_confirmed_updates()
+            QMessageBox.information(self, "Confirm All", f"All {done} documents finalized and moved to the output folder.")
+        self.refresh_doc_list()
 
-    def _on_finalize_done(self):
-        import traceback
-        _log = open(Path(__file__).parent.parent / "finalize_debug.log", "a", encoding="utf-8")
-        _log.write("=== _on_finalize_done START ===\n")
-        _log.flush()
-        try:
-            self.pending_docs = []
-            _log.write("1\n"); _log.flush()
-            self.passed_docs = []
-            _log.write("2\n"); _log.flush()
-            self.all_flagged_docs = []
-            _log.write("3\n"); _log.flush()
-            self.pending_cards = []
-            _log.write("4\n"); _log.flush()
-            self.passed_cards = []
-            _log.write("5\n"); _log.flush()
-            self.pending_list.clear()
-            _log.write("6\n"); _log.flush()
-            self.passed_list.clear()
-            _log.write("7\n"); _log.flush()
-            self.active_list = None
-            _log.write("8\n"); _log.flush()
-            self.active_index = -1
-            _log.write("9\n"); _log.flush()
-            self.current_pdf_doc = None
-            _log.write("10\n"); _log.flush()
-            self.document_modified = False
-            _log.write("11\n"); _log.flush()
-            self.undo_stack.clear()
-            _log.write("12\n"); _log.flush()
-            for lbl in self.page_labels:
-                lbl.deleteLater()
-            _log.write("13\n"); _log.flush()
-            self.page_labels = []
-            _log.write("14\n"); _log.flush()
-            self.preview_placeholder.setText("Select a document to preview")
-            _log.write("15\n"); _log.flush()
-            self.preview_placeholder.setStyleSheet("color: #555570; font-size: 12pt;")
-            _log.write("16\n"); _log.flush()
-            self.preview_placeholder.show()
-            _log.write("17\n"); _log.flush()
-            self.pending_label.setText("Pending Review (0)")
-            _log.write("18\n"); _log.flush()
-            self.passed_label.setText("Auto-Confirmed (0)")
-            _log.write("19\n"); _log.flush()
-            self.count_label.setText("No documents")
-            _log.write("20\n"); _log.flush()
-            self.page_label.setText("No document loaded")
-            _log.write("21\n"); _log.flush()
-            self.finalize_btn.setEnabled(True)
-            _log.write("22\n"); _log.flush()
-            self.finalize_btn.setText("FINALIZE")
-            _log.write("23\n"); _log.flush()
-            QMessageBox.information(self, "Finalize Complete", "All documents have been processed and moved to the output folder.")
-            _log.write("24\n"); _log.flush()
-        except Exception as e:
-            _log.write(f"EXCEPTION: {e}\n")
-            _log.write(traceback.format_exc() + "\n")
-            _log.flush()
-        _log.write("=== _on_finalize_done END ===\n")
-        _log.close()
-
-    def _on_finalize_error(self, msg):
-        _log = open(Path(__file__).parent.parent / "finalize_debug.log", "a", encoding="utf-8")
-        _log.write(f"=== _on_finalize_error: {msg} ===\n")
-        _log.close()
-        self.finalize_btn.setEnabled(True)
-        self.finalize_btn.setText("FINALIZE")
-        QMessageBox.critical(self, "Finalize Error", f"Failed to finalize:\n{msg}")
+    def _show_toast(self, message: str):
+        if self._toast is None:
+            self._toast = QLabel(self)
+            self._toast.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._toast.setWordWrap(True)
+            self._toast.setStyleSheet(
+                "background-color: #20223a; color: #7dff9b; border: 1px solid #2fbf6b;"
+                " border-radius: 6px; padding: 8px 14px; font-size: 10pt; font-weight: bold;"
+            )
+        self._toast.setText(message)
+        self._toast.adjustSize()
+        max_w = max(240, min(420, self.width() - 32))
+        if self._toast.width() > max_w:
+            self._toast.setFixedWidth(max_w)
+            self._toast.adjustSize()
+        self._toast.adjustSize()
+        self._toast.move(self.width() - self._toast.width() - 16, self.height() - self._toast.height() - 16)
+        self._toast.raise_()
+        self._toast.show()
+        if self._toast_timer is None:
+            self._toast_timer = QTimer(self)
+            self._toast_timer.setSingleShot(True)
+            self._toast_timer.timeout.connect(self._toast.hide)
+        self._toast_timer.start(2000)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if self._toast is not None and self._toast.isVisible():
+            self._toast.move(self.width() - self._toast.width() - 16, self.height() - self._toast.height() - 16)
         if self.current_pdf_doc:
             QTimer.singleShot(100, self.render_preview)
 

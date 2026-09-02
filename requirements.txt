@@ -1,7 +1,5 @@
-# OCR Engines (install one or both)
+# OCR Engine
 pytesseract
-paddleocr
-paddlepaddle
 
 # Core dependencies
 opencv-python

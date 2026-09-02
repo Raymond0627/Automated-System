@@ -57,9 +57,6 @@ pyinstaller ^
     --exclude-module transformers ^
     --exclude-module onnxruntime ^
     --exclude-module tensorflow ^
-    --exclude-module paddle ^
-    --exclude-module paddleocr ^
-    --exclude-module paddlepaddle ^
     --exclude-module sympy ^
     --exclude-module scipy ^
     --exclude-module pandas ^

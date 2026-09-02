@@ -1,7 +1,8 @@
-import os
+﻿import os
 import sys
 import json
 import time
+import gc
 import numpy as np
 import cv2
 import fitz
@@ -60,6 +61,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
 
         total_pages = 0
         if result["blank_pages"]:
+            pdf_for_ocr = None
             try:
                 pdf_for_ocr = fitz.open(original_path)
                 total_pages = len(pdf_for_ocr)
@@ -69,18 +71,26 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                     pg = pdf_for_ocr[blank_pg]
                     pix = pg.get_pixmap(dpi=render_dpi)
                     img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+                    del pix
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    del img
                     text = pytesseract.image_to_string(gray, config='--psm 6').strip()
+                    del gray
                     words = [w for w in text.split() if len(w) >= 2]
                     if len(words) >= 2:
                         result["blank_pages"].remove(blank_pg)
                         result["log_messages"].append(f"[BLANK-OCR] {original_filename} p{blank_pg+1}: {len(words)} words found - NOT blank")
                     else:
                         result["log_messages"].append(f"[BLANK-OCR] {original_filename} p{blank_pg+1}: {len(words)} word(s) - confirmed blank")
-                pdf_for_ocr.close()
-            except Exception:
-                pass
+            except Exception as e:
+                result["log_messages"].append(f"[BLANK-OCR-ERROR] {original_filename}: {e}")
+            finally:
+                if pdf_for_ocr:
+                    try:
+                        pdf_for_ocr.close()
+                    except Exception:
+                        pass
 
         result["total_pages"] = total_pages
 
@@ -135,14 +145,14 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 "blank_pages": result["blank_pages"],
                 "all_blank": True,
                 "docsep_pages": result["docsep_pages"],
-                "company_source": company_result['source'],
+                "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
             }
             if qc_result:
                 result["flagged_data"]["qc"] = qc_result
             result["log_messages"].append(f"[BLANK] {original_filename}: ALL BLANK ({total_pages} pages){qc_str}{docsep_msg}")
         elif date_result.confidence >= config.get("confidence_threshold", 70) and date_result.date:
-            company_known = (company_result['source'] in ('header', 'addressee', 'keyword')
-                             and not company_result.get('needs_review', False))
+            company_known = (not company_result.get('needs_review', False)
+                             and company_result.get('confidence_label') in ('high', 'medium'))
             if qc_failed:
                 result["status"] = "flagged"
                 result["flagged_data"] = {
@@ -156,7 +166,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                     "raw_ocr_text": date_result.raw_ocr_text,
                     "blank_pages": result["blank_pages"],
                     "docsep_pages": result["docsep_pages"],
-                    "company_source": company_result['source'],
+                    "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
                 }
                 if qc_result:
                     result["flagged_data"]["qc"] = qc_result
@@ -174,12 +184,12 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                     "raw_ocr_text": date_result.raw_ocr_text,
                     "blank_pages": result["blank_pages"],
                     "docsep_pages": result["docsep_pages"],
-                    "company_source": company_result['source'],
+                    "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
                     "company_needs_review": True,
                 }
                 if qc_result:
                     result["flagged_data"]["qc"] = qc_result
-                result["log_messages"].append(f"[FLAGGED-COMPANY] {original_filename} company='{final_company}' source={company_result['source']}")
+                result["log_messages"].append(f"[FLAGGED-COMPANY] {original_filename} company='{final_company}' tier={company_result.get('tier_used', 'unknown')}")
             else:
                 result["status"] = "confirmed"
                 result["passed_data"] = {
@@ -193,7 +203,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                     "blank_pages": result["blank_pages"],
                     "docsep_pages": result["docsep_pages"],
                     "raw_ocr_text": date_result.raw_ocr_text,
-                    "company_source": company_result['source'],
+                    "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
                 }
                 if qc_result:
                     result["passed_data"]["qc_status"] = qc_result.get("qc_status", "")
@@ -212,7 +222,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 "raw_ocr_text": date_result.raw_ocr_text,
                 "blank_pages": result["blank_pages"],
                 "docsep_pages": result["docsep_pages"],
-                "company_source": company_result['source'],
+                "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
             }
             if qc_result:
                 result["flagged_data"]["qc"] = qc_result
@@ -260,6 +270,7 @@ class PipelineThread(QThread):
             render_dpi = self.config.get("render_dpi", 150)
             pipeline_config.render_dpi = render_dpi
             max_workers = self.config.get("max_workers", 4)
+            batch_size = self.config.get("batch_size", 50)
 
             flagged_root = Path(self.config["flagged_root"])
             flagged_root.mkdir(parents=True, exist_ok=True)
@@ -303,9 +314,17 @@ class PipelineThread(QThread):
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 future_to_info = {}
+                submitted = 0
+
                 for info in doc_infos:
+                    if self._cancelled:
+                        break
                     future = executor.submit(_process_doc_worker, info, self.config, render_dpi)
                     future_to_info[future] = info
+                    submitted += 1
+
+                    if submitted % batch_size == 0:
+                        self.log_message.emit(f"[INFO] Submitted {submitted}/{len(doc_infos)} documents...")
 
                 for future in as_completed(future_to_info):
                     if self._cancelled:
@@ -357,6 +376,9 @@ class PipelineThread(QThread):
                     pct = 10 + int(80 * processed / max(1, total))
                     self.progress.emit(f"Processing {processed}/{total}...{eta}", pct)
 
+                    if processed % 50 == 0:
+                        gc.collect()
+
             flagged = []
             for b in batches:
                 for d in b.documents:
@@ -387,6 +409,8 @@ class PipelineThread(QThread):
             self.error_signal.emit(str(e))
             import traceback
             self.log_message.emit(traceback.format_exc())
+        finally:
+            gc.collect()
 
 
 class DocCardWidget(QFrame):

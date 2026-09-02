@@ -3,6 +3,7 @@ import numpy as np
 import shutil
 import base64
 import json
+import gc
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 
@@ -11,16 +12,7 @@ BLANK_INK_RATIO_THRESHOLD = 1.5       # % of ink pixels below which page is blan
 ROTATION_CONFIDENCE_THRESHOLD = 65    # OSD confidence % threshold
 MIRROR_CONFIDENCE_DELTA_THRESHOLD = 15  # % gap between normal vs flipped OCR scores
 
-# ---- PaddleOCR singleton cache ----
-_paddle_ocr_instance = None
-_paddle_gpu_mode = None
 _remote_gpu_url = ""
-
-
-def reset_paddle_cache():
-    global _paddle_ocr_instance, _paddle_gpu_mode
-    _paddle_ocr_instance = None
-    _paddle_gpu_mode = None
 
 
 def set_remote_gpu_url(url: str):
@@ -125,7 +117,6 @@ def check_mirrored(
     """
     Detect mirrored pages by comparing OCR confidence on original vs horizontally-flipped copy.
     If flipped version scores meaningfully higher -> flag as mirrored.
-    Uses PaddleOCR if available, falls back to Tesseract.
     Returns {'is_mirrored': bool, 'confidence_delta': float, 'needs_review': bool}
     """
     flipped = cv2.flip(page_img, 1)
@@ -134,18 +125,6 @@ def check_mirrored(
         """Returns (confidence_score, word_count)"""
         if gpu_mode == "remote":
             return remote_ocr(img), 0
-        global _paddle_ocr_instance
-        try:
-            from paddleocr import PaddleOCR
-            if _paddle_ocr_instance is None:
-                _paddle_ocr_instance = PaddleOCR(use_angle_cls=False, lang="en", show_log=False, use_gpu=use_gpu)
-            result = _paddle_ocr_instance.ocr(img, cls=False)
-            if result and result[0]:
-                scores = [line[1][1] for line in result[0] if line[1]]
-                word_count = len(result[0])
-                return (sum(scores) / len(scores)) * 100 if scores else 0.0, word_count
-        except Exception:
-            pass
         try:
             import pytesseract
             data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
@@ -256,27 +235,38 @@ def detect_docsep_flag(pdf_path: str, dpi: int = 150) -> Dict:
     Returns {docsep_pages: List[int], count: int, confidence: float, reason: str}
     """
     import fitz
-    doc = fitz.open(pdf_path)
-    total = len(doc)
-    docsep_pages = []
-    confidence = 0.0
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        total = len(doc)
+        docsep_pages = []
+        confidence = 0.0
 
-    if total > 0:
-        pix = doc[0].get_pixmap(dpi=dpi)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        result = detect_docsep_page(img)
-        if result["is_docsep"]:
-            docsep_pages.append(0)
-            confidence = result["confidence"]
+        if total > 0:
+            pix = doc[0].get_pixmap(dpi=dpi)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            result = detect_docsep_page(img)
+            del img, pix
+            if result["is_docsep"]:
+                docsep_pages.append(0)
+                confidence = result["confidence"]
 
-    doc.close()
-    return {
-        "docsep_pages": docsep_pages,
-        "count": len(docsep_pages),
-        "confidence": confidence,
-        "reason": "QR code detected" if docsep_pages else "",
-    }
+        return {
+            "docsep_pages": docsep_pages,
+            "count": len(docsep_pages),
+            "confidence": confidence,
+            "reason": "QR code detected" if docsep_pages else "",
+        }
+    except Exception as e:
+        print(f"Error detecting DOCSEP: {e}")
+        return {"docsep_pages": [], "count": 0, "confidence": 0.0, "reason": ""}
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def remove_docsep_pages(pdf_path: str, output_dir: str, dpi: int = 150) -> Dict:
@@ -286,40 +276,51 @@ def remove_docsep_pages(pdf_path: str, output_dir: str, dpi: int = 150) -> Dict:
     Returns {removed: bool, count: int, pages_removed: List[int], cleaned_path: str}
     """
     import fitz
-    doc = fitz.open(pdf_path)
-    total = len(doc)
-    pages_to_remove = []
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        total = len(doc)
+        pages_to_remove = []
 
-    # Check first page
-    if total > 0:
-        pix = doc[0].get_pixmap(dpi=dpi)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-        result = detect_docsep_page(img)
-        if result["is_docsep"]:
-            pages_to_remove.append(0)
+        # Check first page
+        if total > 0:
+            pix = doc[0].get_pixmap(dpi=dpi)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            del pix
+            result = detect_docsep_page(img)
+            del img
+            if result["is_docsep"]:
+                pages_to_remove.append(0)
 
-    if not pages_to_remove:
-        doc.close()
+        if not pages_to_remove:
+            return {"removed": False, "count": 0, "pages_removed": [], "cleaned_path": pdf_path}
+
+        # Remove pages in reverse order
+        for pn in reversed(pages_to_remove):
+            doc.delete_page(pn)
+
+        # Save cleaned version
+        stem = Path(pdf_path).stem
+        cleaned_name = f"{stem}_cleaned.pdf"
+        out_path = Path(output_dir) / cleaned_name
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        doc.save(str(out_path), incremental=False, garbage=4, deflate=True)
+        return {
+            "removed": True,
+            "count": len(pages_to_remove),
+            "pages_removed": pages_to_remove,
+            "cleaned_path": str(out_path),
+        }
+    except Exception as e:
+        print(f"Error removing DOCSEP pages: {e}")
         return {"removed": False, "count": 0, "pages_removed": [], "cleaned_path": pdf_path}
-
-    # Remove pages in reverse order
-    for pn in reversed(pages_to_remove):
-        doc.delete_page(pn)
-
-    # Save cleaned version
-    stem = Path(pdf_path).stem
-    cleaned_name = f"{stem}_cleaned.pdf"
-    out_path = Path(output_dir) / cleaned_name
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(out_path), incremental=False, garbage=4, deflate=True)
-    doc.close()
-    return {
-        "removed": True,
-        "count": len(pages_to_remove),
-        "pages_removed": pages_to_remove,
-        "cleaned_path": str(out_path),
-    }
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def remove_blank_pages(pdf_path: str, blank_indices: List[int], output_path: str) -> int:
@@ -332,28 +333,35 @@ def remove_blank_pages(pdf_path: str, blank_indices: List[int], output_path: str
     if not blank_indices:
         return 0
     import fitz
-    doc = fitz.open(pdf_path)
-    removed = 0
-    for pn in reversed(sorted(blank_indices)):
-        if pn < len(doc):
-            doc.delete_page(pn)
-            removed += 1
-    if removed > 0:
-        save_path = output_path
-        if output_path == pdf_path:
-            import tempfile
-            tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
-            save_path = tmp.name
-            tmp.close()
-            doc.save(save_path, incremental=False, garbage=4, deflate=True)
-            doc.close()
-            shutil.move(save_path, output_path)
-        else:
-            doc.save(save_path, incremental=False, garbage=4, deflate=True)
-            doc.close()
-    else:
-        doc.close()
-    return removed
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        removed = 0
+        for pn in reversed(sorted(blank_indices)):
+            if pn < len(doc):
+                doc.delete_page(pn)
+                removed += 1
+        if removed > 0:
+            save_path = output_path
+            if output_path == pdf_path:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix='.pdf', delete=False)
+                save_path = tmp.name
+                tmp.close()
+                doc.save(save_path, incremental=False, garbage=4, deflate=True)
+                shutil.move(save_path, output_path)
+            else:
+                doc.save(save_path, incremental=False, garbage=4, deflate=True)
+        return removed
+    except Exception as e:
+        print(f"Error removing blank pages: {e}")
+        return 0
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
 
 
 def run_qc_on_pdf(
@@ -371,51 +379,69 @@ def run_qc_on_pdf(
     Returns aggregated QC results.
     """
     import fitz
-    doc = fitz.open(pdf_path)
-    total = len(doc)
-    pages_to_check = total if max_pages == 0 else min(total, max_pages)
+    doc = None
+    try:
+        doc = fitz.open(pdf_path)
+        total = len(doc)
+        pages_to_check = total if max_pages == 0 else min(total, max_pages)
 
-    agg = {
-        "blank_detected": False,
-        "blank_ink_ratio": 0.0,
-        "rotation_detected": "none",
-        "rotation_confidence": 100.0,
-        "mirrored_detected": False,
-        "mirror_delta": 0.0,
-        "mirror_needs_review": False,
-        "qc_status": "passed",
-        "qc_failure_reasons": "",
-        "pages_checked": pages_to_check,
-        "total_pages": total,
-    }
+        agg = {
+            "blank_detected": False,
+            "blank_ink_ratio": 0.0,
+            "rotation_detected": "none",
+            "rotation_confidence": 100.0,
+            "mirrored_detected": False,
+            "mirror_delta": 0.0,
+            "mirror_needs_review": False,
+            "qc_status": "passed",
+            "qc_failure_reasons": "",
+            "pages_checked": pages_to_check,
+            "total_pages": total,
+        }
 
-    for pn in range(pages_to_check):
-        page = doc[pn]
-        pix = page.get_pixmap(dpi=dpi)
-        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        for pn in range(pages_to_check):
+            page = doc[pn]
+            pix = page.get_pixmap(dpi=dpi)
+            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            del pix
 
-        result = run_qc(img, blank_threshold, rotation_threshold, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode, dpi=dpi)
-        if result["blank_detected"]:
-            agg["blank_detected"] = True
-        agg["blank_ink_ratio"] = max(agg["blank_ink_ratio"], result["blank_ink_ratio"])
-        if result["rotation_detected"] != "none":
-            agg["rotation_detected"] = result["rotation_detected"]
-            agg["rotation_confidence"] = min(agg["rotation_confidence"], result["rotation_confidence"])
-        if result["mirrored_detected"]:
-            agg["mirrored_detected"] = True
-            agg["mirror_delta"] = max(agg["mirror_delta"], result["mirror_delta"])
-        if result["mirror_needs_review"]:
-            agg["mirror_needs_review"] = True
+            result = run_qc(img, blank_threshold, rotation_threshold, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode, dpi=dpi)
+            del img
+            if result["blank_detected"]:
+                agg["blank_detected"] = True
+            agg["blank_ink_ratio"] = max(agg["blank_ink_ratio"], result["blank_ink_ratio"])
+            if result["rotation_detected"] != "none":
+                agg["rotation_detected"] = result["rotation_detected"]
+                agg["rotation_confidence"] = min(agg["rotation_confidence"], result["rotation_confidence"])
+            if result["mirrored_detected"]:
+                agg["mirrored_detected"] = True
+                agg["mirror_delta"] = max(agg["mirror_delta"], result["mirror_delta"])
+            if result["mirror_needs_review"]:
+                agg["mirror_needs_review"] = True
 
-        if result["qc_status"] != "passed":
-            agg["qc_status"] = result["qc_status"]
-        if result["qc_failure_reasons"]:
-            agg["qc_failure_reasons"] = (
-                agg["qc_failure_reasons"] + "; " + result["qc_failure_reasons"]
-                if agg["qc_failure_reasons"]
-                else result["qc_failure_reasons"]
-            )
+            if result["qc_status"] != "passed":
+                agg["qc_status"] = result["qc_status"]
+            if result["qc_failure_reasons"]:
+                agg["qc_failure_reasons"] = (
+                    agg["qc_failure_reasons"] + "; " + result["qc_failure_reasons"]
+                    if agg["qc_failure_reasons"]
+                    else result["qc_failure_reasons"]
+                )
 
-    doc.close()
-    return agg
+        return agg
+    except Exception as e:
+        print(f"Error running QC on PDF: {e}")
+        return {
+            "blank_detected": False, "blank_ink_ratio": 0.0,
+            "rotation_detected": "none", "rotation_confidence": 100.0,
+            "mirrored_detected": False, "mirror_delta": 0.0,
+            "mirror_needs_review": False, "qc_status": "passed",
+            "qc_failure_reasons": "", "pages_checked": 0, "total_pages": 0,
+        }
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
