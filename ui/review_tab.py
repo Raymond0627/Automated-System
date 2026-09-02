@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import (
     QSpinBox, QScrollArea, QListWidget, QListWidgetItem, QTreeWidget,
     QTreeWidgetItem, QStackedWidget, QSplitter,
     QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog,
-    QMenu, QInputDialog, QFrame, QLineEdit, QCompleter
+    QMenu, QInputDialog, QFrame, QLineEdit, QCompleter,
+    QGraphicsOpacityEffect
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QRectF, QPointF
 from PyQt6.QtGui import (
@@ -40,12 +41,42 @@ class ClickableLabel(QLabel):
     def __init__(self, page_num, parent=None):
         super().__init__(parent)
         self._page_num = page_num
+        self._sort_slot = -1
+        self._sort_mode = False
+        self._sort_handler = None
+        self._press_screen = None
+        self._drag_active = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._sort_mode:
+                self._press_screen = event.globalPosition().toPoint()
+                self._drag_active = False
+                event.accept()
+                return
             self.clicked.emit(self._page_num)
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._sort_mode and self._sort_handler:
+            if self._press_screen is not None:
+                delta = event.globalPosition().toPoint() - self._press_screen
+                if delta.manhattanLength() > 12:
+                    self._sort_handler.on_sort_drag(self._sort_slot)
+                    self._drag_active = True
+                    self._press_screen = None
+            elif self._drag_active:
+                self._sort_handler.on_drag_move(self._sort_slot, event.globalPosition().toPoint())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._sort_mode and self._sort_handler:
+            if self._press_screen is not None:
+                self._press_screen = None
+            self._drag_active = False
+            self._sort_handler.on_sort_release(self._sort_slot)
+        super().mouseReleaseEvent(event)
 
 
 class CropOverlay(QWidget):
@@ -283,8 +314,14 @@ class ReviewTab(QWidget):
         self._crop_overlay = None
         self.undo_stack = []
         self.undo_max = 50
-        self.view_mode = "one_page"
+        self.view_mode = "variable"
         self.variable_pages_per_row = 3
+        self._sort_mode = False
+        self._sort_order = []
+        self._sort_dragging = -1
+        self._sort_ghost = None
+        self._sort_ghost_src = None
+        self._sort_indicator = None
         self.build_ui()
 
     def build_ui(self):
@@ -512,12 +549,17 @@ class ReviewTab(QWidget):
         self.enter_shortcut_return.activated.connect(self._on_enter_key)
         self.enter_shortcut_enter = QShortcut(QKeySequence(Qt.Key.Key_Enter), self)
         self.enter_shortcut_enter.activated.connect(self._on_enter_key)
+        self.sort_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.sort_shortcut.activated.connect(self._toggle_sort_mode)
+        self.esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self.esc_shortcut.activated.connect(self._on_escape)
 
     def refresh_completer(self):
         companies = load_known_companies()
         self._company_completer.model().setStringList(companies)
 
     def refresh_review(self):
+        self._exit_sort_mode(rerender=False)
         _prev_flagged = list(self.all_flagged_docs) if self.all_flagged_docs else []
         _prev_auto = list(self.auto_confirmed_docs) if self.auto_confirmed_docs else []
 
@@ -575,6 +617,7 @@ class ReviewTab(QWidget):
                 self.doc_list.setCurrentRow(0)
 
     def switch_tab(self, tab_name: str):
+        self._exit_sort_mode(rerender=False)
         self.active_tab = tab_name
         self.active_index = -1
         self.current_pdf_doc = None
@@ -824,6 +867,7 @@ class ReviewTab(QWidget):
 
     def load_document(self, doc: dict):
         self.exit_crop_mode()
+        self._exit_sort_mode(rerender=False)
         if self.current_pdf_doc:
             try:
                 self.current_pdf_doc.close()
@@ -920,7 +964,7 @@ class ReviewTab(QWidget):
         doc = self._get_current_doc()
         return doc.get("docsep_pages", []) if doc else []
 
-    def _create_page_label(self, page_num, pixmap, blank_pages, docsep_pages):
+    def _create_page_label(self, page_num, pixmap, blank_pages, docsep_pages, sort_slot=-1):
         lbl = ClickableLabel(page_num)
         lbl.setPixmap(pixmap)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -946,8 +990,21 @@ class ReviewTab(QWidget):
             docsep_badge.move(8, 8)
             docsep_badge.adjustSize()
             docsep_badge.show()
+        elif sort_slot >= 0:
+            lbl.setStyleSheet("background-color: #10151f; border: 3px solid #26c6da; border-radius: 4px; padding: 4px;")
         else:
             lbl.setStyleSheet("background-color: #1e1f35; border: 1px solid #3a3b55; border-radius: 4px; padding: 4px;")
+
+        if sort_slot >= 0:
+            pos_badge = QLabel(f"#{sort_slot + 1}", lbl)
+            pos_badge.setStyleSheet("background-color: #26c6da; color: #0a0f1a; font-weight: bold; font-size: 11px; padding: 2px 10px; border-radius: 3px;")
+            pos_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            pos_badge.move(8, 8)
+            pos_badge.adjustSize()
+            pos_badge.show()
+            lbl._sort_slot = sort_slot
+            lbl._sort_mode = True
+            lbl._sort_handler = self
 
         return lbl
 
@@ -982,10 +1039,20 @@ class ReviewTab(QWidget):
             docsep_pages = self._get_docsep_pages()
             preview_width = max(400, self.preview_scroll.viewport().width() - 50)
 
+            page_iter = list(self._sort_order) if self._sort_mode else list(range(total_pages))
+
+            def make_label(slot, page_num, width):
+                return self._create_page_label(
+                    page_num,
+                    self._make_page_pixmap(page_num, width),
+                    blank_pages,
+                    docsep_pages,
+                    sort_slot=slot if self._sort_mode else -1,
+                )
+
             if self.view_mode == "one_page":
-                for page_num in range(total_pages):
-                    pixmap = self._make_page_pixmap(page_num, preview_width)
-                    lbl = self._create_page_label(page_num, pixmap, blank_pages, docsep_pages)
+                for slot, page_num in enumerate(page_iter):
+                    lbl = make_label(slot, page_num, preview_width)
                     self.preview_container_layout.addWidget(lbl)
                     self.page_labels.append(lbl)
 
@@ -994,14 +1061,13 @@ class ReviewTab(QWidget):
                 row = QHBoxLayout()
                 row.setContentsMargins(0, 0, 0, 0)
                 row.setSpacing(8)
-                for page_num in range(total_pages):
-                    pixmap = self._make_page_pixmap(page_num, col_width)
-                    lbl = self._create_page_label(page_num, pixmap, blank_pages, docsep_pages)
+                for slot, page_num in enumerate(page_iter):
+                    lbl = make_label(slot, page_num, col_width)
                     row.addWidget(lbl)
                     self.page_labels.append(lbl)
-                    if len(self.page_labels) % 2 == 0 or page_num == total_pages - 1:
+                    items_in_row = 1 if len(self.page_labels) % 2 == 1 else 2
+                    if items_in_row == 2 or slot == total_pages - 1:
                         row_container = QWidget()
-                        items_in_row = 2 if len(self.page_labels) % 2 == 0 else 1
                         content_width = col_width * items_in_row + 8 * (items_in_row - 1)
                         row_container.setFixedWidth(content_width)
                         row_container.setLayout(row)
@@ -1012,21 +1078,19 @@ class ReviewTab(QWidget):
 
             elif self.view_mode == "two_pages_cover":
                 if total_pages > 0:
-                    pixmap = self._make_page_pixmap(0, preview_width)
-                    lbl = self._create_page_label(0, pixmap, blank_pages, docsep_pages)
+                    lbl = make_label(0, page_iter[0], preview_width)
                     self.preview_container_layout.addWidget(lbl)
                     self.page_labels.append(lbl)
                 col_width = (preview_width - 8) // 2
                 row = QHBoxLayout()
                 row.setContentsMargins(0, 0, 0, 0)
                 row.setSpacing(8)
-                for page_num in range(1, total_pages):
-                    pixmap = self._make_page_pixmap(page_num, col_width)
-                    lbl = self._create_page_label(page_num, pixmap, blank_pages, docsep_pages)
+                for slot in range(1, total_pages):
+                    lbl = make_label(slot, page_iter[slot], col_width)
                     row.addWidget(lbl)
                     self.page_labels.append(lbl)
                     pages_in_row = len([w for w in row.children() if hasattr(w, 'pixmap')])
-                    is_last = page_num == total_pages - 1
+                    is_last = slot == total_pages - 1
                     if is_last or pages_in_row == 2:
                         row_container = QWidget()
                         content_width = col_width * pages_in_row + 8 * (pages_in_row - 1)
@@ -1045,13 +1109,12 @@ class ReviewTab(QWidget):
                 row.setContentsMargins(0, 0, 0, 0)
                 row.setSpacing(8)
                 count = 0
-                for page_num in range(total_pages):
-                    pixmap = self._make_page_pixmap(page_num, col_width)
-                    lbl = self._create_page_label(page_num, pixmap, blank_pages, docsep_pages)
+                for slot, page_num in enumerate(page_iter):
+                    lbl = make_label(slot, page_num, col_width)
                     row.addWidget(lbl)
                     self.page_labels.append(lbl)
                     count += 1
-                    if count == n or page_num == total_pages - 1:
+                    if count == n or slot == total_pages - 1:
                         row_container = QWidget()
                         content_width = col_width * count + 8 * (count - 1)
                         row_container.setFixedWidth(content_width)
@@ -1069,7 +1132,10 @@ class ReviewTab(QWidget):
                 status += f" | {blank_count} blank"
             if docsep_count:
                 status += f" | {docsep_count} DOCSEP"
-            status += f" | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)"
+            if self._sort_mode:
+                status += "  |  SORTING: drag pages to reorder  (Enter=apply, Esc=cancel)"
+            else:
+                status += f" | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)"
             self.page_label.setText(status)
         except Exception as e:
             self.preview_placeholder.setText(f"Error rendering: {e}")
@@ -1079,6 +1145,19 @@ class ReviewTab(QWidget):
         if not self.current_pdf_doc:
             return
         menu = QMenu(self)
+        if self._sort_mode:
+            apply_act = QAction("Apply Sort (Enter)", self)
+            apply_act.triggered.connect(self._apply_sort)
+            menu.addAction(apply_act)
+            cancel_act = QAction("Cancel Sorting (Esc)", self)
+            cancel_act.triggered.connect(lambda: self._exit_sort_mode())
+            menu.addAction(cancel_act)
+            menu.exec(lbl.mapToGlobal(pos))
+            return
+        sort_act = QAction("Page Sorting...", self)
+        sort_act.triggered.connect(self._enter_sort_mode)
+        menu.addAction(sort_act)
+        menu.addSeparator()
         delete_act = QAction("Delete Page", self)
         delete_act.triggered.connect(lambda: self._delete_page(page_num))
         menu.addAction(delete_act)
@@ -1271,6 +1350,197 @@ class ReviewTab(QWidget):
         self._crop_label = None
         self.save_crop_btn.setVisible(False)
         self.confirm_btn.setEnabled(True)
+
+    def _toggle_sort_mode(self):
+        if not self._sort_mode:
+            self._enter_sort_mode()
+
+    def _on_escape(self):
+        if self._sort_mode:
+            self._exit_sort_mode()
+
+    def _enter_sort_mode(self):
+        if self._sort_mode or not self.current_pdf_doc:
+            return
+        if self._crop_mode:
+            self.exit_crop_mode()
+        if len(self.current_pdf_doc) < 2:
+            self._show_toast("Sorting needs at least 2 pages")
+            return
+        self._clear_sort_drag_ui()
+        self._sort_order = list(range(len(self.current_pdf_doc)))
+        self._sort_dragging = -1
+        self._sort_mode = True
+        self.render_preview()
+
+    def _exit_sort_mode(self, rerender=True):
+        self._sort_mode = False
+        self._sort_order = []
+        self._sort_dragging = -1
+        self._clear_sort_drag_ui()
+        if rerender:
+            self.render_preview()
+
+    def _apply_sort(self):
+        if not self._sort_mode or not self.current_pdf_doc:
+            return
+        total = len(self.current_pdf_doc)
+        if self._sort_order == list(range(total)):
+            self._exit_sort_mode()
+            self._show_toast("Page order unchanged")
+            return
+        try:
+            self._push_undo()
+            new_doc = fitz.open()
+            for page_num in self._sort_order:
+                new_doc.insert_pdf(self.current_pdf_doc, from_page=page_num, to_page=page_num)
+            old = self.current_pdf_doc
+            self.current_pdf_doc = new_doc
+            old.close()
+            self.total_pages = len(self.current_pdf_doc)
+            pos_map = {}
+            for new_pos, old_page in enumerate(self._sort_order):
+                pos_map[old_page] = new_pos
+            doc = self._get_current_doc()
+            if doc:
+                doc["blank_pages"] = [pos_map[p] for p in doc.get("blank_pages", []) if p in pos_map]
+                doc["docsep_pages"] = [pos_map[p] for p in doc.get("docsep_pages", []) if p in pos_map]
+            self.document_modified = True
+            self._exit_sort_mode()
+            self._show_toast("Sort applied — press Enter again to save")
+        except Exception as e:
+            QMessageBox.critical(self, "Sort Error", f"Failed to apply sort:\n{e}")
+            self.render_preview()
+
+    def on_sort_drag(self, slot):
+        if not self._sort_mode:
+            return
+        self._sort_dragging = slot
+        if 0 <= slot < len(self.page_labels):
+            self.page_labels[slot].setCursor(Qt.CursorShape.ClosedHandCursor)
+        if self._sort_ghost is not None:
+            return
+        if slot < 0 or slot >= len(self.page_labels):
+            return
+        src = self.page_labels[slot]
+        if src.pixmap() is None:
+            return
+
+        ghost = QLabel(self)
+        ghost.setPixmap(src.pixmap())
+        ghost.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        ghost.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        ghost.setStyleSheet("background-color: transparent;")
+        ghost.setGraphicsEffect(QGraphicsOpacityEffect(ghost))
+        ghost.graphicsEffect().setOpacity(0.8)
+        ghost.adjustSize()
+        self._sort_ghost = ghost
+        self._sort_ghost_src = src
+
+        src_eff = QGraphicsOpacityEffect(src)
+        src_eff.setOpacity(0.3)
+        src.setGraphicsEffect(src_eff)
+
+        ind = QFrame(self.preview_container)
+        ind.setFixedHeight(3)
+        ind.setStyleSheet("background-color: #26c6da; border: none; border-radius: 1px;")
+        ind.hide()
+        self._sort_indicator = ind
+
+    def on_drag_move(self, slot, global_pos):
+        if not self._sort_mode:
+            return
+        ghost = self._sort_ghost
+        if ghost is not None:
+            local = self.mapFromGlobal(global_pos)
+            ghost.move(local.x() - ghost.width() // 2, local.y() - ghost.height() // 2)
+            ghost.raise_()
+            ghost.show()
+        self._update_sort_indicator(global_pos)
+
+    def _hover_target(self, global_pos):
+        target = -1
+        where = "before"
+        for i, lbl in enumerate(self.page_labels):
+            if not lbl.isVisible():
+                continue
+            pt = lbl.mapFromGlobal(global_pos)
+            if lbl.rect().contains(pt):
+                target = i
+                where = "before" if pt.y() < lbl.rect().center().y() else "after"
+                break
+        return target, where
+
+    def _update_sort_indicator(self, global_pos):
+        ind = self._sort_indicator
+        if ind is None:
+            return
+        target, where = self._hover_target(global_pos)
+        if target < 0 or target == self._sort_dragging:
+            ind.hide()
+            return
+        lbl = self.page_labels[target]
+        top_left = lbl.mapTo(self.preview_container, lbl.rect().topLeft())
+        bottom_left = lbl.mapTo(self.preview_container, lbl.rect().bottomLeft())
+        top_right = lbl.mapTo(self.preview_container, lbl.rect().topRight())
+        y = top_left.y() - 4 if where == "before" else bottom_left.y() + 4
+        ind.setGeometry(top_left.x(), y - 1, max(120, top_right.x() - top_left.x()), 3)
+        ind.raise_()
+        ind.show()
+
+    def _clear_sort_drag_ui(self):
+        if self._sort_ghost is not None:
+            self._sort_ghost.setParent(None)
+            self._sort_ghost.deleteLater()
+            self._sort_ghost = None
+        if self._sort_ghost_src is not None:
+            self._sort_ghost_src.setGraphicsEffect(None)
+            self._sort_ghost_src = None
+        if self._sort_indicator is not None:
+            self._sort_indicator.setParent(None)
+            self._sort_indicator.deleteLater()
+            self._sort_indicator = None
+
+    def on_sort_release(self, slot):
+        if not self._sort_mode:
+            return
+        dragged = self._sort_dragging
+        self._sort_dragging = -1
+        if 0 <= dragged < len(self.page_labels):
+            self.page_labels[dragged].setCursor(Qt.CursorShape.PointingHandCursor)
+        if dragged < 0 or dragged >= len(self._sort_order):
+            self._clear_sort_drag_ui()
+            return
+        target, where = self._hover_target(QCursor.pos())
+        if target < 0 or target == dragged:
+            self._clear_sort_drag_ui()
+            return
+        order = list(self._sort_order)
+        item = order.pop(dragged)
+        insert_at = target - 1 if target > dragged else target
+        if where == "after":
+            insert_at += 1
+        insert_at = max(0, min(insert_at, len(order)))
+        order.insert(insert_at, item)
+        self._sort_order = order
+        self._clear_sort_drag_ui()
+        self.render_preview()
+
+    def _save_reviewed_overwrite(self):
+        if self.active_tab != "reviewed" or self.active_index < 0:
+            return
+        doc = self.reviewed_docs[self.active_index]
+        out_path = doc.get("original_path", "")
+        if not out_path:
+            QMessageBox.warning(self, "Cannot Save", "Reviewed document path is unknown.")
+            return
+        try:
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            self.current_pdf_doc.save(out_path, garbage=4, deflate=True)
+            self.document_modified = False
+            self._show_toast(f"Re-saved: {os.path.basename(out_path)}\n→ {os.path.dirname(out_path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", f"Could not save reviewed document:\n{e}")
 
     def _get_current_doc(self):
         docs = self._get_current_docs()
@@ -1567,8 +1837,13 @@ class ReviewTab(QWidget):
         focus = self.focusWidget()
         if focus in (self.company_input, self.month_combo, self.year_spin) or isinstance(focus, QPushButton):
             return
+        if self._sort_mode:
+            self._apply_sort()
+            return
         if self.active_tab in ("pending", "auto_confirmed"):
             self._finalize_current_and_advance()
+        elif self.active_tab == "reviewed" and self.document_modified and self.current_pdf_doc and self.active_index >= 0:
+            self._save_reviewed_overwrite()
 
     def _finalize_current_and_advance(self):
         if self.active_tab not in ("pending", "auto_confirmed"):
