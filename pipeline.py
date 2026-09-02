@@ -558,7 +558,11 @@ def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
 
     existing = list(flat_glob)
     seq = len(existing) + 1
-    final_filename = f"{yyyymm}{seq:04d}_{division_code}_{company_dir}.pdf"
+    final_filename = f"{yyyymm}{seq:04d}_{division_code}_{company_dir}"
+    if doc_data.get("is_duplicate"):
+        final_filename += doc_data.get("duplicate_suffix", "")
+    final_filename += ".pdf"
+    
     output_path = output_div_dir / final_filename
 
     counter = 1

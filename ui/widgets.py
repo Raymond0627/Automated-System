@@ -480,15 +480,19 @@ class PipelineThread(QThread):
 
 class DocCardWidget(QFrame):
     clicked = pyqtSignal(int)
+    contextMenuRequested = pyqtSignal(int, object)
 
     def __init__(self, doc: Dict, idx: int, parent=None):
         super().__init__(parent)
         self.idx = idx
         self.doc = doc
         self._selected = False
+        self._is_duplicate = doc.get("is_duplicate", False)
 
         self.setFixedHeight(58)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(lambda pos, i=idx, g=self.mapToGlobal: self.contextMenuRequested.emit(i, g(pos)))
         self.setStyleSheet(self._get_style("normal"))
 
         layout = QHBoxLayout(self)
@@ -510,8 +514,16 @@ class DocCardWidget(QFrame):
         name_label = QLabel(name)
         name_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         name_label.setStyleSheet("background: transparent; color: #ffffff;")
+        if self._is_duplicate:
+            name_label.setStyleSheet("background: transparent; color: #00bcd4; text-decoration: underline;")
         top_row.addWidget(name_label)
         top_row.addStretch()
+
+        if self._is_duplicate:
+            dup_label = QLabel("(Duplicate)")
+            dup_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            dup_label.setStyleSheet("background: transparent; color: #00bcd4;")
+            top_row.addWidget(dup_label)
 
         if blank_pages:
             blank_label = QLabel(f"{len(blank_pages)} blank")
@@ -573,8 +585,15 @@ class DocCardWidget(QFrame):
             self.setStyleSheet(self._get_style("selected"))
         elif self.doc.get("reviewed"):
             self.setStyleSheet(self._get_style("reviewed"))
+        elif self._is_duplicate:
+            self.setStyleSheet(self._get_style("duplicate"))
         else:
             self.setStyleSheet(self._get_style("normal"))
+
+    def set_duplicate(self, is_duplicate: bool):
+        self._is_duplicate = is_duplicate
+        self.doc["is_duplicate"] = is_duplicate
+        self.setStyleSheet(self._get_style("duplicate" if is_duplicate else ("normal" if not self._selected else "selected")))
 
     def _get_style(self, state: str) -> str:
         if state == "selected":
@@ -591,6 +610,18 @@ class DocCardWidget(QFrame):
                     background-color: #1a3a2a;
                     border: 1px solid #2d6a3f;
                     border-radius: 8px;
+                }
+            """
+        elif state == "duplicate":
+            return """
+                QFrame {
+                    background-color: #1a3a4a;
+                    border: 1px solid #00bcd4;
+                    border-radius: 8px;
+                }
+                QFrame:hover {
+                    background-color: #1e4555;
+                    border: 1px solid #26c6da;
                 }
             """
         else:
@@ -613,6 +644,7 @@ class DocCardWidget(QFrame):
 
 class PassedDocCardWidget(QFrame):
     clicked = pyqtSignal(int)
+    contextMenuRequested = pyqtSignal(int, object)
 
     def __init__(self, doc: Dict, idx: int, parent=None):
         super().__init__(parent)
@@ -620,9 +652,12 @@ class PassedDocCardWidget(QFrame):
         self.doc = doc
         self._selected = False
         self._reviewed = False
+        self._is_duplicate = doc.get("is_duplicate", False)
 
         self.setFixedHeight(58)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(lambda pos, i=idx, g=self.mapToGlobal: self.contextMenuRequested.emit(i, g(pos)))
         self.setStyleSheet(self._get_style("normal"))
 
         layout = QHBoxLayout(self)
@@ -644,8 +679,16 @@ class PassedDocCardWidget(QFrame):
         name_label = QLabel(name)
         name_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         name_label.setStyleSheet("background: transparent; color: #ffffff;")
+        if self._is_duplicate:
+            name_label.setStyleSheet("background: transparent; color: #00bcd4; text-decoration: underline;")
         top_row.addWidget(name_label)
         top_row.addStretch()
+
+        if self._is_duplicate:
+            dup_label = QLabel("(Duplicate)")
+            dup_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+            dup_label.setStyleSheet("background: transparent; color: #00bcd4;")
+            top_row.addWidget(dup_label)
 
         if blank_pages:
             blank_label = QLabel(f"{len(blank_pages)} blank")
@@ -692,12 +735,24 @@ class PassedDocCardWidget(QFrame):
             self.setStyleSheet(self._get_style("selected"))
         elif self._reviewed:
             self.setStyleSheet(self._get_style("reviewed"))
+        elif self._is_duplicate:
+            self.setStyleSheet(self._get_style("duplicate"))
         else:
             self.setStyleSheet(self._get_style("normal"))
 
     def set_reviewed(self, reviewed: bool):
         self._reviewed = reviewed
-        self.setStyleSheet(self._get_style("reviewed" if reviewed else ("selected" if self._selected else "normal")))
+        self.setStyleSheet(self._get_style("reviewed" if reviewed else ("selected" if self._selected else ("duplicate" if self._is_duplicate else "normal"))))
+
+    def set_duplicate(self, is_duplicate: bool):
+        self._is_duplicate = is_duplicate
+        self.doc["is_duplicate"] = is_duplicate
+        if self._reviewed:
+            self.setStyleSheet(self._get_style("reviewed"))
+        elif self._selected:
+            self.setStyleSheet(self._get_style("selected"))
+        else:
+            self.setStyleSheet(self._get_style("duplicate" if is_duplicate else "normal"))
 
     def _get_style(self, state: str) -> str:
         if state == "selected":
@@ -718,6 +773,18 @@ class PassedDocCardWidget(QFrame):
                 QFrame:hover {
                     background-color: #1f3045;
                     border: 1px solid #5a7fb5;
+                }
+            """
+        elif state == "duplicate":
+            return """
+                QFrame {
+                    background-color: #1a3a4a;
+                    border: 1px solid #00bcd4;
+                    border-radius: 8px;
+                }
+                QFrame:hover {
+                    background-color: #1e4555;
+                    border: 1px solid #26c6da;
                 }
             """
         else:

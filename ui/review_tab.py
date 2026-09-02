@@ -327,6 +327,8 @@ class ReviewTab(QWidget):
         self._crop_overlay = None
         self.undo_stack = []
         self.undo_max = 50
+        self._doc_undo_stack = []
+        self._doc_undo_max = 20
         self.view_mode = "variable"
         self.variable_pages_per_row = 3
         self._sort_mode = False
@@ -571,6 +573,8 @@ class ReviewTab(QWidget):
         self.sort_shortcut.activated.connect(self._toggle_sort_mode)
         self.esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
         self.esc_shortcut.activated.connect(self._on_escape)
+        self.duplicate_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
+        self.duplicate_shortcut.activated.connect(self._duplicate_current_document)
 
         QTimer.singleShot(0, self._restore_session_if_present)
 
@@ -737,6 +741,7 @@ class ReviewTab(QWidget):
             for i, doc in enumerate(docs):
                 card = DocCardWidget(doc, i)
                 card.clicked.connect(self._on_card_clicked)
+                card.contextMenuRequested.connect(self._show_document_menu)
                 item = QListWidgetItem()
                 item.setSizeHint(QSize(0, 62))
                 self.doc_list.addItem(item)
@@ -747,6 +752,7 @@ class ReviewTab(QWidget):
             for i, doc in enumerate(docs):
                 card = PassedDocCardWidget(doc, i)
                 card.clicked.connect(self._on_card_clicked)
+                card.contextMenuRequested.connect(self._show_document_menu)
                 item = QListWidgetItem()
                 item.setSizeHint(QSize(0, 62))
                 self.doc_list.addItem(item)
@@ -1724,6 +1730,9 @@ class ReviewTab(QWidget):
 
     def _undo(self):
         self.exit_crop_mode()
+        if self._doc_undo_stack:
+            self._undo_document_deletion()
+            return
         if not self.undo_stack or not self.current_pdf_doc:
             return
         state = self.undo_stack.pop()
@@ -1947,6 +1956,102 @@ class ReviewTab(QWidget):
         config.min_file_size_kb = self.config.get("min_file_size_kb", 10)
         config.output_layout = self.config.get("output_layout", "company")
         return config
+
+    def _show_document_menu(self, idx: int, global_pos: QPoint):
+        if self.active_tab == "reviewed":
+            return
+        menu = QMenu(self)
+        duplicate_act = QAction("Duplicate  (Ctrl+D)", self)
+        duplicate_act.triggered.connect(lambda: self._duplicate_document_at(idx))
+        menu.addAction(duplicate_act)
+        menu.addSeparator()
+        delete_act = QAction("Delete", self)
+        delete_act.triggered.connect(lambda: self._delete_document_at(idx))
+        menu.addAction(delete_act)
+        menu.exec(global_pos)
+
+    def _duplicate_document_at(self, idx: int):
+        if self.active_tab not in ("pending", "auto_confirmed"):
+            return
+        docs = self._get_current_docs()
+        if idx < 0 or idx >= len(docs):
+            return
+        original_doc = docs[idx]
+        new_doc = dict(original_doc)
+        new_doc["is_duplicate"] = True
+        base_name = original_doc.get("original_filename", "document.pdf")
+        if "(" in base_name and base_name.endswith(")"):
+            base_name = base_name.rsplit("(", 1)[0].strip()
+        name_without_ext = base_name
+        ext = ""
+        if "." in base_name:
+            dot_idx = base_name.rfind(".")
+            name_without_ext = base_name[:dot_idx]
+            ext = base_name[dot_idx:]
+        counter = 1
+        new_name = f"{name_without_ext}({counter}){ext}"
+        existing_names = [d.get("original_filename", "") for d in docs]
+        while new_name in existing_names:
+            counter += 1
+            new_name = f"{name_without_ext}({counter}){ext}"
+        new_doc["original_filename"] = new_name
+        new_doc["duplicate_suffix"] = f"({counter})"
+        insert_idx = idx + 1
+        docs.insert(insert_idx, new_doc)
+        self.active_index = insert_idx
+        self.refresh_doc_list(select_row=insert_idx)
+        self._session_changed()
+
+    def _duplicate_current_document(self):
+        if self.active_tab == "reviewed":
+            return
+        if self.active_index < 0:
+            return
+        self._duplicate_document_at(self.active_index)
+
+    def _delete_document_at(self, idx: int):
+        if self.active_tab not in ("pending", "auto_confirmed"):
+            return
+        docs = self._get_current_docs()
+        if idx < 0 or idx >= len(docs):
+            return
+        doc_to_delete = docs[idx]
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Delete '{doc_to_delete.get('original_filename', 'this document')}'?\n\nThis can be undone with Ctrl+Z.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._doc_undo_stack.append({
+            "tab": self.active_tab,
+            "idx": idx,
+            "doc": dict(doc_to_delete),
+        })
+        if len(self._doc_undo_stack) > self._doc_undo_max:
+            self._doc_undo_stack.pop(0)
+        docs.pop(idx)
+        new_idx = min(idx, len(docs) - 1)
+        self.active_index = new_idx
+        self.refresh_doc_list(select_row=new_idx if new_idx >= 0 else None)
+        self._session_changed()
+
+    def _undo_document_deletion(self):
+        if not self._doc_undo_stack:
+            return
+        action = self._doc_undo_stack.pop()
+        tab = action["tab"]
+        idx = action["idx"]
+        doc = action["doc"]
+        if tab == "pending":
+            self.pending_docs.insert(idx, doc)
+        elif tab == "auto_confirmed":
+            self.auto_confirmed_docs.insert(idx, doc)
+        self.active_index = idx
+        self.refresh_doc_list(select_row=idx)
+        self._session_changed()
 
     def _on_enter_key(self):
         focus = self.focusWidget()
