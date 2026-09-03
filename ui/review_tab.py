@@ -447,6 +447,7 @@ class ReviewTab(QWidget):
         self.doc_list.currentRowChanged.connect(self._on_doc_selected)
 
         self.reviewed_tree = QTreeWidget()
+        self.reviewed_tree.installEventFilter(self)
         self.reviewed_tree.setHeaderHidden(True)
         self.reviewed_tree.setRootIsDecorated(True)
         self.reviewed_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1761,6 +1762,13 @@ class ReviewTab(QWidget):
         self.render_preview()
 
     def eventFilter(self, obj, event):
+        if obj is self.reviewed_tree and event.type() == event.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Down:
+                self._nav_reviewed(1)
+                return True
+            elif event.key() == Qt.Key.Key_Up:
+                self._nav_reviewed(-1)
+                return True
         if event.type() == event.Type.Wheel:
             if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 delta = event.angleDelta().y()

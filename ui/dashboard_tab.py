@@ -328,11 +328,26 @@ class DashboardTab(QWidget):
 
         self.log_table.scrollToBottom()
 
+    def _resolve_output_root(self, input_path: str) -> str:
+        output = self.output_var.text().strip()
+        if not output:
+            output = str(Path(input_path) / "output")
+            os.makedirs(output, exist_ok=True)
+            self.output_var.setText(output)
+        else:
+            os.makedirs(output, exist_ok=True)
+        return output
+
     def scan_folder(self):
         path = self.input_var.text()
         if not os.path.isdir(path):
             QMessageBox.critical(self, "Error", f"Input folder not found:\n{path}")
             return
+        output = self._resolve_output_root(path)
+        self.config["input_root"] = path
+        self.config["output_root"] = output
+        self.config["flagged_root"] = os.path.join(output, "flagged")
+        self._save_config()
         pdfs, divs, companies = 0, 0, 0
         for d in Path(path).iterdir():
             if d.is_dir():
@@ -351,13 +366,13 @@ class DashboardTab(QWidget):
             return
 
         self.config["input_root"] = self.input_var.text()
-        self.config["output_root"] = self.output_var.text()
-        self.config["flagged_root"] = self.output_var.text() + "/flagged"
-        self._save_config()
-
         if not os.path.isdir(self.config["input_root"]):
             QMessageBox.critical(self, "Error", "Input folder does not exist")
             return
+        output = self._resolve_output_root(self.config["input_root"])
+        self.config["output_root"] = output
+        self.config["flagged_root"] = os.path.join(output, "flagged")
+        self._save_config()
 
         self.run_btn.setEnabled(False)
         self.run_btn.setText("Running...")
