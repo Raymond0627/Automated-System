@@ -123,18 +123,16 @@ class MainWindow(QMainWindow):
 
     def _check_first_run(self):
         input_root = self.config.get("input_root", "")
-        flagged_root = self.config.get("flagged_root", "")
-        if not input_root and not flagged_root:
+        output_root = self.config.get("output_root", "")
+        if not input_root and not output_root:
             QMessageBox.information(
                 self,
                 "Welcome — First Run Setup",
                 "Lumeed QScan needs file paths configured before use.\n\n"
-                "Please set your Input Root and Flagged Root folders\n"
+                "Please set your Input Root and Output Root folders\n"
                 "on the Dashboard tab, then click Save.",
             )
-            self.tabs.setCurrentIndex(0)
-        else:
-            self.tabs.setCurrentIndex(1)
+        self.tabs.setCurrentIndex(0)
 
     def _sync_scan_to_session(self):
         state = self.dashboard_tab.get_scan_state()

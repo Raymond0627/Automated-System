@@ -44,15 +44,15 @@ class DashboardTab(QWidget):
         if logo_path.exists():
             logo_label = QLabel()
             pixmap = QPixmap(str(logo_path))
-            logo_label.setPixmap(pixmap.scaled(36, 36, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-            logo_label.setFixedSize(40, 40)
+            logo_label.setPixmap(pixmap.scaled(48, 48, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+            logo_label.setFixedSize(50, 50)
             header.addWidget(logo_label)
         title = QLabel("Lumeed QScan")
-        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        title.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
         title.setStyleSheet("color: #e0e0ff; padding: 0;")
         header.addWidget(title)
         subtitle = QLabel("PDF Auto-Rename & OCR Pipeline")
-        subtitle.setFont(QFont("Segoe UI", 9))
+        subtitle.setFont(QFont("Segoe UI", 11))
         subtitle.setStyleSheet("color: #7778a0; padding: 6px 0 0 4px;")
         header.addWidget(subtitle)
         header.addStretch()
@@ -64,8 +64,7 @@ class DashboardTab(QWidget):
 
         self.input_var = QLineEdit(self.config["input_root"])
         self.output_var = QLineEdit(self.config["output_root"])
-        self.flagged_var = QLineEdit(self.config["flagged_root"])
-        for v in (self.input_var, self.output_var, self.flagged_var):
+        for v in (self.input_var, self.output_var):
             v.setFont(QFont("Segoe UI", 9))
 
         folder_layout.addWidget(QLabel("Input:"), 0, 0)
@@ -83,14 +82,6 @@ class DashboardTab(QWidget):
         btn_out.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         btn_out.clicked.connect(lambda: self._browse(self.output_var))
         folder_layout.addWidget(btn_out, 1, 2)
-
-        folder_layout.addWidget(QLabel("Flagged:"), 2, 0)
-        folder_layout.addWidget(self.flagged_var, 2, 1)
-        btn_flag = QPushButton("Browse")
-        btn_flag.setFixedSize(72, 26)
-        btn_flag.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        btn_flag.clicked.connect(lambda: self._browse(self.flagged_var))
-        folder_layout.addWidget(btn_flag, 2, 2)
 
         layout.addWidget(folder_group)
 
@@ -182,7 +173,7 @@ class DashboardTab(QWidget):
             var.setText(path)
             self.config["input_root"] = self.input_var.text()
             self.config["output_root"] = self.output_var.text()
-            self.config["flagged_root"] = self.flagged_var.text()
+            self.config["flagged_root"] = self.output_var.text() + "/flagged"
             self._save_config()
 
     def _save_config(self):
@@ -361,7 +352,7 @@ class DashboardTab(QWidget):
 
         self.config["input_root"] = self.input_var.text()
         self.config["output_root"] = self.output_var.text()
-        self.config["flagged_root"] = self.flagged_var.text()
+        self.config["flagged_root"] = self.output_var.text() + "/flagged"
         self._save_config()
 
         if not os.path.isdir(self.config["input_root"]):
