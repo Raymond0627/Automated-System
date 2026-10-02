@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -10,15 +11,24 @@ except ImportError:
     fuzz = None
     extractOne = None
 
-KNOWN_COMPANIES_FILE = Path(__file__).parent / "known_companies.json"
+if not getattr(sys, 'frozen', False):
+    sys.path.insert(0, str(Path(__file__).parent))
+from paths import DATA_DIR, RESOURCE_DIR, ensure_data_dir
+
+# Writable per-user roster location (so the installed app can persist changes).
+KNOWN_COMPANIES_FILE = DATA_DIR / "known_companies.json"
 
 # --- Tier 0/0b/1: Caption extraction ---
 VERSUS_RE = re.compile(
-    r'-\s*versus\s*-|versus|vs\.?\s',
+    r'-\s*versus\s*-|versus|vs\.?\s|vs\s*\.\s',
     re.IGNORECASE
 )
 RESPONDENT_RE = re.compile(
-    r'\brespondents?\b',
+    r'\b(?:respondents?|responder)\b',
+    re.IGNORECASE
+)
+COMPLAINANT_RE = re.compile(
+    r'\bcomplainants?\b',
     re.IGNORECASE
 )
 
@@ -144,12 +154,48 @@ def _fuzzy_margin(candidate: str, roster: List[str], min_score: int, min_margin:
 
 def extract_from_caption(page_text: str) -> Optional[Dict[str, Any]]:
     """
-    Find '-versus-'/'vs.' -> capture company name.
+    Find '-versus-'/'vs.' -> capture RESPONDENT company name.
 
-    Handles two IC formats:
-    (A) "REPUBLIC vs. COMPANY" — company directly after vs.
-    (B) "REPUBLIC -versus- RESPONDENT, COMPANY" — company after Respondent
+    Handles IC formats:
+    (A) "Complainant, vs. COMPANY, Respondent"
+    (B) "REPUBLIC -versus- RESPONDENT, COMPANY"
+    Skips routing slip noise (text before actual caption).
     """
+    comp_match = COMPLAINANT_RE.search(page_text)
+    resp_match = RESPONDENT_RE.search(page_text)
+
+    if comp_match and resp_match:
+        # Format A: extract between Complainant and Respondent
+        between = page_text[comp_match.end():resp_match.start()]
+        versus_match = VERSUS_RE.search(between)
+        if versus_match:
+            after_versus = between[versus_match.end():].strip()
+            # Join lines (OCR splits company names across lines), then split on commas/periods
+            after_versus_joined = re.sub(r'\s*\n\s*', ' ', after_versus)
+            for chunk in re.split(r'[,.]', after_versus_joined):
+                chunk = chunk.strip()
+                chunk = re.sub(r'^[.,:;\-|/]+', '', chunk).strip()
+                chunk = re.sub(r'[.,:;\-|/]+$', '', chunk).strip()
+                if not chunk:
+                    continue
+                # Skip case numbers, dates, and short noise
+                if re.match(r'^[\d\s\-/().]+$', chunk):
+                    continue
+                if re.match(r'^I\.?C\.?\s*\(CAD\)', chunk, re.IGNORECASE):
+                    continue
+                if re.match(r'^CAD\s+CASE', chunk, re.IGNORECASE):
+                    continue
+                if len(chunk.split()) >= 2:
+                    normalized = normalize_company_name(chunk)
+                    has_strong = bool(STRONG_KEYWORDS_RE.search(normalized))
+                    if has_strong or len(chunk.split()) >= 3:
+                        return {
+                            'company_name': normalized,
+                            'tier': 'caption',
+                            'confidence': 'high',
+                        }
+
+    # Format B: find versus anywhere (fallback)
     versus_match = VERSUS_RE.search(page_text)
     if not versus_match:
         return None
@@ -159,13 +205,11 @@ def extract_from_caption(page_text: str) -> Optional[Dict[str, Any]]:
     respondent_match = RESPONDENT_RE.search(after_versus)
 
     if respondent_match:
-        # Format B: capture text AFTER "Respondent" up to next period
         after_respondent = after_versus[respondent_match.end():].strip()
         raw_company = re.split(r'[.]', after_respondent)[0].strip()
         raw_company = re.sub(r'^[.,:;\-|/]+', '', raw_company).strip()
         raw_company = re.sub(r'[.,:;\-|/]+$', '', raw_company).strip()
     else:
-        # Format A: capture text after vs. up to next period
         raw_company = re.split(r'[.]', after_versus)[0].strip()
         raw_company = re.sub(r'^[.,:;\-|/]+', '', raw_company).strip()
         raw_company = re.sub(r'[.,:;\-|/]+$', '', raw_company).strip()
@@ -239,6 +283,52 @@ def extract_from_caption_wide(page_text: str) -> Optional[Dict[str, Any]]:
                     }
 
     return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Tier 0c: Complainant/Respondent extraction (IC format)
+# ─────────────────────────────────────────────────────────────
+
+def extract_from_complainant_respondent(page_text: str) -> Optional[Dict[str, Any]]:
+    """
+    Extract RESPONDENT company name from IC document format:
+    'Complainant, vs. COMPANY NAME, Respondent'
+    Captures text AFTER 'vs.' and BEFORE 'Respondent' (the respondent entity).
+    """
+    comp_match = COMPLAINANT_RE.search(page_text)
+    resp_match = RESPONDENT_RE.search(page_text)
+    if not comp_match or not resp_match:
+        return None
+
+    between = page_text[comp_match.end():resp_match.start()]
+
+    versus_match = VERSUS_RE.search(between)
+    if not versus_match:
+        return None
+
+    after_versus = between[versus_match.end():].strip()
+    after_versus_joined = re.sub(r'\s*\n\s*', ' ', after_versus)
+    for chunk in re.split(r'[,.]', after_versus_joined):
+        chunk = chunk.strip()
+        chunk = re.sub(r'^[.,:;\-|/]+', '', chunk).strip()
+        chunk = re.sub(r'[.,:;\-|/]+$', '', chunk).strip()
+        if not chunk:
+            continue
+        if re.match(r'^[\d\s\-/().]+$', chunk):
+            continue
+        if re.match(r'^I\.?C\.?\s*\(CAD\)', chunk, re.IGNORECASE):
+            continue
+        if re.match(r'^CAD\s+CASE', chunk, re.IGNORECASE):
+            continue
+        if len(chunk.split()) >= 2:
+            normalized = normalize_company_name(chunk)
+            has_strong = bool(STRONG_KEYWORDS_RE.search(normalized))
+            if has_strong or len(chunk.split()) >= 3:
+                return {
+                    'company_name': normalized,
+                    'tier': 'complainant_respondent',
+                    'confidence': 'high',
+                }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -487,6 +577,7 @@ def fuzzy_match_with_tier(
             'company_name': '',
             'matched_roster_entry': None,
             'fuzzy_match_score': None,
+            'company_confidence': 0,
             'tier_used': tier,
             'cross_validated': cross_validated,
             'confidence_label': 'none',
@@ -498,6 +589,7 @@ def fuzzy_match_with_tier(
             'company_name': candidates[0],
             'matched_roster_entry': None,
             'fuzzy_match_score': None,
+            'company_confidence': 0,
             'tier_used': tier,
             'cross_validated': cross_validated,
             'confidence_label': 'none',
@@ -505,11 +597,14 @@ def fuzzy_match_with_tier(
         }
 
     # Determine threshold based on tier and cross-validation
+    HIGH_CONFIDENCE_TIERS = ('caption', 'caption_wide', 'routing_slip', 'complainant_respondent')
+    MEDIUM_CONFIDENCE_TIERS = ('caption_keyword', 'full_keyword')
+
     if cross_validated:
         threshold = 70
-    elif tier in ('caption', 'caption_wide', 'routing_slip', 'caption_keyword'):
+    elif tier in HIGH_CONFIDENCE_TIERS:
         threshold = 80
-    elif tier == 'full_keyword':
+    elif tier in MEDIUM_CONFIDENCE_TIERS:
         threshold = 90
     elif tier == 'header_corroborated':
         threshold = 85
@@ -536,13 +631,17 @@ def fuzzy_match_with_tier(
             best_score = None
 
     if best_entry and best_score is not None and best_score >= threshold:
+        # Compute company_confidence: fuzzy score boosted by tier quality
+        tier_boost = 10 if tier in HIGH_CONFIDENCE_TIERS else 0
+        company_confidence = min(100, best_score + tier_boost)
         return {
             'company_name': best_entry,
             'matched_roster_entry': best_entry,
             'fuzzy_match_score': best_score,
+            'company_confidence': company_confidence,
             'tier_used': tier,
             'cross_validated': cross_validated,
-            'confidence_label': 'high' if cross_validated or tier in ('caption', 'caption_wide', 'routing_slip') else 'medium',
+            'confidence_label': 'high' if cross_validated or tier in HIGH_CONFIDENCE_TIERS else 'medium',
             'needs_review': False,
         }
 
@@ -552,6 +651,7 @@ def fuzzy_match_with_tier(
             'company_name': best_entry,
             'matched_roster_entry': best_entry,
             'fuzzy_match_score': best_score,
+            'company_confidence': best_score,
             'tier_used': tier,
             'cross_validated': cross_validated,
             'confidence_label': 'low',
@@ -562,6 +662,7 @@ def fuzzy_match_with_tier(
         'company_name': best_candidate,
         'matched_roster_entry': None,
         'fuzzy_match_score': None,
+        'company_confidence': 0,
         'tier_used': tier,
         'cross_validated': cross_validated,
         'confidence_label': 'none',
@@ -595,13 +696,29 @@ def get_company_name_for_filename(page_ocr_data_list: list, fallback_folder_name
     tier1_result = None
 
     # Tier 0: Caption regex (PRIMARY)
+    # Search ALL pages — prefer results from pages with Complainant/Respondent markers
+    # AND "Republic of the Philippines" header (actual case caption, not routing slip)
+    COMPLAINANT_RE_LOCAL = re.compile(r'\bcomplainants?\b', re.IGNORECASE)
+    RESPONDENT_RE_LOCAL = re.compile(r'\b(?:respondents?|responder)\b', re.IGNORECASE)
+    CASE_HEADER_RE = re.compile(r'republic\s+of\s+the\s+philippines', re.IGNORECASE)
+
+    best_tier0 = None
+    best_score = 0  # 0=none, 1=strong, 2=markers, 4=case_header
     for entry in page_ocr_data_list:
         page_text = entry.get('page_text', '')
         if not page_text:
             continue
-        tier0_result = extract_from_caption(page_text)
-        if tier0_result:
-            break
+        has_markers = bool(COMPLAINANT_RE_LOCAL.search(page_text) and RESPONDENT_RE_LOCAL.search(page_text))
+        has_header = bool(CASE_HEADER_RE.search(page_text))
+        result = extract_from_caption(page_text)
+        if result:
+            has_strong = bool(STRONG_KEYWORDS_RE.search(result['company_name']))
+            # Score: case_header + markers + strong = highest
+            score = (4 if has_header else 0) + (2 if has_markers else 0) + (1 if has_strong else 0)
+            if score > best_score:
+                best_tier0 = result
+                best_score = score
+    tier0_result = best_tier0
 
     # Tier 1: Routing slip subject field
     for entry in page_ocr_data_list:
@@ -651,6 +768,19 @@ def get_company_name_for_filename(page_ocr_data_list: list, fallback_folder_name
                 [tier0b_result['company_name']],
                 known_companies,
                 'caption_wide',
+            )
+
+    # Tier 0c: Complainant/Respondent extraction
+    for entry in page_ocr_data_list:
+        page_text = entry.get('page_text', '')
+        if not page_text:
+            continue
+        tier0c_result = extract_from_complainant_respondent(page_text)
+        if tier0c_result:
+            return fuzzy_match_with_tier(
+                [tier0c_result['company_name']],
+                known_companies,
+                'complainant_respondent',
             )
 
     # Tier 2: Caption keywords (caption span only)
@@ -705,7 +835,24 @@ def get_company_name_for_filename(page_ocr_data_list: list, fallback_folder_name
 # Roster management (unchanged)
 # ─────────────────────────────────────────────────────────────
 
+def _seed_known_companies_if_needed() -> None:
+    if KNOWN_COMPANIES_FILE.exists():
+        return
+    resource_file = RESOURCE_DIR / "known_companies.json"
+    if resource_file.exists():
+        try:
+            ensure_data_dir()
+            with open(resource_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                with open(KNOWN_COMPANIES_FILE, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+
 def load_known_companies() -> List[str]:
+    _seed_known_companies_if_needed()
     try:
         if KNOWN_COMPANIES_FILE.exists():
             with open(KNOWN_COMPANIES_FILE, "r", encoding="utf-8") as f:
@@ -719,6 +866,7 @@ def load_known_companies() -> List[str]:
 
 def save_known_companies(companies: List[str]) -> None:
     deduped = sorted(set(companies))
+    ensure_data_dir()
     with open(KNOWN_COMPANIES_FILE, "w", encoding="utf-8") as f:
         json.dump(deduped, f, indent=2, ensure_ascii=False)
 

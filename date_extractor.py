@@ -165,7 +165,111 @@ def find_labeled_date_candidates(page_ocr_data_list):
 
 CONTROL_NO_PATTERN = re.compile(r'\b\d{0,2}9002000\d{3}\b')
 CONTROL_DATE_PATTERN = re.compile(r'\b(\d{1,2})[/\-](\d{1,2})[/\-](\d{4})\b')
-ISO_DATETIME_PATTERN = re.compile(r'\b\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}:\d{2}\b')
+# Flexible ISO datetime: handles "2017-09-20 10:04:53", "2017-09-2010:03:19", "2017-09 20 1004 53"
+ISO_DATETIME_PATTERN = re.compile(r'\b\d{4}[-/]\d{2}[-/ ]\d{2}[\sT]*\d{1,2}[:\s]?\d{2}[:\s]?\d{2}\b')
+# Date-only pattern: "2017-09-20" without time
+ISO_DATE_ONLY_PATTERN = re.compile(r'\b(\d{4})[-/](\d{2})[-/](\d{2})\b')
+# Corrupted date patterns: "W17-09-20", "L2017-09-20"
+CORRUPTED_DATE_PATTERN = re.compile(r'\b[A-Z]?(\d{2,4})[-/](\d{2})[-/](\d{2})\b')
+ROUTING_SLIP_RE = re.compile(r'(?:document\s+routing\s+slip|routing\s+slip|date\s+requested)', re.IGNORECASE)
+MM_DD_YYYY_RE = re.compile(r'\b(\d{1,2})[/\-!\.](\d{1,2})[/\-!1\.](\d{4})\b')
+
+
+def find_routing_slip_date(page_text: str) -> Optional[dict]:
+    """
+    Find the routing slip date from IC documents.
+    Only returns a date if found via:
+    1. MM/DD/YYYY near IC control number
+    2. Date (MM/DD/YYYY, ISO, date-only, corrupted) near "Routing Slip" header
+    Returns None if not found (no fallback — goes to pending).
+    """
+    MIN_YEAR = 2017
+
+    def _parse_date(y, m, d):
+        try:
+            yr = int(y)
+            if yr < 100:
+                yr += 2000
+            parsed_date = date(yr, int(m), int(d))
+            if MIN_YEAR <= parsed_date.year <= date.today().year:
+                return parsed_date
+        except Exception:
+            pass
+        return None
+
+    # Strategy 1: Find dates near IC control number
+    for ctrl_match in CONTROL_NO_PATTERN.finditer(page_text):
+        ctrl_end = ctrl_match.end()
+        window = page_text[ctrl_end:ctrl_end + 80]
+        date_match = CONTROL_DATE_PATTERN.search(window)
+        if date_match:
+            try:
+                parsed = dateparser.parse(date_match.group(0), settings={
+                    'PREFER_DAY_OF_MONTH': 'first',
+                    'REQUIRE_PARTS': ['year', 'month', 'day'],
+                })
+                if parsed:
+                    d = parsed.date()
+                    if MIN_YEAR <= d.year <= date.today().year:
+                        return {'date': d, 'source': 'control_number', 'confirmed': True}
+            except Exception:
+                pass
+
+    # Strategy 2: Find dates near "Routing Slip" header
+    for routing_match in ROUTING_SLIP_RE.finditer(page_text):
+        window = page_text[routing_match.start():routing_match.start() + 300]
+
+        # Try MM/DD/YYYY first (handles OCR glitches like 09/05!2017)
+        mmdd_match = MM_DD_YYYY_RE.search(window)
+        if mmdd_match:
+            try:
+                cleaned = f"{mmdd_match.group(1)}/{mmdd_match.group(2)}/{mmdd_match.group(3)}"
+                parsed = dateparser.parse(cleaned, settings={
+                    'PREFER_DAY_OF_MONTH': 'first',
+                    'REQUIRE_PARTS': ['year', 'month', 'day'],
+                })
+                if parsed:
+                    d = parsed.date()
+                    if MIN_YEAR <= d.year <= date.today().year:
+                        return {'date': d, 'source': 'routing_slip_mmdd', 'confirmed': True}
+            except Exception:
+                pass
+
+        # Try full ISO datetime
+        iso_match = ISO_DATETIME_PATTERN.search(window)
+        if iso_match:
+            try:
+                iso_text = iso_match.group(0)
+                date_part_match = re.match(r'(\d{4})[-/](\d{2})[-/ ](\d{2})', iso_text)
+                if date_part_match:
+                    y, m, d = date_part_match.groups()
+                    parsed_date = _parse_date(y, m, d)
+                    if parsed_date:
+                        return {'date': parsed_date, 'source': 'routing_slip_iso', 'confirmed': True}
+            except Exception:
+                pass
+
+        # Try date-only (YYYY-MM-DD)
+        date_only_match = ISO_DATE_ONLY_PATTERN.search(window)
+        if date_only_match:
+            y, m, d = date_only_match.groups()
+            parsed_date = _parse_date(y, m, d)
+            if parsed_date:
+                return {'date': parsed_date, 'source': 'routing_slip_date_only', 'confirmed': True}
+
+        # Try corrupted date (W17-09-20, L2017-09-20)
+        for corr_match in CORRUPTED_DATE_PATTERN.finditer(window):
+            y_raw, m, d = corr_match.groups()
+            parsed_date = _parse_date(y_raw, m, d)
+            if parsed_date:
+                return {'date': parsed_date, 'source': 'routing_slip_corrupted', 'confirmed': True}
+            if len(y_raw) == 2:
+                parsed_date = _parse_date('20' + y_raw, m, d)
+                if parsed_date:
+                    return {'date': parsed_date, 'source': 'routing_slip_corrupted', 'confirmed': True}
+
+    # No routing slip date found — return None (goes to pending)
+    return None
 
 
 def find_document_date_via_control_anchor(page_text: str):
@@ -207,10 +311,15 @@ def preprocess_image(image: np.ndarray, upscale: float = 1.5) -> np.ndarray:
     return thresh
 
 
-def pdf_to_image(pdf_path: str, page_index: int = 0, dpi: int = 200) -> Optional[np.ndarray]:
-    doc = None
+def pdf_to_image(pdf_path: str, page_index: int = 0, dpi: int = 200, doc: Optional["fitz.Document"] = None) -> Optional[np.ndarray]:
+    own_doc = doc is None
+    if own_doc:
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            print(f"Error opening PDF: {e}")
+            return None
     try:
-        doc = fitz.open(pdf_path)
         if page_index >= len(doc):
             page_index = 0
         page = doc[page_index]
@@ -230,7 +339,7 @@ def pdf_to_image(pdf_path: str, page_index: int = 0, dpi: int = 200) -> Optional
         print(f"Error converting PDF to image: {e}")
         return None
     finally:
-        if doc:
+        if own_doc and doc:
             try:
                 doc.close()
             except Exception:
@@ -331,25 +440,12 @@ def extract_candidates_from_ocr(ocr_data: dict, psm: int, page_width: int, page_
 
 def score_candidate(candidate: DateCandidate, uniqueness_bonus: float) -> float:
     score = 0.0
-    x, y, w, h = candidate.bbox
-    page_h, page_w = candidate.page_height, candidate.page_width
 
     score += 20.0
-
-    if page_h > 0 and page_w > 0:
-        rel_y = y / page_h
-        if rel_y < 0.33:
-            score += 30 * (1 - rel_y / 0.33)
-        rel_x = x / page_w
-        if rel_x > 0.66:
-            score += 20
 
     score += len(candidate.keywords_nearby) * 15
     score += min(candidate.confidence, 100) * 0.3
     score += uniqueness_bonus
-
-    if candidate.source_page == 0:
-        score += 10
 
     if candidate.is_ambiguous_numeric:
         score -= 35
@@ -359,40 +455,108 @@ def score_candidate(candidate: DateCandidate, uniqueness_bonus: float) -> float:
     return score
 
 
-def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150) -> DateResult:
+def _quick_confidence(all_candidates, page_ocr_data_list, control_results):
+    if not all_candidates:
+        return 0.0, False
+    deduped = {}
+    for c in all_candidates:
+        key = (c.parsed_date, c.source_page)
+        if key not in deduped or c.confidence > deduped[key].confidence:
+            deduped[key] = c
+    unique_candidates = list(deduped.values())
+    unique_date_count = len(set(c.parsed_date for c in unique_candidates if c.parsed_date))
+    uniqueness_bonus = 15.0 if unique_date_count <= 1 else 0.0
+    scored = [(c, score_candidate(c, uniqueness_bonus)) for c in unique_candidates]
+    labeled_set = find_labeled_date_candidates(page_ocr_data_list)
+    control_lookup = {}
+    for pg, cr in control_results.items():
+        control_lookup[(cr['date'], pg)] = cr['confirmed_by_date_requested']
+    for i, (c, s) in enumerate(scored):
+        key = (c.parsed_date, c.source_page)
+        in_labeled = key in labeled_set
+        in_control = key in control_lookup
+        if in_labeled and in_control:
+            scored[i] = (c, s + 100)
+        elif in_control:
+            scored[i] = (c, s + (90 if control_lookup[key] else 60))
+        elif in_labeled:
+            scored[i] = (c, s + 80)
+    scored.sort(key=lambda x: x[1], reverse=True)
+    if not scored:
+        return 0.0, False
+    best_score = scored[0][1]
+    return int(min(best_score, 100)), True
+
+
+def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150, doc: Optional["fitz.Document"] = None, docsep_pages: Optional[List[int]] = None) -> DateResult:
     all_candidates = []
     raw_texts = []
     page_ocr_data_list = []
     control_results = {}
     method = f"{engine}_heuristic"
     blank_pages = []
+    EARLY_EXIT_CONFIDENCE = 85
+    skip_pages = set(docsep_pages or [])
 
-    doc = None
-    try:
-        doc = fitz.open(pdf_path)
+    own_doc = doc is None
+    if own_doc:
+        try:
+            doc = fitz.open(pdf_path)
+            num_pages = len(doc) if max_pages is None else min(len(doc), max_pages)
+        except Exception:
+            num_pages = 1
+    else:
         num_pages = len(doc) if max_pages is None else min(len(doc), max_pages)
-    except Exception:
-        num_pages = 1
-    finally:
-        if doc:
+
+    # --- Module 1: Blank detection (all pages, no early exit) ---
+    for page_idx in range(num_pages):
+        if page_idx in skip_pages:
+            continue
+        img = pdf_to_image(pdf_path, page_idx, dpi=dpi, doc=doc)
+        if img is None:
+            continue
+        if img.size == 0 or img.shape[0] < 10 or img.shape[1] < 10:
+            continue
+        blank_result = detect_blank_page(img)
+        if blank_result["is_blank"] is True or blank_result["is_blank"] == "needs_review":
+            # Verify with text / OCR before declaring blank (from widgets pipeline)
+            is_confirmed_blank = False
+            native_txt = ""
             try:
-                doc.close()
+                _chk_doc = fitz.open(pdf_path) if own_doc else doc
+                native_txt = _chk_doc[page_idx].get_text().strip()
+                if own_doc:
+                    _chk_doc.close()
             except Exception:
                 pass
+            words = [w for w in native_txt.split() if len(w) >= 2]
+            if len(words) >= 2:
+                is_confirmed_blank = False
+            elif pytesseract is not None:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+                tess_txt = pytesseract.image_to_string(gray, config='--psm 6').strip()
+                tess_words = [w for w in tess_txt.split() if len(w) >= 2]
+                is_confirmed_blank = len(tess_words) < 2
+            else:
+                is_confirmed_blank = (blank_result["is_blank"] is True)
 
+            if is_confirmed_blank:
+                blank_pages.append(page_idx)
+        del img
+
+    skip_pages.update(blank_pages)
+
+    # --- Module 2: Date extraction via OCR (skip blank + docsep, early exit OK) ---
     for page_idx in range(num_pages):
-        img = pdf_to_image(pdf_path, page_idx, dpi=dpi)
+        if page_idx in skip_pages:
+            continue
+
+        img = pdf_to_image(pdf_path, page_idx, dpi=dpi, doc=doc)
         if img is None:
             continue
 
         if img.size == 0 or img.shape[0] < 10 or img.shape[1] < 10:
             continue
-
-        blank_result = detect_blank_page(img)
-        if blank_result["is_blank"] is True or blank_result["is_blank"] == "needs_review":
-            blank_pages.append(page_idx)
-            if blank_result["is_blank"] is True:
-                continue
 
         try:
             processed = preprocess_image(img, upscale=1.5)
@@ -423,9 +587,61 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
                 del processed
                 continue
 
+        if page_idx >= 1:
+            conf, ok = _quick_confidence(all_candidates, page_ocr_data_list, control_results)
+            labeled_pages = {page for _, page in find_labeled_date_candidates(page_ocr_data_list)}
+            page_anchored = page_idx in control_results or page_idx in labeled_pages
+            if ok and conf >= EARLY_EXIT_CONFIDENCE and page_anchored:
+                break
+
+    if own_doc and doc:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
     # Check if all pages were blank
     all_blank = len(blank_pages) == num_pages
 
+    # --- Module 3: Routing slip date (PRIMARY source) ---
+    # Check ALL pages: both native text and Tesseract OCR text
+    routing_dates = []
+    try:
+        import fitz as _fitz
+        _doc_for_routing = _fitz.open(pdf_path) if own_doc else doc
+        for page_idx in range(len(_doc_for_routing)):
+            native_text = _doc_for_routing[page_idx].get_text()
+            rs = find_routing_slip_date(native_text)
+            if rs:
+                routing_dates.append(rs)
+        if own_doc:
+            _doc_for_routing.close()
+    except Exception:
+        pass
+
+    for raw_text in raw_texts:
+        if raw_text:
+            rs = find_routing_slip_date(raw_text)
+            if rs:
+                routing_dates.append(rs)
+
+    # Any routing slip date found in the valid year range is high-confidence (95%)
+    if routing_dates:
+        best_routing = routing_dates[0]
+        return DateResult(
+            date=best_routing['date'],
+            confidence=95,
+            method=best_routing.get('source', 'routing_slip_confirmed'),
+            candidates=[],
+            raw_ocr_text=' '.join(raw_texts) if raw_texts else "",
+            blank_pages=blank_pages,
+            all_blank=all_blank,
+            needs_review=False,
+            top_candidates=[],
+            page_texts=raw_texts,
+        )
+
+    # No routing slip date found — use candidate scoring with LOW confidence
     if not all_candidates:
         return DateResult(
             date=None,
@@ -482,7 +698,8 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
     scored.sort(key=lambda x: x[1], reverse=True)
 
     best_candidate, best_score = scored[0]
-    final_confidence = int(min(best_score, 100))
+    # Cap fallback confidence at 70 (routing slip is the primary source)
+    final_confidence = int(min(best_score, 70))
 
     needs_review = bool(disagree_pages)
     top_candidates = []

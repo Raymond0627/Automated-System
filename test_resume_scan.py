@@ -79,6 +79,22 @@ class TestScanInfoRoundTrip(unittest.TestCase):
         self.assertIsNone(session.get_scan_info())
 
 
+class TestJsonSafeFlagged(unittest.TestCase):
+    def test_strips_bytes_only(self):
+        items = [
+            {"a": 1, "_pending_pdf_bytes": b"x"},
+            {"a": 2},
+        ]
+        out = widgets._json_safe_flagged(items)
+        self.assertEqual(out[0], {"a": 1})
+        self.assertEqual(out[1], {"a": 2})
+        # original list must not be mutated
+        self.assertEqual(items[0]["_pending_pdf_bytes"], b"x")
+
+    def test_keeps_non_dict_items(self):
+        self.assertEqual(widgets._json_safe_flagged(["keep"]), ["keep"])
+
+
 class TestPipelineResumeMode(unittest.TestCase):
     def setUp(self):
         _app()
@@ -111,7 +127,14 @@ class TestPipelineResumeMode(unittest.TestCase):
     def test_resume_runs_only_remaining_and_merges_index(self):
         plan = [str(self.input_root / "a.pdf"), str(self.input_root / "b.pdf"), str(self.input_root / "c.pdf")]
         existing = [str(self.input_root / "a.pdf")]
-        old_flag = {"original_path": plan[0], "original_filename": "a.pdf", "division_code": "D", "reviewed": False}
+        old_flag = {
+            "original_path": plan[0],
+            "original_filename": "a.pdf",
+            "division_code": "D",
+            "company_name": "Acme",
+            "reviewed": False,
+            "_pending_pdf_bytes": b"\x25\x50\x44\x46",
+        }
 
         # pre-existing index content should be preserved until merged
         self.flagged_root.mkdir(parents=True, exist_ok=True)
@@ -143,8 +166,48 @@ class TestPipelineResumeMode(unittest.TestCase):
         flagged_index = json.loads((self.flagged_root / "flagged_index.json").read_text(encoding="utf-8"))
         self.assertEqual(len(flagged_index), 3)
         self.assertEqual([d["original_path"] for d in flagged_index].count(plan[0]), 1)
+        self.assertNotIn("_pending_pdf_bytes", flagged_index[0])
         self.assertEqual(len(finished), 1)
         self.assertEqual(len(finished[0]), 3)
+
+    def test_resume_empty_remaining_completes_cleanly(self):
+        plan = [str(self.input_root / "a.pdf")]
+        existing = list(plan)
+        old_flag = {
+            "original_path": plan[0],
+            "original_filename": "a.pdf",
+            "division_code": "D",
+            "company_name": "Acme",
+            "reviewed": False,
+            "_pending_pdf_bytes": b"RAWBYTES",
+        }
+
+        completed = []
+        finished = []
+        errors = []
+        thread = PipelineThread(
+            self.config,
+            0,
+            plan=plan,
+            existing_paths=set(existing),
+            merged_flagged=[old_flag],
+            merged_confirmed=[],
+        )
+        thread.doc_completed.connect(lambda kind, p: completed.append((kind, p)))
+        thread.finished_signal.connect(lambda flagged: finished.append(flagged))
+        thread.error_signal.connect(lambda msg: errors.append(msg))
+
+        thread.run()
+
+        self.assertEqual(errors, [])
+        # only the initial "plan" status message - no document processing
+        self.assertEqual([k for k, p in completed], ["plan"])
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(len(finished[0]), 1)
+
+        flagged_index = json.loads((self.flagged_root / "flagged_index.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(flagged_index), 1)
+        self.assertNotIn("_pending_pdf_bytes", flagged_index[0])
 
     def test_fresh_mode_clears_index_and_emits_plan(self):
         self._orig_parse = widgets.parse_folder_structure

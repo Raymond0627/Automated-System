@@ -1,5 +1,7 @@
 import os
+import sys
 import json
+import shutil
 import fitz
 from pathlib import Path
 from datetime import date, datetime
@@ -10,15 +12,14 @@ from PyQt6.QtWidgets import (
     QTreeWidgetItem, QStackedWidget, QSplitter,
     QGroupBox, QDialog, QTextEdit, QMessageBox, QFileDialog,
     QMenu, QInputDialog, QFrame, QLineEdit, QCompleter,
-    QGraphicsOpacityEffect
+    QGraphicsOpacityEffect, QApplication
 )
-from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QRectF, QPointF
+from PyQt6.QtCore import Qt, QSize, QTimer, QThread, pyqtSignal, QRectF, QPointF, QPoint
 from PyQt6.QtGui import (
     QFont, QPixmap, QImage, QAction, QShortcut, QKeySequence,
     QPainter, QPen, QBrush, QColor, QCursor
 )
 
-import sys
 if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).parent.parent))
 from paths import BASE_DIR
@@ -29,6 +30,7 @@ from enhance import enhance_page
 from company_extractor import normalize_company_name, learn_company_name, load_known_companies, save_known_companies
 
 from .widgets import DocCardWidget, PassedDocCardWidget
+from .styles import get_palette_dict, get_combobox_popup_style, THEME_DARK
 from session import (
     serialize as serialize_session,
     apply as apply_session,
@@ -304,6 +306,8 @@ class ReviewTab(QWidget):
         self.reviewed_docs = []
         self.active_tab = "pending"
         self.active_index = -1
+        self.selected_indices = []
+        self.reviewed_selected_indices = []
         self.current_pdf_doc = None
         self.doc_card_widgets = []
         self.reviewed_card_widgets = []
@@ -321,12 +325,17 @@ class ReviewTab(QWidget):
         self._zoom_timer.setSingleShot(True)
         self._zoom_timer.timeout.connect(self.render_preview)
         self.page_labels = []
+        self._preview_scroll_timer = QTimer(self)
+        self._preview_scroll_timer.setSingleShot(True)
+        self._preview_scroll_timer.timeout.connect(self._on_preview_scroll_timeout)
         self.document_modified = False
+        self.selected_page = -1
         self._crop_mode = False
         self._crop_page_num = -1
         self._crop_overlay = None
         self.undo_stack = []
         self.undo_max = 50
+        self.undo_max_bytes = 64 * 1024 * 1024
         self._doc_undo_stack = []
         self._doc_undo_max = 20
         self.view_mode = "variable"
@@ -342,6 +351,10 @@ class ReviewTab(QWidget):
         self._session_timer.setSingleShot(True)
         self._session_timer.setInterval(500)
         self._session_timer.timeout.connect(self._save_session_now)
+        self._auto_refresh_timer = QTimer(self)
+        self._auto_refresh_timer.setSingleShot(True)
+        self._auto_refresh_timer.setInterval(120)
+        self._auto_refresh_timer.timeout.connect(self._on_auto_refresh)
         self.build_ui()
 
     def build_ui(self):
@@ -358,7 +371,7 @@ class ReviewTab(QWidget):
         left_layout.setSpacing(4)
 
         self.month_combo = QComboBox()
-        self.month_combo.addItems(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])
+        self.month_combo.addItems([f"{m:02d}" for m in range(1, 13)])
         self.month_combo.setFixedHeight(26)
         self.month_combo.setFont(QFont("Segoe UI", 9))
         self.year_spin = QSpinBox()
@@ -396,26 +409,11 @@ class ReviewTab(QWidget):
 
         nav_row = QHBoxLayout()
         nav_row.setSpacing(4)
-        nav_row.setContentsMargins(0, 0, 0, 4)
+        nav_row.setContentsMargins(4, 2, 4, 4)
         self.doc_nav_label = QLabel("No docs")
-        self.doc_nav_label.setFont(QFont("Segoe UI", 8))
+        self.doc_nav_label.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
         self.doc_nav_label.setStyleSheet("color: #8888aa;")
         nav_row.addWidget(self.doc_nav_label, 1)
-        self.prev_btn = QPushButton("<")
-        self.prev_btn.setFixedSize(48, 24)
-        self.prev_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.prev_btn.clicked.connect(self.prev_document)
-        nav_row.addWidget(self.prev_btn)
-        self.next_btn = QPushButton(">")
-        self.next_btn.setFixedSize(48, 24)
-        self.next_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.next_btn.clicked.connect(self.next_document)
-        nav_row.addWidget(self.next_btn)
-        self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.setFixedSize(80, 24)
-        self.refresh_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        self.refresh_btn.clicked.connect(self.refresh_review)
-        nav_row.addWidget(self.refresh_btn)
         left_layout.addLayout(nav_row)
 
         filter_row = QHBoxLayout()
@@ -450,8 +448,12 @@ class ReviewTab(QWidget):
         self.reviewed_tree.installEventFilter(self)
         self.reviewed_tree.setHeaderHidden(True)
         self.reviewed_tree.setRootIsDecorated(True)
+        self.reviewed_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self.reviewed_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.reviewed_tree.customContextMenuRequested.connect(self._show_reviewed_menu)
         self.reviewed_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.reviewed_tree.itemClicked.connect(self._on_reviewed_item_clicked)
+        self.reviewed_tree.itemChanged.connect(self._on_reviewed_item_renamed)
         self.reviewed_tree.setStyleSheet("""
             QTreeWidget {
                 background-color: #1a1e2e;
@@ -521,6 +523,7 @@ class ReviewTab(QWidget):
         self.preview_container_layout.addWidget(self.preview_placeholder)
 
         self.preview_scroll.setWidget(self.preview_container)
+        self.preview_scroll.verticalScrollBar().valueChanged.connect(self._schedule_preview_render)
         preview_layout.addWidget(self.preview_scroll, 1)
 
         right_layout.addWidget(preview_group, 1)
@@ -536,13 +539,13 @@ class ReviewTab(QWidget):
         self.count_label.setStyleSheet("color: #8888aa;")
         bottom.addWidget(self.count_label)
         sep = QLabel("|")
-        sep.setStyleSheet("color: #333455; padding: 0 4px;")
+        self.sep1 = sep
         bottom.addWidget(sep)
         bottom.addWidget(QLabel("Date:"))
         bottom.addWidget(self.month_combo)
         bottom.addWidget(self.year_spin)
         sep2 = QLabel("|")
-        sep2.setStyleSheet("color: #333455; padding: 0 4px;")
+        self.sep2 = sep2
         bottom.addWidget(sep2)
         bottom.addWidget(QLabel("Company:"))
         bottom.addWidget(self.company_input)
@@ -577,7 +580,33 @@ class ReviewTab(QWidget):
         self.duplicate_shortcut = QShortcut(QKeySequence("Ctrl+D"), self)
         self.duplicate_shortcut.activated.connect(self._duplicate_current_document)
 
-        QTimer.singleShot(0, self._restore_session_if_present)
+        # ---- Right-click action shortcuts ----
+        self.rotate_left_shortcut = QShortcut(QKeySequence("Ctrl+Left"), self)
+        self.rotate_left_shortcut.activated.connect(self._shortcut_rotate_left)
+        self.rotate_right_shortcut = QShortcut(QKeySequence("Ctrl+Right"), self)
+        self.rotate_right_shortcut.activated.connect(self._shortcut_rotate_right)
+        self.flip_h_shortcut = QShortcut(QKeySequence("Ctrl+H"), self)
+        self.flip_h_shortcut.activated.connect(self._shortcut_flip_h)
+        self.flip_v_shortcut = QShortcut(QKeySequence("Ctrl+Shift+H"), self)
+        self.flip_v_shortcut.activated.connect(self._shortcut_flip_v)
+        self.delete_page_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Delete), self)
+        self.delete_page_shortcut.activated.connect(self._shortcut_delete_page)
+        self.enhance_shortcut = QShortcut(QKeySequence("Ctrl+E"), self)
+        self.enhance_shortcut.activated.connect(self._shortcut_enhance)
+        self.crop_shortcut = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
+        self.crop_shortcut.activated.connect(self._shortcut_crop)
+        self.mark_blank_shortcut = QShortcut(QKeySequence("Ctrl+B"), self)
+        self.mark_blank_shortcut.activated.connect(self._shortcut_mark_blank)
+        self.remove_mark_shortcut = QShortcut(QKeySequence("Ctrl+Shift+B"), self)
+        self.remove_mark_shortcut.activated.connect(self._shortcut_remove_mark)
+        self.delete_doc_shortcut = QShortcut(QKeySequence("Ctrl+Delete"), self)
+        self.delete_doc_shortcut.activated.connect(self._shortcut_delete_doc)
+        self.merge_shortcut = QShortcut(QKeySequence("Ctrl+M"), self)
+        self.merge_shortcut.activated.connect(self._shortcut_merge)
+        self.insert_shortcut = QShortcut(QKeySequence("Ctrl+I"), self)
+        self.insert_shortcut.activated.connect(self._shortcut_insert)
+
+        self.apply_theme(self.config.get("theme", THEME_DARK))
 
     def refresh_completer(self):
         companies = load_known_companies()
@@ -600,13 +629,14 @@ class ReviewTab(QWidget):
         except Exception:
             pass
 
-    def _restore_session_if_present(self):
+    def _restore_session_if_present(self) -> bool:
         snap = load_snapshot()
         if not snap:
-            return
+            return False
         saved_at = snap.get("saved_at", "unknown time")
+        parent_w = self.window() or self
         answer = QMessageBox.question(
-            self,
+            parent_w,
             "Restore Session",
             f"An unsaved session from {saved_at} was found.\n\nRestore it now?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -614,7 +644,7 @@ class ReviewTab(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             discard_snapshot()
-            return
+            return True
         try:
             self._restore_from_snapshot(snap)
         except Exception:
@@ -623,6 +653,7 @@ class ReviewTab(QWidget):
             self.session_restored.emit(snap)
         except RuntimeError:
             pass
+        return True
 
     def _restore_from_snapshot(self, snap: dict):
         restore = apply_session(self, snap)
@@ -731,16 +762,17 @@ class ReviewTab(QWidget):
             self.refresh_doc_list()
         self._session_changed()
 
-    def refresh_doc_list(self, select_row=None):
+    def refresh_doc_list(self, select_row=None, preserve_current=False):
         if self.active_tab == "reviewed":
             return
         self.doc_list.blockSignals(True)
         self.doc_list.clear()
         self.doc_card_widgets = []
+        theme = self.config.get("theme", THEME_DARK)
         if self.active_tab == "pending":
             docs = self.pending_docs
             for i, doc in enumerate(docs):
-                card = DocCardWidget(doc, i)
+                card = DocCardWidget(doc, i, theme=theme)
                 card.clicked.connect(self._on_card_clicked)
                 card.contextMenuRequested.connect(self._show_document_menu)
                 item = QListWidgetItem()
@@ -751,7 +783,7 @@ class ReviewTab(QWidget):
         elif self.active_tab == "auto_confirmed":
             docs = self.auto_confirmed_docs
             for i, doc in enumerate(docs):
-                card = PassedDocCardWidget(doc, i)
+                card = PassedDocCardWidget(doc, i, theme=theme)
                 card.clicked.connect(self._on_card_clicked)
                 card.contextMenuRequested.connect(self._show_document_menu)
                 item = QListWidgetItem()
@@ -769,7 +801,19 @@ class ReviewTab(QWidget):
         self.doc_list.blockSignals(False)
         if docs:
             row = select_row if select_row is not None else 0
-            self.doc_list.setCurrentRow(row)
+            self.selected_indices = [row]
+            if preserve_current:
+                # Rebuild the list but do NOT emit currentRowChanged, otherwise
+                # _on_doc_selected → load_document would reset the company/date
+                # (file name) fields the user is currently editing.
+                self.doc_list.blockSignals(True)
+                self.doc_list.setCurrentRow(row)
+                self.doc_list.blockSignals(False)
+            else:
+                self.doc_list.setCurrentRow(row)
+            self._update_cards_selection()
+        else:
+            self.selected_indices = []
 
     def _load_reviewed_from_output(self):
         output_root = Path(self.config.get("output_root", ""))
@@ -863,6 +907,7 @@ class ReviewTab(QWidget):
             self.reviewed_tree.addTopLevelItem(folder_item)
             for i, doc in grouped[key]:
                 file_item = QTreeWidgetItem([doc.get("original_filename", "Unknown")])
+                file_item.setFlags(file_item.flags() | Qt.ItemFlag.ItemIsEditable)
                 file_item.setData(0, Qt.ItemDataRole.UserRole, i)
                 file_item.setToolTip(0, doc.get("original_path", ""))
                 folder_item.addChild(file_item)
@@ -885,8 +930,339 @@ class ReviewTab(QWidget):
         idx = item.data(0, Qt.ItemDataRole.UserRole)
         if idx is None or idx >= len(self.reviewed_docs):
             return
+
+        modifiers = QApplication.keyboardModifiers()
+        if modifiers & Qt.KeyboardModifier.ControlModifier:
+            if idx in self.reviewed_selected_indices:
+                self.reviewed_selected_indices.remove(idx)
+                if not self.reviewed_selected_indices:
+                    self.reviewed_selected_indices = [idx]
+            else:
+                self.reviewed_selected_indices.append(idx)
+        else:
+            self.reviewed_selected_indices = [idx]
+
         self.active_index = idx
         self.load_document(self.reviewed_docs[idx])
+
+    def _get_reviewed_selected_indices(self) -> list:
+        selected_items = self.reviewed_tree.selectedItems()
+        file_indices = []
+        for item in selected_items:
+            idx = item.data(0, Qt.ItemDataRole.UserRole)
+            if idx is not None and 0 <= idx < len(self.reviewed_docs):
+                file_indices.append(idx)
+
+        # Preserve the click order from self.reviewed_selected_indices for items that are selected
+        ordered = [i for i in self.reviewed_selected_indices if i in file_indices]
+        for i in file_indices:
+            if i not in ordered:
+                ordered.append(i)
+        return ordered
+
+    def _show_reviewed_menu(self, pos: QPoint):
+        if self.active_tab != "reviewed":
+            return
+        clicked_item = self.reviewed_tree.itemAt(pos)
+        if clicked_item and clicked_item.childCount() > 0:
+            return  # folder item
+
+        selected = self._get_reviewed_selected_indices()
+        if clicked_item:
+            clicked_idx = clicked_item.data(0, Qt.ItemDataRole.UserRole)
+            if clicked_idx is not None and clicked_idx not in selected:
+                self.reviewed_tree.clearSelection()
+                clicked_item.setSelected(True)
+                self.reviewed_selected_indices = [clicked_idx]
+                self.active_index = clicked_idx
+                self.load_document(self.reviewed_docs[clicked_idx])
+                selected = [clicked_idx]
+
+        if not selected:
+            return
+
+        count = len(selected)
+        menu = QMenu(self)
+        if count > 1:
+            delete_act = QAction(f"Delete ({count} files)", self)
+            delete_act.triggered.connect(self._delete_selected_reviewed)
+            menu.addAction(delete_act)
+
+            merge_act = QAction(f"Merge ({count} files)", self)
+            merge_act.triggered.connect(self._merge_selected_reviewed)
+            menu.addAction(merge_act)
+
+            duplicate_act = QAction(f"Duplicate ({count} files)", self)
+            duplicate_act.triggered.connect(self._duplicate_selected_reviewed)
+            menu.addAction(duplicate_act)
+        else:
+            rename_act = QAction("Rename File...", self)
+            rename_act.triggered.connect(lambda: self._rename_reviewed_at(selected[0]))
+            menu.addAction(rename_act)
+            menu.addSeparator()
+            duplicate_act = QAction("Duplicate", self)
+            duplicate_act.triggered.connect(lambda: self._duplicate_reviewed_at(selected[0]))
+            menu.addAction(duplicate_act)
+            menu.addSeparator()
+            delete_act = QAction("Delete", self)
+            delete_act.triggered.connect(lambda: self._delete_reviewed_at(selected[0]))
+            menu.addAction(delete_act)
+
+        menu.exec(self.reviewed_tree.viewport().mapToGlobal(pos))
+
+    def _merge_selected_reviewed(self):
+        selected = self._get_reviewed_selected_indices()
+        if len(selected) < 2:
+            return
+
+        first_doc = self.reviewed_docs[selected[0]]
+        first_path = first_doc.get("original_path", "")
+        first_name = os.path.basename(first_path) if first_path else "document.pdf"
+        count = len(selected)
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Merge",
+            f"Merge {count} files into '{first_name}'?\n\nAll pages will be combined into this file. The other {count - 1} file(s) will be permanently deleted from disk.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            merged_pdf = fitz.open()
+            for idx in selected:
+                doc = self.reviewed_docs[idx]
+                path = doc.get("original_path", "")
+                if not path or not os.path.exists(path):
+                    QMessageBox.warning(self, "Merge Error", f"File not found on disk:\n{path}")
+                    merged_pdf.close()
+                    return
+                src = fitz.open(path)
+                merged_pdf.insert_pdf(src)
+                src.close()
+
+            # Save to temporary file next to first_path to safely overwrite
+            temp_path = first_path + ".merge_tmp.pdf"
+            merged_pdf.save(temp_path, garbage=4, deflate=True)
+            merged_pdf.close()
+
+            # Close preview document if open
+            if self.current_pdf_doc:
+                self.current_pdf_doc.close()
+                self.current_pdf_doc = None
+
+            # Overwrite first file
+            os.replace(temp_path, first_path)
+
+            # Delete the secondary files
+            deleted_count = 0
+            for idx in selected[1:]:
+                path = self.reviewed_docs[idx].get("original_path", "")
+                if path and os.path.exists(path) and path != first_path:
+                    try:
+                        os.remove(path)
+                        deleted_count += 1
+                    except Exception as e:
+                        print(f"Warning: could not delete merged file {path}: {e}")
+
+            self._show_toast(f"Merged {count} files into '{first_name}'")
+            self._start_reviewed_scan()
+        except Exception as e:
+            QMessageBox.critical(self, "Merge Error", f"Failed to merge reviewed files:\n{e}")
+
+    def _delete_selected_reviewed(self):
+        selected = self._get_reviewed_selected_indices()
+        if not selected:
+            return
+        count = len(selected)
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Permanently delete {count} selected file(s) from disk?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        if self.current_pdf_doc:
+            self.current_pdf_doc.close()
+            self.current_pdf_doc = None
+
+        deleted = 0
+        for idx in selected:
+            path = self.reviewed_docs[idx].get("original_path", "")
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                    deleted += 1
+                except Exception as e:
+                    print(f"Could not delete {path}: {e}")
+
+        self._show_toast(f"Deleted {deleted} file(s)")
+        self._start_reviewed_scan()
+
+    def _delete_reviewed_at(self, idx: int):
+        if 0 <= idx < len(self.reviewed_docs):
+            path = self.reviewed_docs[idx].get("original_path", "")
+            name = os.path.basename(path)
+            confirm = QMessageBox.question(
+                self,
+                "Confirm Delete",
+                f"Permanently delete '{name}' from disk?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                if self.current_pdf_doc:
+                    self.current_pdf_doc.close()
+                    self.current_pdf_doc = None
+                if path and os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except Exception as e:
+                        QMessageBox.critical(self, "Delete Error", f"Could not delete:\n{e}")
+                        return
+                self._show_toast(f"Deleted '{name}'")
+                self._start_reviewed_scan()
+
+    def _rename_reviewed_at(self, idx: int):
+        if not (0 <= idx < len(self.reviewed_docs)):
+            return
+        item = self.reviewed_index_to_item.get(idx)
+        if item:
+            self.reviewed_tree.editItem(item, 0)
+
+    def _on_reviewed_item_renamed(self, item, column):
+        if column != 0:
+            return
+        idx = item.data(0, Qt.ItemDataRole.UserRole)
+        if idx is None or not (0 <= idx < len(self.reviewed_docs)):
+            return
+        doc = self.reviewed_docs[idx]
+        old_path = doc.get("original_path", "")
+        old_name = doc.get("original_filename", "")
+        new_name = (item.text(0) or "").strip()
+
+        if not new_name or new_name == old_name:
+            if new_name != old_name:
+                item.setText(0, old_name)
+            return
+
+        if "/" in new_name or "\\" in new_name or new_name in (".", ".."):
+            QMessageBox.warning(self, "Rename Failed", "File name cannot contain path separators.")
+            item.setText(0, old_name)
+            return
+
+        if os.path.splitext(new_name)[1].lower() != ".pdf":
+            new_name += ".pdf"
+
+        new_path = os.path.join(os.path.dirname(old_path), new_name)
+        if os.path.normcase(os.path.normpath(new_path)) == os.path.normcase(os.path.normpath(old_path)):
+            item.setText(0, old_name)
+            return
+
+        if os.path.exists(new_path):
+            confirm = QMessageBox.question(
+                self,
+                "Replace File",
+                f"A file named '{new_name}' already exists.\n\nReplace it with the renamed file?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                item.setText(0, old_name)
+                return
+
+        if self.current_pdf_doc:
+            if self.document_modified:
+                try:
+                    doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
+                except Exception:
+                    pass
+            try:
+                self.current_pdf_doc.close()
+            except Exception:
+                pass
+            self.current_pdf_doc = None
+
+        try:
+            os.replace(old_path, new_path)
+        except Exception as e:
+            QMessageBox.critical(self, "Rename Failed", f"Could not rename file:\n{e}")
+            item.setText(0, old_name)
+            return
+
+        doc["original_path"] = new_path
+        doc["original_filename"] = new_name
+        if len(new_name) >= 8 and new_name[:8].isdigit():
+            doc["detected_date"] = new_name[:8]
+
+        self._show_toast(f"Renamed to '{new_name}'")
+        self._start_reviewed_scan()
+
+    def _duplicate_reviewed_at(self, idx: int):
+        if 0 <= idx < len(self.reviewed_docs):
+            path = self.reviewed_docs[idx].get("original_path", "")
+            if not path or not os.path.exists(path):
+                return
+            p = Path(path)
+            stem = p.stem
+            ext = p.suffix
+            counter = 1
+            new_path = p.parent / f"{stem}({counter}){ext}"
+            while new_path.exists():
+                counter += 1
+                new_path = p.parent / f"{stem}({counter}){ext}"
+            try:
+                shutil.copy2(str(p), str(new_path))
+                self._doc_undo_stack.append({
+                    "type": "duplicate_reviewed",
+                    "tab": "reviewed",
+                    "paths": [str(new_path)],
+                })
+                if len(self._doc_undo_stack) > self._doc_undo_max:
+                    self._doc_undo_stack.pop(0)
+                self._show_toast(f"Duplicated: {new_path.name}")
+                self._start_reviewed_scan()
+            except Exception as e:
+                QMessageBox.critical(self, "Duplicate Error", f"Failed to duplicate:\n{e}")
+
+    def _duplicate_selected_reviewed(self):
+        selected = self._get_reviewed_selected_indices()
+        if not selected:
+            return
+        count = 0
+        created_paths = []
+        for idx in selected:
+            path = self.reviewed_docs[idx].get("original_path", "")
+            if path and os.path.exists(path):
+                p = Path(path)
+                stem = p.stem
+                ext = p.suffix
+                counter = 1
+                new_path = p.parent / f"{stem}({counter}){ext}"
+                while new_path.exists():
+                    counter += 1
+                    new_path = p.parent / f"{stem}({counter}){ext}"
+                try:
+                    shutil.copy2(str(p), str(new_path))
+                    count += 1
+                    created_paths.append(str(new_path))
+                except Exception as e:
+                    print(f"Could not duplicate {path}: {e}")
+        if created_paths:
+            self._doc_undo_stack.append({
+                "type": "duplicate_reviewed",
+                "tab": "reviewed",
+                "paths": created_paths,
+            })
+            if len(self._doc_undo_stack) > self._doc_undo_max:
+                self._doc_undo_stack.pop(0)
+        self._show_toast(f"Duplicated {count} file(s)")
+        self._start_reviewed_scan()
 
     def _nav_reviewed(self, delta: int):
         docs = self.reviewed_docs
@@ -902,8 +1278,36 @@ class ReviewTab(QWidget):
             self.reviewed_tree.scrollToItem(item)
         self.load_document(docs[new_idx])
 
-    def _on_card_clicked(self, idx: int):
-        self.doc_list.setCurrentRow(idx)
+    def _on_card_clicked(self, idx: int, modifiers=None):
+        if modifiers and (modifiers & Qt.KeyboardModifier.ControlModifier):
+            if idx in self.selected_indices:
+                self.selected_indices.remove(idx)
+                if not self.selected_indices:
+                    self.selected_indices = [idx]
+            else:
+                self.selected_indices.append(idx)
+            self.active_index = idx
+            self._update_cards_selection()
+            docs = self._get_current_docs()
+            if 0 <= idx < len(docs):
+                self.load_document(docs[idx])
+        elif modifiers and (modifiers & Qt.KeyboardModifier.ShiftModifier) and self.selected_indices:
+            anchor = self.selected_indices[0]
+            start = min(anchor, idx)
+            end = max(anchor, idx)
+            self.selected_indices = [anchor] + [i for i in range(start, end + 1) if i != anchor]
+            self.active_index = idx
+            self._update_cards_selection()
+            docs = self._get_current_docs()
+            if 0 <= idx < len(docs):
+                self.load_document(docs[idx])
+        else:
+            self.selected_indices = [idx]
+            self.doc_list.setCurrentRow(idx)
+
+    def _update_cards_selection(self):
+        for i, card in enumerate(self.doc_card_widgets):
+            card.set_selected(i in self.selected_indices)
 
     def _on_doc_selected(self, row: int):
         if row < 0:
@@ -912,8 +1316,9 @@ class ReviewTab(QWidget):
         if row >= len(docs):
             return
         self.active_index = row
-        for i, card in enumerate(self.doc_card_widgets):
-            card.set_selected(i == row)
+        if not (hasattr(self, "selected_indices") and row in self.selected_indices and len(self.selected_indices) > 1):
+            self.selected_indices = [row]
+        self._update_cards_selection()
         if self.active_tab == "pending":
             self.load_document(self.pending_docs[row])
         elif self.active_tab == "auto_confirmed":
@@ -941,19 +1346,25 @@ class ReviewTab(QWidget):
         self.auto_confirmed_docs = []
         self.reviewed_docs = []
         self.active_index = -1
+        self.selected_indices = []
+        self.reviewed_selected_indices = []
         self.current_pdf_doc = None
         self.undo_stack.clear()
         for lbl in self.page_labels:
             lbl.deleteLater()
         self.page_labels = []
+        p = get_palette_dict(self.config.get("theme", THEME_DARK))
         self.preview_placeholder.setText("Select a document to preview")
-        self.preview_placeholder.setStyleSheet("color: #555570; font-size: 12pt;")
+        self.preview_placeholder.setStyleSheet(f"color: {p['text_placeholder']}; font-size: 12pt; font-weight: 500;")
         self.tab_pending_btn.setText("Pending (0)")
         self.tab_auto_confirmed_btn.setText("Auto-Confirmed (0)")
         self.tab_reviewed_btn.setText("Reviewed (0)")
         self.count_label.setText("No documents")
+        self.count_label.setStyleSheet(f"color: {p['text_secondary']}; font-weight: 600; font-size: 8.5pt;")
         self.doc_nav_label.setText("No docs")
+        self.doc_nav_label.setStyleSheet(f"color: {p['text_secondary']}; font-weight: 600; font-size: 8.5pt;")
         self.page_label.setText("No document loaded")
+        self.page_label.setStyleSheet(f"color: {p['text_secondary']}; font-weight: 600; font-size: 8.5pt;")
         self.confirm_all_btn.setVisible(False)
         self.confirm_all_btn.setEnabled(False)
         self.confirm_all_btn.setText("CONFIRM ALL")
@@ -970,6 +1381,29 @@ class ReviewTab(QWidget):
         self.tab_auto_confirmed_btn.setText(f"Auto-Confirmed ({len(self.auto_confirmed_docs)})")
         self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.auto_confirmed_docs)} auto | {len(self.reviewed_docs)} reviewed")
         self._session_changed()
+        # Trigger debounced live auto-refresh so newly processed files appear immediately
+        self._auto_refresh_timer.start()
+
+    def _on_auto_refresh(self):
+        if self.active_tab == "reviewed":
+            return
+        docs = self._get_current_docs()
+        prev_idx = self.active_index
+        # If user hasn't selected any document yet and we now have docs, load the first one
+        if prev_idx < 0 and docs:
+            self.refresh_doc_list(select_row=0)
+        elif docs:
+            # Preserve current selected document row while updating list items
+            target_row = min(max(0, prev_idx), len(docs) - 1)
+            if prev_idx == target_row and self.current_pdf_doc:
+                # The user is viewing/editing a document and new files arrived.
+                # Rebuild the list but leave the loaded document untouched so the
+                # edited file name / date are not reset to the stored values.
+                self.refresh_doc_list(select_row=target_row, preserve_current=True)
+            else:
+                self.refresh_doc_list(select_row=target_row)
+        else:
+            self.refresh_doc_list()
 
     def load_document(self, doc: dict):
         self.exit_crop_mode()
@@ -982,6 +1416,7 @@ class ReviewTab(QWidget):
             self.current_pdf_doc = None
 
         self.current_page = 0
+        self.selected_page = 0
         self.document_modified = False
         self.undo_stack.clear()
 
@@ -1077,30 +1512,35 @@ class ReviewTab(QWidget):
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         lbl.customContextMenuRequested.connect(lambda pos, pn=page_num, lb=lbl: self._show_page_menu(pos, pn, lb))
+        lbl.clicked.connect(self._select_page)
 
         is_blank = page_num in blank_pages
         is_docsep = page_num in docsep_pages
+        is_selected = page_num == self.selected_page and not self._sort_mode
+        p = get_palette_dict(self.config.get("theme", THEME_DARK))
 
         if is_blank:
-            lbl.setStyleSheet("background-color: #1e1f35; border: 3px solid #ff4444; border-radius: 4px; padding: 4px;")
+            lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 3px solid {p['status_bad']}; border-radius: 4px; padding: 4px;")
             blank_badge = QLabel("BLANK", lbl)
-            blank_badge.setStyleSheet("background-color: #ff4444; color: white; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
+            blank_badge.setStyleSheet(f"background-color: {p['status_bad']}; color: white; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
             blank_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
             blank_badge.move(8, 8)
             blank_badge.adjustSize()
             blank_badge.show()
         elif is_docsep:
-            lbl.setStyleSheet("background-color: #1e1f35; border: 3px solid #ffab00; border-radius: 4px; padding: 4px;")
+            lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 3px solid {p['status_warn']}; border-radius: 4px; padding: 4px;")
             docsep_badge = QLabel("DOCSEP", lbl)
-            docsep_badge.setStyleSheet("background-color: #ffab00; color: #1e1f35; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
+            docsep_badge.setStyleSheet(f"background-color: {p['status_warn']}; color: white; font-weight: bold; font-size: 10px; padding: 2px 8px; border-radius: 3px;")
             docsep_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
             docsep_badge.move(8, 8)
             docsep_badge.adjustSize()
             docsep_badge.show()
+        elif is_selected:
+            lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 3px solid {p['accent_primary']}; border-radius: 4px; padding: 4px;")
         elif sort_slot >= 0:
-            lbl.setStyleSheet("background-color: #10151f; border: 3px solid #26c6da; border-radius: 4px; padding: 4px;")
+            lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 3px solid {p['accent_primary']}; border-radius: 4px; padding: 4px;")
         else:
-            lbl.setStyleSheet("background-color: #1e1f35; border: 1px solid #3a3b55; border-radius: 4px; padding: 4px;")
+            lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 1px solid {p['border']}; border-radius: 4px; padding: 4px;")
 
         if sort_slot >= 0:
             pos_badge = QLabel(f"#{sort_slot + 1}", lbl)
@@ -1115,6 +1555,31 @@ class ReviewTab(QWidget):
 
         return lbl
 
+    def _update_page_selection_borders(self):
+        """Update border highlights instantly without recreating or re-rendering page widgets."""
+        if not self.current_pdf_doc or not self.page_labels:
+            return
+        p = get_palette_dict(self.config.get("theme", THEME_DARK))
+        blank_pages = self._get_blank_pages()
+        docsep_pages = self._get_docsep_pages()
+        for lbl in self.page_labels:
+            pn = getattr(lbl, "_page_num", getattr(lbl, "_lazy_page_num", None))
+            if pn is None:
+                continue
+            is_blank = pn in blank_pages
+            is_docsep = pn in docsep_pages
+            is_selected = (pn == self.selected_page and not self._sort_mode)
+            sort_slot = getattr(lbl, "_sort_slot", -1)
+
+            if is_blank:
+                lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 3px solid {p['status_bad']}; border-radius: 4px; padding: 4px;")
+            elif is_docsep:
+                lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 3px solid {p['status_warn']}; border-radius: 4px; padding: 4px;")
+            elif is_selected or sort_slot >= 0:
+                lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 3px solid {p['accent_primary']}; border-radius: 4px; padding: 4px;")
+            else:
+                lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 1px solid {p['border']}; border-radius: 4px; padding: 4px;")
+
     def _make_page_pixmap(self, page_num, page_width):
         page = self.current_pdf_doc[page_num]
         dpi = max(25, int(150 * (self.zoom_level / 100)))
@@ -1124,6 +1589,77 @@ class ReviewTab(QWidget):
         if pixmap.width() > page_width:
             pixmap = pixmap.scaledToWidth(page_width, Qt.TransformationMode.SmoothTransformation)
         return pixmap
+
+    def _make_page_placeholder(self, page_num, page_width):
+        page = self.current_pdf_doc[page_num]
+        dpi = max(25, int(150 * (self.zoom_level / 100)))
+        pt_w = max(1, page.rect.width)
+        pt_h = max(1, page.rect.height)
+        raw_w = max(1, int(round(pt_w * dpi / 72.0)))
+        raw_h = max(1, int(round(pt_h * dpi / 72.0)))
+        if raw_w > page_width:
+            ph_w = max(1, int(page_width))
+            ph_h = max(1, int(round(raw_h * ph_w / raw_w)))
+        else:
+            ph_w, ph_h = raw_w, raw_h
+        pm = QPixmap(ph_w, ph_h)
+        pm.fill(QColor(0, 0, 0, 0))
+        return pm
+
+    def _schedule_preview_render(self):
+        if self.current_pdf_doc and self.page_labels:
+            self._preview_scroll_timer.start(80)
+
+    def _on_preview_scroll_timeout(self):
+        self._render_visible_pages()
+        self._release_far_pixmaps()
+
+    def _render_visible_pages(self):
+        if not self.current_pdf_doc or not self.page_labels:
+            return
+        vp = self.preview_scroll.viewport()
+        if vp is None:
+            return
+        view_h = vp.height()
+        scroll_top = self.preview_scroll.verticalScrollBar().value()
+        scroll_bottom = scroll_top + view_h
+        margin = max(view_h, 400)
+        for lbl in self.page_labels:
+            page_num = getattr(lbl, "_lazy_page_num", None)
+            if page_num is None or getattr(lbl, "_lazy_rendered", False):
+                continue
+            lbl_top = lbl.mapTo(self.preview_container, QPoint(0, 0)).y()
+            lbl_h = lbl.height()
+            if lbl_top + lbl_h < scroll_top - margin or lbl_top > scroll_bottom + margin:
+                continue
+            self._ensure_label_rendered(lbl, page_num)
+
+    def _release_far_pixmaps(self):
+        if not self.current_pdf_doc or not self.page_labels:
+            return
+        vp = self.preview_scroll.viewport()
+        if vp is None:
+            return
+        view_h = vp.height()
+        scroll_top = self.preview_scroll.verticalScrollBar().value()
+        scroll_bottom = scroll_top + view_h
+        margin = max(view_h, 400)
+        for lbl in self.page_labels:
+            if not getattr(lbl, "_lazy_rendered", False):
+                continue
+            lbl_top = lbl.mapTo(self.preview_container, QPoint(0, 0)).y()
+            lbl_h = lbl.height()
+            if lbl_top + lbl_h < scroll_top - margin - view_h or lbl_top > scroll_bottom + margin + view_h:
+                lbl.setPixmap(QPixmap())
+                lbl._lazy_rendered = False
+
+    def _ensure_label_rendered(self, lbl, page_num):
+        try:
+            pixmap = self._make_page_pixmap(page_num, getattr(lbl, "_lazy_width", 400))
+            lbl.setPixmap(pixmap)
+            lbl._lazy_rendered = True
+        except Exception:
+            pass
 
     def render_preview(self):
         if not self.current_pdf_doc:
@@ -1149,13 +1685,27 @@ class ReviewTab(QWidget):
             page_iter = list(self._sort_order) if self._sort_mode else list(range(total_pages))
 
             def make_label(slot, page_num, width):
-                return self._create_page_label(
+                if self._sort_mode:
+                    lbl = self._create_page_label(
+                        page_num,
+                        self._make_page_pixmap(page_num, width),
+                        blank_pages,
+                        docsep_pages,
+                        sort_slot=slot,
+                    )
+                    lbl._lazy_rendered = True
+                    return lbl
+                lbl = self._create_page_label(
                     page_num,
-                    self._make_page_pixmap(page_num, width),
+                    self._make_page_placeholder(page_num, width),
                     blank_pages,
                     docsep_pages,
-                    sort_slot=slot if self._sort_mode else -1,
+                    sort_slot=-1,
                 )
+                lbl._lazy_page_num = page_num
+                lbl._lazy_width = width
+                lbl._lazy_rendered = False
+                return lbl
 
             if self.view_mode == "one_page":
                 for slot, page_num in enumerate(page_iter):
@@ -1244,6 +1794,7 @@ class ReviewTab(QWidget):
             else:
                 status += f" | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)"
             self.page_label.setText(status)
+            self._schedule_preview_render()
         except Exception as e:
             self.preview_placeholder.setText(f"Error rendering: {e}")
             self.preview_placeholder.setStyleSheet("color: #ff5555; font-size: 12pt;")
@@ -1329,9 +1880,17 @@ class ReviewTab(QWidget):
         if not self.current_pdf_doc or len(self.current_pdf_doc) <= 1:
             QMessageBox.warning(self, "Cannot Delete", "Cannot delete the only remaining page.")
             return
+        if self._sort_mode:
+            self._exit_sort_mode()
         self._push_undo()
         self.current_pdf_doc.delete_page(page_num)
+        doc = self._get_current_doc()
+        if doc is not None:
+            doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
         self.document_modified = True
+        new_total = len(self.current_pdf_doc)
+        self.selected_page = min(max(0, page_num), new_total - 1) if new_total > 0 else -1
+        self.current_page = self.selected_page
         self.render_preview()
         self._session_changed()
 
@@ -1409,6 +1968,8 @@ class ReviewTab(QWidget):
         self._crop_mode = True
         self._crop_page_num = page_num
         lbl = self.page_labels[page_num]
+        if getattr(lbl, "_lazy_page_num", None) is not None and not getattr(lbl, "_lazy_rendered", False):
+            self._ensure_label_rendered(lbl, page_num)
         self._crop_label = lbl
         overlay = CropOverlay(lbl)
         overlay.setGeometry(0, 0, lbl.width(), lbl.height())
@@ -1417,6 +1978,7 @@ class ReviewTab(QWidget):
         self._crop_overlay = overlay
         self.save_crop_btn.setVisible(True)
         self.confirm_btn.setEnabled(False)
+        self.page_label.setText(f"CROPPING Page {page_num + 1}  (Enter=save crop, Esc=cancel)")
 
     def apply_crop(self):
         if not self._crop_mode or not self._crop_overlay or not self.current_pdf_doc:
@@ -1463,12 +2025,28 @@ class ReviewTab(QWidget):
         self._crop_label = None
         self.save_crop_btn.setVisible(False)
         self.confirm_btn.setEnabled(True)
+        if self.current_pdf_doc and not self._sort_mode:
+            total_pages = len(self.current_pdf_doc)
+            blank_pages = self._get_blank_pages()
+            docsep_pages = self._get_docsep_pages()
+            blank_count = len([p for p in blank_pages if p < total_pages])
+            docsep_count = len([p for p in docsep_pages if p < total_pages])
+            status = f"{total_pages} page(s)"
+            if blank_count:
+                status += f" | {blank_count} blank"
+            if docsep_count:
+                status += f" | {docsep_count} DOCSEP"
+            status += f" | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)"
+            self.page_label.setText(status)
 
     def _toggle_sort_mode(self):
         if not self._sort_mode:
             self._enter_sort_mode()
 
     def _on_escape(self):
+        if self._crop_mode:
+            self.exit_crop_mode()
+            return
         if self._sort_mode:
             self._exit_sort_mode()
 
@@ -1650,7 +2228,20 @@ class ReviewTab(QWidget):
             return
         try:
             os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            self.current_pdf_doc.save(out_path, garbage=4, deflate=True)
+            # Save to a temp file in the same folder, then atomically replace the
+            # original. This lets a file-backed doc be fully rewritten instead of
+            # requiring an incremental save over the open file.
+            temp_path = out_path + ".save_tmp.pdf"
+            self.current_pdf_doc.save(temp_path, garbage=4, deflate=True)
+
+            # Close the currently-open doc (it is the same file we are overwriting)
+            # so the file handle is released before replacing on disk.
+            if self.current_pdf_doc:
+                self.current_pdf_doc.close()
+                self.current_pdf_doc = None
+
+            os.replace(temp_path, out_path)
+
             self.document_modified = False
             self._show_toast(f"Re-saved: {os.path.basename(out_path)}\n→ {os.path.dirname(out_path)}")
             self._session_changed()
@@ -1720,14 +2311,17 @@ class ReviewTab(QWidget):
         if not self.current_pdf_doc:
             return
         doc = self._get_current_doc()
+        pdf_bytes = self.current_pdf_doc.tobytes()
         state = {
-            "pdf": self.current_pdf_doc.tobytes(),
+            "pdf": pdf_bytes,
             "blank_pages": list(doc.get("blank_pages", [])) if doc else [],
             "docsep_pages": list(doc.get("docsep_pages", [])) if doc else [],
         }
         self.undo_stack.append(state)
-        if len(self.undo_stack) > self.undo_max:
-            self.undo_stack.pop(0)
+        total = sum(len(s["pdf"]) for s in self.undo_stack)
+        while (len(self.undo_stack) > self.undo_max) or (total > self.undo_max_bytes and len(self.undo_stack) > 1):
+            dropped = self.undo_stack.pop(0)
+            total -= len(dropped["pdf"])
 
     def _undo(self):
         self.exit_crop_mode()
@@ -1844,6 +2438,7 @@ class ReviewTab(QWidget):
             else:
                 confirmed_company = original_company
             doc["confirmed_date"] = dt
+            doc["detected_date"] = dt
             doc["company_name"] = confirmed_company
             doc["reviewed"] = True
             doc["review_timestamp"] = str(datetime.now())
@@ -1852,6 +2447,7 @@ class ReviewTab(QWidget):
             result = finalize_single_document(doc, config)
             if result.get("success"):
                 self.pending_docs.pop(self.active_index)
+                self.all_flagged_docs = [d for d in self.all_flagged_docs if d is not doc]
                 self._save_flagged_updates()
                 self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
                 self.current_pdf_doc = None
@@ -1890,6 +2486,82 @@ class ReviewTab(QWidget):
                 self._session_changed()
             else:
                 QMessageBox.warning(self, "Finalize Failed", f"Could not save: {result.get('error', 'Unknown')}")
+
+        elif self.active_tab == "reviewed":
+            doc = self.reviewed_docs[self.active_index]
+            old_path = doc.get("original_path", "")
+            old_name = doc.get("original_filename", "")
+            if not old_path or not os.path.exists(old_path) or not old_name:
+                self.refresh_doc_list()
+                self._session_changed()
+                return
+
+            stem = os.path.splitext(old_name)[0]
+            parts = stem.split("_")
+            if len(parts) < 3 or not parts[0][:6].isdigit() or len(parts[0]) < 10:
+                QMessageBox.warning(self, "Cannot Rename", "This file name doesn't match the expected YYYYMM####_###_COMPANY format.")
+                return
+            old_ym = parts[0][:6]
+            seq = parts[0][6:10]
+            division = parts[1]
+            old_company = "_".join(parts[2:]).strip()
+
+            new_ym = dt.replace("-", "")[:6]
+            company_text = (company_text or "").strip()
+            if company_text:
+                from pipeline import sanitize_filename
+                new_company = sanitize_filename(normalize_company_name(company_text))
+            else:
+                new_company = old_company
+
+            new_name = f"{new_ym}{seq}_{division}_{new_company}.pdf"
+            if os.path.normcase(os.path.normpath(new_name)) == os.path.normcase(os.path.normpath(old_name)):
+                self.refresh_doc_list()
+                self._session_changed()
+                return
+
+            new_path = os.path.join(os.path.dirname(old_path), new_name)
+            if os.path.normcase(os.path.normpath(new_path)) != os.path.normcase(os.path.normpath(old_path)) and os.path.exists(new_path):
+                res = QMessageBox.question(
+                    self, "Replace File?",
+                    f"A file named '{new_name}' already exists.\nReplace it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if res != QMessageBox.StandardButton.Yes:
+                    return
+
+            if self.document_modified and self.current_pdf_doc:
+                try:
+                    doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
+                except Exception:
+                    pass
+            if self.current_pdf_doc:
+                try:
+                    self.current_pdf_doc.close()
+                except Exception:
+                    pass
+                self.current_pdf_doc = None
+
+            try:
+                os.replace(old_path, new_path)
+            except OSError as e:
+                QMessageBox.warning(self, "Rename Failed", f"Could not rename file:\n{e}")
+                return
+
+            doc["original_path"] = new_path
+            doc["original_filename"] = new_name
+            doc["detected_date"] = dt
+            if company_text:
+                doc["company_name"] = normalize_company_name(company_text)
+
+            self.active_index = -1
+            for lbl in self.page_labels:
+                lbl.deleteLater()
+            self.page_labels = []
+            self._show_toast(f"Renamed: {old_name}\n→ {new_name}")
+            self._start_reviewed_scan()
+            self._session_changed()
 
     def toggle_ocr_panel(self):
         if self.active_index < 0:
@@ -1968,22 +2640,224 @@ class ReviewTab(QWidget):
     def _show_document_menu(self, idx: int, global_pos: QPoint):
         if self.active_tab == "reviewed":
             return
+        if not hasattr(self, "selected_indices") or not self.selected_indices:
+            self.selected_indices = [idx]
+        elif idx not in self.selected_indices:
+            self.selected_indices = [idx]
+            self.active_index = idx
+            self.doc_list.setCurrentRow(idx)
+        self._update_cards_selection()
+
         menu = QMenu(self)
-        duplicate_act = QAction("Duplicate  (Ctrl+D)", self)
-        duplicate_act.triggered.connect(lambda: self._duplicate_document_at(idx))
-        menu.addAction(duplicate_act)
-        menu.addSeparator()
-        delete_act = QAction("Delete", self)
-        delete_act.triggered.connect(lambda: self._delete_document_at(idx))
-        menu.addAction(delete_act)
+        count = len(self.selected_indices)
+        if count > 1:
+            delete_act = QAction(f"Delete ({count} files)", self)
+            delete_act.triggered.connect(self._delete_selected_documents)
+            menu.addAction(delete_act)
+
+            merge_act = QAction(f"Merge ({count} files)", self)
+            merge_act.triggered.connect(self._merge_selected_documents)
+            menu.addAction(merge_act)
+
+            duplicate_act = QAction(f"Duplicate ({count} files)", self)
+            duplicate_act.triggered.connect(self._duplicate_selected_documents)
+            menu.addAction(duplicate_act)
+        else:
+            duplicate_act = QAction("Duplicate", self)
+            duplicate_act.triggered.connect(lambda: self._duplicate_document_at(idx))
+            menu.addAction(duplicate_act)
+            menu.addSeparator()
+            delete_act = QAction("Delete", self)
+            delete_act.triggered.connect(lambda: self._delete_document_at(idx))
+            menu.addAction(delete_act)
         menu.exec(global_pos)
 
-    def _duplicate_document_at(self, idx: int):
+    def _merge_selected_documents(self):
         if self.active_tab not in ("pending", "auto_confirmed"):
             return
         docs = self._get_current_docs()
-        if idx < 0 or idx >= len(docs):
+        valid_indices = [i for i in self.selected_indices if 0 <= i < len(docs)]
+        if len(valid_indices) < 2:
             return
+
+        selected_docs = [docs[i] for i in valid_indices]
+        first_doc = selected_docs[0]
+        first_name = first_doc.get("original_filename", "document.pdf")
+        count = len(selected_docs)
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Merge",
+            f"Merge {count} documents into '{first_name}'?\n\nAll pages will be combined in selection order. This can be undone with Ctrl+Z.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        # Snapshot for undo
+        undo_removed = []
+        for d in selected_docs[1:]:
+            if d in docs:
+                undo_removed.append((docs.index(d), dict(d)))
+        first_doc_orig = dict(first_doc)
+        if "_pending_pdf_bytes" in first_doc:
+            first_doc_orig["_pending_pdf_bytes"] = bytes(first_doc["_pending_pdf_bytes"])
+
+        try:
+            merged_pdf = fitz.open()
+            combined_blank = list(first_doc.get("blank_pages", []))
+            combined_docsep = list(first_doc.get("docsep_pages", []))
+            page_offset = 0
+
+            for i, doc in enumerate(selected_docs):
+                if doc.get("_pending_pdf_bytes"):
+                    src = fitz.open("pdf", doc["_pending_pdf_bytes"])
+                elif doc.get("original_path") and os.path.exists(doc.get("original_path")):
+                    src = fitz.open(doc["original_path"])
+                else:
+                    QMessageBox.warning(self, "Merge Error", f"Cannot access file for '{doc.get('original_filename', 'doc')}'")
+                    merged_pdf.close()
+                    return
+
+                if i > 0:
+                    for bp in doc.get("blank_pages", []):
+                        combined_blank.append(bp + page_offset)
+                    for dp in doc.get("docsep_pages", []):
+                        combined_docsep.append(dp + page_offset)
+
+                merged_pdf.insert_pdf(src)
+                page_offset += len(src)
+                src.close()
+
+            merged_bytes = merged_pdf.tobytes(garbage=4, deflate=True)
+            merged_pdf.close()
+
+            first_doc["_pending_pdf_bytes"] = merged_bytes
+            first_doc["blank_pages"] = sorted(list(set(combined_blank)))
+            first_doc["docsep_pages"] = sorted(list(set(combined_docsep)))
+
+            # Push to undo stack
+            self._doc_undo_stack.append({
+                "type": "merge",
+                "tab": self.active_tab,
+                "first_doc_ref": first_doc,
+                "first_doc_orig": first_doc_orig,
+                "removed_items": undo_removed,
+            })
+            if len(self._doc_undo_stack) > self._doc_undo_max:
+                self._doc_undo_stack.pop(0)
+
+            # Remove secondary docs
+            for d in selected_docs[1:]:
+                if d in docs:
+                    docs.remove(d)
+
+            # Save state
+            if self.active_tab == "pending":
+                self._save_flagged_updates()
+            else:
+                self._save_auto_confirmed_updates()
+
+            new_first_idx = docs.index(first_doc)
+            self.selected_indices = [new_first_idx]
+            self.active_index = new_first_idx
+            self.refresh_doc_list(select_row=new_first_idx)
+            self.load_document(first_doc)
+            self._session_changed()
+            self._show_toast(f"Merged {count} files into '{first_name}'")
+        except Exception as e:
+            QMessageBox.critical(self, "Merge Error", f"Failed to merge documents:\n{e}")
+
+    def _delete_selected_documents(self):
+        if self.active_tab not in ("pending", "auto_confirmed"):
+            return
+        docs = self._get_current_docs()
+        valid_indices = [i for i in self.selected_indices if 0 <= i < len(docs)]
+        if not valid_indices:
+            return
+
+        count = len(valid_indices)
+        if count == 1:
+            self._delete_document_at(valid_indices[0])
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Delete",
+            f"Delete {count} selected documents?\n\nThis can be undone with Ctrl+Z.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        docs_to_delete = [docs[i] for i in valid_indices]
+        undo_items = []
+        for d in docs_to_delete:
+            if d in docs:
+                undo_items.append((docs.index(d), dict(d)))
+
+        self._doc_undo_stack.append({
+            "type": "delete_multiple",
+            "tab": self.active_tab,
+            "items": undo_items,
+        })
+        if len(self._doc_undo_stack) > self._doc_undo_max:
+            self._doc_undo_stack.pop(0)
+
+        for d in docs_to_delete:
+            if d in docs:
+                docs.remove(d)
+
+        if self.active_tab == "pending":
+            self._save_flagged_updates()
+        else:
+            self._save_auto_confirmed_updates()
+
+        new_idx = min(valid_indices[0], len(docs) - 1) if docs else -1
+        self.selected_indices = [new_idx] if new_idx >= 0 else []
+        self.active_index = new_idx
+        self.refresh_doc_list(select_row=new_idx if new_idx >= 0 else None)
+        self._session_changed()
+        self._show_toast(f"Deleted {count} documents")
+
+    def _duplicate_selected_documents(self):
+        if self.active_tab not in ("pending", "auto_confirmed"):
+            return
+        docs = self._get_current_docs()
+        valid_indices = [i for i in self.selected_indices if 0 <= i < len(docs)]
+        if not valid_indices:
+            return
+        if len(valid_indices) == 1:
+            self._duplicate_document_at(valid_indices[0])
+            return
+
+        created_docs = []
+        # Duplicate in reverse index order so inserting doesn't shift earlier indices
+        for idx in sorted(valid_indices, reverse=True):
+            nd = self._duplicate_document_at(idx, record_undo=False)
+            if nd:
+                created_docs.append(nd)
+
+        if created_docs:
+            self._doc_undo_stack.append({
+                "type": "duplicate_multiple",
+                "tab": self.active_tab,
+                "docs": created_docs,
+                "prev_active_idx": valid_indices[0],
+            })
+            if len(self._doc_undo_stack) > self._doc_undo_max:
+                self._doc_undo_stack.pop(0)
+
+        self._show_toast(f"Duplicated {len(valid_indices)} documents")
+
+    def _duplicate_document_at(self, idx: int, record_undo: bool = True):
+        if self.active_tab not in ("pending", "auto_confirmed"):
+            return None
+        docs = self._get_current_docs()
+        if idx < 0 or idx >= len(docs):
+            return None
         original_doc = docs[idx]
         new_doc = dict(original_doc)
         new_doc["is_duplicate"] = True
@@ -2006,9 +2880,29 @@ class ReviewTab(QWidget):
         new_doc["duplicate_suffix"] = f"({counter})"
         insert_idx = idx + 1
         docs.insert(insert_idx, new_doc)
+
+        if self.active_tab == "pending":
+            if new_doc not in self.all_flagged_docs:
+                af_idx = self.all_flagged_docs.index(original_doc) if original_doc in self.all_flagged_docs else len(self.all_flagged_docs)
+                self.all_flagged_docs.insert(af_idx + 1, new_doc)
+            self._save_flagged_updates()
+        else:
+            self._save_auto_confirmed_updates()
+
+        if record_undo:
+            self._doc_undo_stack.append({
+                "type": "duplicate_single",
+                "tab": self.active_tab,
+                "doc": new_doc,
+                "prev_active_idx": idx,
+            })
+            if len(self._doc_undo_stack) > self._doc_undo_max:
+                self._doc_undo_stack.pop(0)
+
         self.active_index = insert_idx
         self.refresh_doc_list(select_row=insert_idx)
         self._session_changed()
+        return new_doc
 
     def _duplicate_current_document(self):
         if self.active_tab == "reviewed":
@@ -2050,20 +2944,104 @@ class ReviewTab(QWidget):
         if not self._doc_undo_stack:
             return
         action = self._doc_undo_stack.pop()
+        action_type = action.get("type", "delete_single")
         tab = action["tab"]
-        idx = action["idx"]
-        doc = action["doc"]
+
+        if action_type == "duplicate_reviewed":
+            paths = action.get("paths", [])
+            removed = 0
+            for p in paths:
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                        removed += 1
+                except Exception as e:
+                    print(f"Could not remove duplicated file {p}: {e}")
+            self._show_toast(f"Undid duplication ({removed} file{'s' if removed != 1 else ''} removed)")
+            self._start_reviewed_scan()
+            return
+
+        docs = self.pending_docs if tab == "pending" else self.auto_confirmed_docs
+
+        if action_type == "duplicate_single":
+            doc_to_remove = action["doc"]
+            if doc_to_remove in docs:
+                docs.remove(doc_to_remove)
+            if tab == "pending" and doc_to_remove in self.all_flagged_docs:
+                self.all_flagged_docs.remove(doc_to_remove)
+            if tab == "pending":
+                self._save_flagged_updates()
+            else:
+                self._save_auto_confirmed_updates()
+            prev_idx = action.get("prev_active_idx", 0)
+            new_idx = min(max(0, prev_idx), len(docs) - 1) if docs else -1
+            self.selected_indices = [new_idx] if new_idx >= 0 else []
+            self.active_index = new_idx
+            self.refresh_doc_list(select_row=new_idx if new_idx >= 0 else None)
+            self._session_changed()
+            self._show_toast("Undid duplicate")
+            return
+        elif action_type == "duplicate_multiple":
+            docs_to_remove = action.get("docs", [])
+            for d in docs_to_remove:
+                if d in docs:
+                    docs.remove(d)
+                if tab == "pending" and d in self.all_flagged_docs:
+                    self.all_flagged_docs.remove(d)
+            if tab == "pending":
+                self._save_flagged_updates()
+            else:
+                self._save_auto_confirmed_updates()
+            prev_idx = action.get("prev_active_idx", 0)
+            new_idx = min(max(0, prev_idx), len(docs) - 1) if docs else -1
+            self.selected_indices = [new_idx] if new_idx >= 0 else []
+            self.active_index = new_idx
+            self.refresh_doc_list(select_row=new_idx if new_idx >= 0 else None)
+            self._session_changed()
+            self._show_toast(f"Undid duplication ({len(docs_to_remove)} duplicates removed)")
+            return
+        elif action_type == "merge":
+            first_doc_orig = action["first_doc_orig"]
+            removed_items = action["removed_items"]
+            # Restore first doc
+            first_doc = action["first_doc_ref"]
+            first_doc.clear()
+            first_doc.update(first_doc_orig)
+            # Restore removed items in sorted index order
+            for orig_idx, d in sorted(removed_items, key=lambda x: x[0]):
+                insert_pos = min(orig_idx, len(docs))
+                docs.insert(insert_pos, d)
+            idx = docs.index(first_doc) if first_doc in docs else 0
+        elif action_type == "delete_multiple":
+            items = action["items"]
+            for orig_idx, d in sorted(items, key=lambda x: x[0]):
+                insert_pos = min(orig_idx, len(docs))
+                docs.insert(insert_pos, d)
+            idx = items[0][0] if items else 0
+            idx = min(idx, len(docs) - 1)
+        else:
+            idx = action["idx"]
+            doc = action["doc"]
+            docs.insert(idx, doc)
+
         if tab == "pending":
-            self.pending_docs.insert(idx, doc)
-        elif tab == "auto_confirmed":
-            self.auto_confirmed_docs.insert(idx, doc)
+            self._save_flagged_updates()
+        else:
+            self._save_auto_confirmed_updates()
+
+        self.selected_indices = [idx]
         self.active_index = idx
         self.refresh_doc_list(select_row=idx)
         self._session_changed()
+        self._show_toast("Undo successful")
 
     def _on_enter_key(self):
         focus = self.focusWidget()
-        if focus in (self.company_input, self.month_combo, self.year_spin) or isinstance(focus, QPushButton):
+        if focus in (self.company_input, self.month_combo, self.year_spin):
+            self.confirm_btn.click()
+            return
+        if self._crop_mode:
+            self.apply_crop()
             return
         if self._sort_mode:
             self._apply_sort()
@@ -2072,6 +3050,93 @@ class ReviewTab(QWidget):
             self._finalize_current_and_advance()
         elif self.active_tab == "reviewed" and self.document_modified and self.current_pdf_doc and self.active_index >= 0:
             self._save_reviewed_overwrite()
+
+    def _is_editing_focus(self) -> bool:
+        f = self.focusWidget()
+        return f in (self.company_input, self.month_combo, self.year_spin)
+
+    def _valid_current_page(self) -> bool:
+        return bool(self.current_pdf_doc) and (not self._crop_mode) and 0 <= self.selected_page < len(self.current_pdf_doc)
+
+    def _select_page(self, page_num):
+        if page_num < 0 or not self.current_pdf_doc or page_num >= len(self.current_pdf_doc):
+            return
+        old = self.selected_page
+        self.selected_page = page_num
+        self.current_page = page_num
+        if self._sort_mode:
+            return
+        if old != page_num:
+            self._update_page_selection_borders()
+
+    def _shortcut_rotate_left(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        self._rotate_page(self.selected_page, -90)
+
+    def _shortcut_rotate_right(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        self._rotate_page(self.selected_page, 90)
+
+    def _shortcut_flip_h(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        self._flip_page(self.selected_page, "h")
+
+    def _shortcut_flip_v(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        self._flip_page(self.selected_page, "v")
+
+    def _shortcut_delete_page(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        if self._sort_mode:
+            return
+        self._delete_page(self.selected_page)
+
+    def _shortcut_enhance(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        self._enhance_page(self.selected_page)
+
+    def _shortcut_crop(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        self.enter_crop_mode(self.selected_page)
+
+    def _shortcut_mark_blank(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        self._mark_blank(self.selected_page)
+
+    def _shortcut_remove_mark(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        self._remove_mark(self.selected_page)
+
+    def _shortcut_delete_doc(self):
+        if self._is_editing_focus() or self._crop_mode:
+            return
+        if self.active_tab == "reviewed":
+            if 0 <= self.active_index < len(self.reviewed_docs):
+                self._delete_reviewed_at(self.active_index)
+        elif self.active_index >= 0:
+            self._delete_document_at(self.active_index)
+
+    def _shortcut_merge(self):
+        if self._is_editing_focus() or self._crop_mode:
+            return
+        if self.active_tab == "reviewed":
+            self._merge_selected_reviewed()
+        else:
+            self._merge_selected_documents()
+
+    def _shortcut_insert(self):
+        if self._is_editing_focus() or not self._valid_current_page():
+            return
+        self._insert_image_page(self.selected_page, "after")
 
     def _finalize_current_and_advance(self):
         if self.active_tab not in ("pending", "auto_confirmed"):
@@ -2086,6 +3151,15 @@ class ReviewTab(QWidget):
         config = self._pipeline_config()
         doc = docs[self.active_index]
 
+        dt = self._get_date_from_widgets()
+        company_text = self._get_company_from_widgets()
+        if dt:
+            doc["detected_date"] = dt
+            doc["confirmed_date"] = dt
+        original_company = doc.get("company_name", "")
+        if company_text and company_text != original_company:
+            doc["company_name"] = normalize_company_name(company_text)
+
         if self.document_modified and self.current_pdf_doc:
             doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
 
@@ -2097,6 +3171,7 @@ class ReviewTab(QWidget):
         if self.active_tab == "pending":
             doc["reviewed"] = True
             self.pending_docs.pop(self.active_index)
+            self.all_flagged_docs = [d for d in self.all_flagged_docs if d is not doc]
             self._save_flagged_updates()
         else:
             self.auto_confirmed_docs.pop(self.active_index)
@@ -2154,6 +3229,45 @@ class ReviewTab(QWidget):
             QMessageBox.information(self, "Confirm All", f"All {done} documents finalized and moved to the output folder.")
         self.refresh_doc_list()
         self._session_changed()
+
+    def apply_theme(self, theme_name: str):
+        p = get_palette_dict(theme_name)
+        self.reviewed_tree.setStyleSheet(f"""
+            QTreeWidget {{
+                background-color: {p['bg_tree']};
+                border: 1px solid {p['border']};
+                border-radius: 6px;
+                font-family: 'Segoe UI';
+                font-size: 9pt;
+                color: {p['text_main']};
+            }}
+            QTreeWidget::item {{
+                padding: 2px 4px;
+            }}
+            QTreeWidget::item:selected {{
+                background-color: {p['bg_tree_selected']};
+                color: {p['text_accent']};
+            }}
+            QTreeWidget::item:hover {{
+                background-color: {p['bg_tree_hover']};
+            }}
+        """)
+        self.preview_scroll.setStyleSheet(f"QScrollArea {{ background-color: {p['bg_preview_scroll']}; border: 1px solid {p['border']}; border-radius: 6px; }}")
+        self.preview_container.setStyleSheet(f"background-color: {p['bg_preview_scroll']};")
+        self.preview_placeholder.setStyleSheet(f"color: {p['text_placeholder']}; font-size: 12pt; font-weight: 500;")
+        self.page_label.setStyleSheet(f"color: {p['text_secondary']}; font-weight: 600; font-size: 8.5pt;")
+        self.count_label.setStyleSheet(f"color: {p['text_secondary']}; font-weight: 600; font-size: 8.5pt;")
+        self.doc_nav_label.setStyleSheet(f"color: {p['text_secondary']}; font-weight: 600; font-size: 8.5pt;")
+        if hasattr(self, "sep1"):
+            self.sep1.setStyleSheet(f"color: {p['border_input']}; padding: 0 4px;")
+        if hasattr(self, "sep2"):
+            self.sep2.setStyleSheet(f"color: {p['border_input']}; padding: 0 4px;")
+        if hasattr(self, "month_combo"):
+            self.month_combo.view().setStyleSheet(get_combobox_popup_style(theme_name))
+
+        # Refresh cards with new theme
+        self.refresh_doc_list(select_row=self.active_index if self.active_index >= 0 else 0)
+        self.render_preview()
 
     def _show_toast(self, message: str):
         if self._toast is None:

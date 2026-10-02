@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import json
 import time
@@ -9,7 +9,7 @@ import fitz
 from pathlib import Path
 from typing import Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date as _date
+from datetime import date, datetime
 
 from PyQt6.QtWidgets import QWidget, QFrame, QHBoxLayout, QVBoxLayout, QLabel
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
@@ -22,6 +22,7 @@ from date_extractor import extract_document_date, DateResult
 from pipeline import PipelineConfig, parse_folder_structure, save_confirmed_documents
 from auto_qc import run_qc_on_pdf, detect_docsep_flag
 from company_extractor import get_company_name_for_filename
+from .styles import get_palette_dict, THEME_DARK
 
 import pytesseract
 
@@ -45,9 +46,15 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
         company_name = doc_info["company_name"]
 
         docsep_msg = ""
+        _shared_doc = None
+        try:
+            _shared_doc = fitz.open(original_path)
+        except Exception:
+            pass
+
         if config.get("enable_docsep_removal", True):
             try:
-                ds_result = detect_docsep_flag(original_path, dpi=render_dpi)
+                ds_result = detect_docsep_flag(original_path, dpi=render_dpi, doc=_shared_doc)
                 result["docsep_pages"] = ds_result.get("docsep_pages", [])
                 if result["docsep_pages"]:
                     docsep_msg = f" | docsep:{len(result['docsep_pages'])}"
@@ -56,17 +63,17 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 pass
 
         page_index = config.get("page_index", 0)
-        date_result = extract_document_date(original_path, page_index, dpi=render_dpi)
+        date_result = extract_document_date(original_path, page_index, dpi=render_dpi, doc=_shared_doc, docsep_pages=result.get("docsep_pages", []))
         result["blank_pages"] = list(date_result.blank_pages or [])
 
         total_pages = 0
         if result["blank_pages"]:
             pdf_for_ocr = None
             try:
-                pdf_for_ocr = fitz.open(original_path)
+                pdf_for_ocr = fitz.open(original_path) if _shared_doc is None else _shared_doc
                 total_pages = len(pdf_for_ocr)
                 for blank_pg in list(result["blank_pages"]):
-                    if blank_pg >= len(pdf_for_ocr):
+                    if blank_pg >= total_pages:
                         continue
                     pg = pdf_for_ocr[blank_pg]
                     pix = pg.get_pixmap(dpi=render_dpi)
@@ -86,11 +93,19 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
             except Exception as e:
                 result["log_messages"].append(f"[BLANK-OCR-ERROR] {original_filename}: {e}")
             finally:
-                if pdf_for_ocr:
+                if pdf_for_ocr and _shared_doc is None:
                     try:
                         pdf_for_ocr.close()
                     except Exception:
                         pass
+        elif _shared_doc is not None:
+            total_pages = len(_shared_doc)
+        else:
+            try:
+                with fitz.open(original_path) as _tmp:
+                    total_pages = len(_tmp)
+            except Exception:
+                total_pages = 0
 
         result["total_pages"] = total_pages
 
@@ -106,10 +121,10 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                     original_path,
                     blank_threshold=config.get("qc_blank_threshold", 1.5),
                     rotation_threshold=config.get("qc_rotation_threshold", 65),
-                    mirror_threshold=config.get("qc_mirror_threshold", 15),
                     dpi=render_dpi,
                     use_gpu=use_gpu,
                     gpu_mode=gpu_mode,
+                    doc=_shared_doc,
                 )
             except Exception:
                 pass
@@ -125,96 +140,59 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
 
         blank_str = f" | {len(result['blank_pages'])}/{total_pages} blank" if result["blank_pages"] else ""
 
-        page_ocr_data_list = []
-        for idx, page_text in enumerate(date_result.page_texts):
-            page_ocr_data_list.append({
-                'page_text': page_text,
-                'page_idx': idx,
-            })
-        company_result = get_company_name_for_filename(page_ocr_data_list, company_name)
-        final_company = company_result['company_name']
+        # Extract native PDF page texts for accurate company extraction
+        try:
+            if _shared_doc is not None:
+                page_texts = [{"page_text": _shared_doc[i].get_text().strip(), "page_idx": i} for i in range(len(_shared_doc))]
+            else:
+                with fitz.open(original_path) as _d:
+                    page_texts = [{"page_text": _d[i].get_text().strip(), "page_idx": i} for i in range(len(_d))]
+        except Exception:
+            page_texts = [{"page_text": t, "page_idx": i} for i, t in enumerate(date_result.page_texts)]
 
-        if date_result.all_blank:
-            result["status"] = "flagged"
-            result["flagged_data"] = {
+        company_result = get_company_name_for_filename(page_texts, company_name)
+        final_company = company_result.get('company_name', company_name)
+        company_confidence = company_result.get('company_confidence', 0)
+        company_tier = company_result.get('tier_used', '')
+
+        # Triple-check Auto-Confirm Gate: Date >= 90%, Company >= 90%, Valid Date, and QC passed
+        earliest_year = config.get("earliest_year", 1950)
+        date_valid = bool(date_result.date and date_result.date.year >= earliest_year and date_result.date <= date.today())
+        date_conf_pass = date_result.confidence >= 90
+        company_conf_pass = company_confidence >= 90
+        qc_passed = not qc_failed
+
+        is_auto_confirmed = (not date_result.all_blank) and date_valid and date_conf_pass and company_conf_pass and qc_passed
+
+        if is_auto_confirmed:
+            result["status"] = "confirmed"
+            result["passed_data"] = {
                 "original_path": original_path,
                 "division_code": division_code,
                 "company_name": final_company,
+                "company_confidence": company_confidence,
+                "company_tier": company_tier,
                 "original_filename": original_filename,
-                "error": "Document is entirely blank",
+                "detected_date": date_result.date.isoformat(),
+                "confidence": date_result.confidence,
+                "method": date_result.method,
                 "blank_pages": result["blank_pages"],
-                "all_blank": True,
                 "docsep_pages": result["docsep_pages"],
-                "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
+                "raw_ocr_text": date_result.raw_ocr_text,
+                "company_source": company_tier,
             }
             if qc_result:
-                result["flagged_data"]["qc"] = qc_result
-            result["log_messages"].append(f"[BLANK] {original_filename}: ALL BLANK ({total_pages} pages){qc_str}{docsep_msg}")
-        elif date_result.confidence >= config.get("confidence_threshold", 70) and date_result.date:
-            company_known = (not company_result.get('needs_review', False)
-                             and company_result.get('confidence_label') in ('high', 'medium'))
-            if qc_failed:
-                result["status"] = "flagged"
-                result["flagged_data"] = {
-                    "original_path": original_path,
-                    "division_code": division_code,
-                    "company_name": final_company,
-                    "original_filename": original_filename,
-                    "best_guess_date": date_result.date.isoformat() if date_result.date else None,
-                    "confidence": date_result.confidence,
-                    "method": date_result.method,
-                    "raw_ocr_text": date_result.raw_ocr_text,
-                    "blank_pages": result["blank_pages"],
-                    "docsep_pages": result["docsep_pages"],
-                    "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
-                }
-                if qc_result:
-                    result["flagged_data"]["qc"] = qc_result
-                result["log_messages"].append(f"[FLAGGED] {original_filename} ({date_result.confidence}%){blank_str}{qc_str}{docsep_msg}")
-            elif not company_known:
-                result["status"] = "flagged"
-                result["flagged_data"] = {
-                    "original_path": original_path,
-                    "division_code": division_code,
-                    "company_name": final_company,
-                    "original_filename": original_filename,
-                    "best_guess_date": date_result.date.isoformat() if date_result.date else None,
-                    "confidence": date_result.confidence,
-                    "method": date_result.method,
-                    "raw_ocr_text": date_result.raw_ocr_text,
-                    "blank_pages": result["blank_pages"],
-                    "docsep_pages": result["docsep_pages"],
-                    "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
-                    "company_needs_review": True,
-                }
-                if qc_result:
-                    result["flagged_data"]["qc"] = qc_result
-                result["log_messages"].append(f"[FLAGGED-COMPANY] {original_filename} company='{final_company}' tier={company_result.get('tier_used', 'unknown')}")
-            else:
-                result["status"] = "confirmed"
-                result["passed_data"] = {
-                    "original_path": original_path,
-                    "division_code": division_code,
-                    "company_name": final_company,
-                    "original_filename": original_filename,
-                    "detected_date": date_result.date.isoformat(),
-                    "confidence": date_result.confidence,
-                    "method": "auto",
-                    "blank_pages": result["blank_pages"],
-                    "docsep_pages": result["docsep_pages"],
-                    "raw_ocr_text": date_result.raw_ocr_text,
-                    "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
-                }
-                if qc_result:
-                    result["passed_data"]["qc_status"] = qc_result.get("qc_status", "")
-                    result["passed_data"]["qc_failure_reasons"] = qc_result.get("qc_failure_reasons", "")
-                result["log_messages"].append(f"[AUTO] {original_filename} -> {date_result.date} ({date_result.confidence}%){blank_str}{qc_str}{docsep_msg}")
+                result["passed_data"]["qc_status"] = qc_result.get("qc_status", "")
+                result["passed_data"]["qc_failure_reasons"] = qc_result.get("qc_failure_reasons", "")
+            result["log_messages"].append(f"[AUTO] {original_filename} -> {date_result.date} ({date_result.confidence}%) | {final_company} ({company_confidence}%){blank_str}{qc_str}{docsep_msg}")
         else:
             result["status"] = "flagged"
             result["flagged_data"] = {
                 "original_path": original_path,
                 "division_code": division_code,
                 "company_name": final_company,
+                "company_confidence": company_confidence,
+                "company_tier": company_tier,
                 "original_filename": original_filename,
                 "best_guess_date": date_result.date.isoformat() if date_result.date else None,
                 "confidence": date_result.confidence,
@@ -222,16 +200,46 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 "raw_ocr_text": date_result.raw_ocr_text,
                 "blank_pages": result["blank_pages"],
                 "docsep_pages": result["docsep_pages"],
-                "company_source": company_result.get('tier_used', company_result.get('source', 'unknown')),
+                "all_blank": date_result.all_blank,
+                "error": "Document is entirely blank" if date_result.all_blank else "",
+                "company_source": company_tier,
+                "company_needs_review": company_confidence < 90,
             }
             if qc_result:
                 result["flagged_data"]["qc"] = qc_result
-            result["log_messages"].append(f"[FLAGGED] {original_filename} ({date_result.confidence}%){blank_str}{qc_str}{docsep_msg}")
+
+            if date_result.all_blank:
+                result["log_messages"].append(f"[BLANK] {original_filename}: ALL BLANK ({total_pages} pages){qc_str}{docsep_msg}")
+            elif not company_conf_pass:
+                result["log_messages"].append(f"[FLAGGED-COMPANY] {original_filename} company='{final_company}' ({company_confidence}%) tier={company_tier}")
+            else:
+                result["log_messages"].append(f"[FLAGGED] {original_filename} ({date_result.confidence}%){blank_str}{qc_str}{docsep_msg}")
     except Exception as e:
         result["status"] = "error"
         result["log_messages"].append(f"[ERROR] {doc_info['original_filename']}: {e}")
 
+    if _shared_doc is not None:
+        try:
+            _shared_doc.close()
+        except Exception:
+            pass
+
     return result
+
+
+def _json_safe_flagged(flagged):
+    """Return a copy of flagged result docs with non-JSON-serializable values
+    (e.g. '_pending_pdf_bytes' as raw bytes) removed so the merged flagged
+    index can always be written without raising during json.dump."""
+    safe = []
+    for item in flagged:
+        if not isinstance(item, dict):
+            safe.append(item)
+            continue
+        copy = dict(item)
+        copy.pop("_pending_pdf_bytes", None)
+        safe.append(copy)
+    return safe
 
 
 class PipelineThread(QThread):
@@ -281,9 +289,9 @@ class PipelineThread(QThread):
             pipeline_config.rename_enabled = self.config.get("rename_enabled", True)
             pipeline_config.audit_enabled = self.config.get("audit_enabled", True)
 
-            render_dpi = self.config.get("render_dpi", 150)
+            render_dpi = self.config.get("render_dpi", 200)
             pipeline_config.render_dpi = render_dpi
-            max_workers = self.config.get("max_workers", 4)
+            max_workers = self.config.get("max_workers", 1)
             batch_size = self.config.get("batch_size", 50)
 
             flagged_root = Path(self.config["flagged_root"])
@@ -408,9 +416,13 @@ class PipelineThread(QThread):
                         doc.status = status
                         if status == "flagged" and worker_result.get("flagged_data"):
                             doc.flagged_data = worker_result["flagged_data"]
+                            doc.company_name = worker_result["flagged_data"].get("company_name", doc.company_name)
+                            doc.company_confidence = worker_result["flagged_data"].get("company_confidence", 0)
                         elif status == "confirmed" and worker_result.get("passed_data"):
                             doc.confirmed_date = passed_data.get("detected_date")
                             doc.confirmed_method = passed_data.get("method", "auto")
+                            doc.company_name = passed_data.get("company_name", doc.company_name)
+                            doc.company_confidence = passed_data.get("company_confidence", 100)
                             doc.flagged_data = None
                         else:
                             doc.flagged_data = None
@@ -448,15 +460,18 @@ class PipelineThread(QThread):
                 errors = sum(1 for b in batches for d in b.documents if d.status == "error")
             blank_docs = 0
 
-            if self.plan is not None:
-                if new_flagged:
-                    self.progress.emit("Writing flagged index...", 95)
-                self._write_merged_indexes(pipeline_config, flagged)
-            else:
-                flagged_root.mkdir(parents=True, exist_ok=True)
-                with open(flagged_root / "flagged_index.json", "w", encoding="utf-8") as f:
-                    json.dump(flagged, f, indent=2, ensure_ascii=False)
-                save_confirmed_documents(batches, pipeline_config)
+            try:
+                if self.plan is not None:
+                    if new_flagged:
+                        self.progress.emit("Writing flagged index...", 95)
+                    self._write_merged_indexes(pipeline_config, flagged)
+                else:
+                    flagged_root.mkdir(parents=True, exist_ok=True)
+                    with open(flagged_root / "flagged_index.json", "w", encoding="utf-8") as f:
+                        json.dump(_json_safe_flagged(flagged), f, indent=2, ensure_ascii=False)
+                    save_confirmed_documents(batches, pipeline_config)
+            except Exception as e:
+                self.log_message.emit(f"[WARN] Failed to write result indexes: {e}")
 
             summary = f"--- Done: {confirmed_count} confirmed, {flagged_count} flagged, {errors} errors"
             summary += " ---"
@@ -475,19 +490,22 @@ class PipelineThread(QThread):
         flagged_root = Path(config.flagged_root)
         flagged_root.mkdir(parents=True, exist_ok=True)
         with open(flagged_root / "flagged_index.json", "w", encoding="utf-8") as f:
-            json.dump(flagged, f, indent=2, ensure_ascii=False)
+            json.dump(_json_safe_flagged(flagged), f, indent=2, ensure_ascii=False)
 
 
 class DocCardWidget(QFrame):
-    clicked = pyqtSignal(int)
+    clicked = pyqtSignal(int, object)
     contextMenuRequested = pyqtSignal(int, object)
 
-    def __init__(self, doc: Dict, idx: int, parent=None):
+    def __init__(self, doc: Dict, idx: int, theme: str = THEME_DARK, parent=None):
         super().__init__(parent)
         self.idx = idx
         self.doc = doc
+        self.theme = theme
         self._selected = False
         self._is_duplicate = doc.get("is_duplicate", False)
+
+        p = get_palette_dict(self.theme)
 
         self.setFixedHeight(58)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -513,71 +531,85 @@ class DocCardWidget(QFrame):
         top_row = QHBoxLayout()
         name_label = QLabel(name)
         name_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        name_label.setStyleSheet("background: transparent; color: #ffffff;")
+        name_label.setStyleSheet(f"background: transparent; color: {p['card_title_color']};")
         if self._is_duplicate:
-            name_label.setStyleSheet("background: transparent; color: #00bcd4; text-decoration: underline;")
+            name_label.setStyleSheet(f"background: transparent; color: {p['card_dup_title']}; text-decoration: underline;")
+        self.name_label = name_label
         top_row.addWidget(name_label)
         top_row.addStretch()
 
         if self._is_duplicate:
             dup_label = QLabel("(Duplicate)")
             dup_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            dup_label.setStyleSheet("background: transparent; color: #00bcd4;")
+            dup_label.setStyleSheet(f"background: transparent; color: {p['card_dup_title']};")
             top_row.addWidget(dup_label)
 
         if blank_pages:
             blank_label = QLabel(f"{len(blank_pages)} blank")
             blank_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            blank_label.setStyleSheet("background: transparent; color: #ff9800;")
+            blank_label.setStyleSheet(f"background: transparent; color: {p['status_todo']};")
             top_row.addWidget(blank_label)
 
         docsep_pages = doc.get("docsep_pages", [])
         if docsep_pages:
             docsep_label = QLabel(f"{len(docsep_pages)} DOCSEP")
             docsep_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            docsep_label.setStyleSheet("background: transparent; color: #ffab00;")
+            docsep_label.setStyleSheet(f"background: transparent; color: {p['status_warn']};")
             top_row.addWidget(docsep_label)
 
         status_label = QLabel(status)
         status_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-        status_color = "#4caf50" if status == "DONE" else "#ff9800"
+        status_color = p["status_done"] if status == "DONE" else p["status_todo"]
         status_label.setStyleSheet(f"background: transparent; color: {status_color};")
         top_row.addWidget(status_label)
         info_layout.addLayout(top_row)
 
         bottom_row = QHBoxLayout()
         div_label = QLabel(f"Div: {div}")
-        div_label.setFont(QFont("Segoe UI", 8))
-        div_label.setStyleSheet("background: transparent; color: #8888aa;")
+        div_label.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        div_label.setStyleSheet(f"background: transparent; color: {p['text_secondary']};")
+        self.div_label = div_label
         bottom_row.addWidget(div_label)
         conf_label = QLabel(f"Conf: {conf}%")
-        conf_label.setFont(QFont("Segoe UI", 8))
-        conf_label.setStyleSheet("background: transparent; color: #8888aa;")
+        conf_label.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        conf_label.setStyleSheet(f"background: transparent; color: {p['text_secondary']};")
+        self.conf_label = conf_label
         bottom_row.addWidget(conf_label)
 
         if qc_status == "failed":
             qc_reasons = qc.get("qc_failure_reasons", "")
             qc_label = QLabel(f"QC: {qc_reasons[:30]}")
             qc_label.setFont(QFont("Segoe UI", 7))
-            qc_label.setStyleSheet("background: transparent; color: #ff7043;")
+            qc_label.setStyleSheet(f"background: transparent; color: {p['status_bad']};")
             bottom_row.addWidget(qc_label)
         elif qc_status == "needs_review":
             qc_label = QLabel("QC: ?")
             qc_label.setFont(QFont("Segoe UI", 7))
-            qc_label.setStyleSheet("background: transparent; color: #ffa726;")
+            qc_label.setStyleSheet(f"background: transparent; color: {p['status_warn']};")
             bottom_row.addWidget(qc_label)
 
         if doc.get("company_needs_review"):
             company_name = doc.get("company_name", "")
             company_label = QLabel(company_name)
             company_label.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
-            company_label.setStyleSheet("background: transparent; color: #ff4444;")
+            company_label.setStyleSheet(f"background: transparent; color: {p['status_bad']};")
             bottom_row.addWidget(company_label)
 
         bottom_row.addStretch()
         info_layout.addLayout(bottom_row)
 
         layout.addLayout(info_layout)
+
+    def set_theme(self, theme: str):
+        self.theme = theme
+        p = get_palette_dict(theme)
+        if hasattr(self, "name_label"):
+            self.name_label.setStyleSheet(f"background: transparent; color: {p['card_dup_title'] if self._is_duplicate else p['card_title_color']};{' text-decoration: underline;' if self._is_duplicate else ''}")
+        if hasattr(self, "div_label"):
+            self.div_label.setStyleSheet(f"background: transparent; color: {p['text_secondary']};")
+        if hasattr(self, "conf_label"):
+            self.conf_label.setStyleSheet(f"background: transparent; color: {p['text_secondary']};")
+        self.setStyleSheet(self._get_style("selected" if self._selected else ("reviewed" if self.doc.get("reviewed") else ("duplicate" if self._is_duplicate else "normal"))))
 
     def set_selected(self, selected: bool):
         self._selected = selected
@@ -596,63 +628,67 @@ class DocCardWidget(QFrame):
         self.setStyleSheet(self._get_style("duplicate" if is_duplicate else ("normal" if not self._selected else "selected")))
 
     def _get_style(self, state: str) -> str:
+        p = get_palette_dict(self.theme)
         if state == "selected":
-            return """
-                QFrame {
-                    background-color: #2a4a7a;
-                    border: 1px solid #4a6fa5;
+            return f"""
+                QFrame {{
+                    background-color: {p['bg_card_selected']};
+                    border: 1px solid {p['card_border_selected']};
                     border-radius: 8px;
-                }
+                }}
             """
         elif state == "reviewed":
-            return """
-                QFrame {
-                    background-color: #1a3a2a;
-                    border: 1px solid #2d6a3f;
+            return f"""
+                QFrame {{
+                    background-color: {p['bg_card_reviewed']};
+                    border: 1px solid {p['card_border_reviewed']};
                     border-radius: 8px;
-                }
+                }}
             """
         elif state == "duplicate":
-            return """
-                QFrame {
-                    background-color: #1a3a4a;
-                    border: 1px solid #00bcd4;
+            return f"""
+                QFrame {{
+                    background-color: {p['bg_card_duplicate']};
+                    border: 1px solid {p['card_border_duplicate']};
                     border-radius: 8px;
-                }
-                QFrame:hover {
-                    background-color: #1e4555;
-                    border: 1px solid #26c6da;
-                }
+                }}
+                QFrame:hover {{
+                    border: 1px solid {p['card_border_duplicate']};
+                }}
             """
         else:
-            return """
-                QFrame {
-                    background-color: #252640;
-                    border: 1px solid #3a3b55;
+            return f"""
+                QFrame {{
+                    background-color: {p['bg_card']};
+                    border: 1px solid {p['card_border_normal']};
                     border-radius: 8px;
-                }
-                QFrame:hover {
-                    background-color: #2d3055;
-                    border: 1px solid #4a4b65;
-                }
+                }}
+                QFrame:hover {{
+                    background-color: {p['bg_card_hover']};
+                    border: 1px solid {p['border_focus']};
+                }}
             """
 
     def mousePressEvent(self, event):
-        self.clicked.emit(self.idx)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.idx, event.modifiers())
         super().mousePressEvent(event)
 
 
 class PassedDocCardWidget(QFrame):
-    clicked = pyqtSignal(int)
+    clicked = pyqtSignal(int, object)
     contextMenuRequested = pyqtSignal(int, object)
 
-    def __init__(self, doc: Dict, idx: int, parent=None):
+    def __init__(self, doc: Dict, idx: int, theme: str = THEME_DARK, parent=None):
         super().__init__(parent)
         self.idx = idx
         self.doc = doc
+        self.theme = theme
         self._selected = False
         self._reviewed = False
         self._is_duplicate = doc.get("is_duplicate", False)
+
+        p = get_palette_dict(self.theme)
 
         self.setFixedHeight(58)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -678,29 +714,30 @@ class PassedDocCardWidget(QFrame):
         top_row = QHBoxLayout()
         name_label = QLabel(name)
         name_label.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        name_label.setStyleSheet("background: transparent; color: #ffffff;")
+        name_label.setStyleSheet(f"background: transparent; color: {p['card_title_color']};")
         if self._is_duplicate:
-            name_label.setStyleSheet("background: transparent; color: #00bcd4; text-decoration: underline;")
+            name_label.setStyleSheet(f"background: transparent; color: {p['card_dup_title']}; text-decoration: underline;")
+        self.name_label = name_label
         top_row.addWidget(name_label)
         top_row.addStretch()
 
         if self._is_duplicate:
             dup_label = QLabel("(Duplicate)")
             dup_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            dup_label.setStyleSheet("background: transparent; color: #00bcd4;")
+            dup_label.setStyleSheet(f"background: transparent; color: {p['card_dup_title']};")
             top_row.addWidget(dup_label)
 
         if blank_pages:
             blank_label = QLabel(f"{len(blank_pages)} blank")
             blank_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            blank_label.setStyleSheet("background: transparent; color: #ff9800;")
+            blank_label.setStyleSheet(f"background: transparent; color: {p['status_todo']};")
             top_row.addWidget(blank_label)
 
         docsep_pages = doc.get("docsep_pages", [])
         if docsep_pages:
             docsep_label = QLabel(f"{len(docsep_pages)} DOCSEP")
             docsep_label.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-            docsep_label.setStyleSheet("background: transparent; color: #ffab00;")
+            docsep_label.setStyleSheet(f"background: transparent; color: {p['status_warn']};")
             top_row.addWidget(docsep_label)
 
         top_row.addStretch()
@@ -708,24 +745,37 @@ class PassedDocCardWidget(QFrame):
 
         bottom_row = QHBoxLayout()
         date_label = QLabel(f"Date: {detected_date}")
-        date_label.setFont(QFont("Segoe UI", 8))
-        date_label.setStyleSheet("background: transparent; color: #88cc88;")
+        date_label.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        date_label.setStyleSheet(f"background: transparent; color: {p['status_done']};")
+        self.date_label = date_label
         bottom_row.addWidget(date_label)
         conf_label = QLabel(f"Conf: {confidence}%")
-        conf_label.setFont(QFont("Segoe UI", 8))
-        conf_label.setStyleSheet("background: transparent; color: #8888aa;")
+        conf_label.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+        conf_label.setStyleSheet(f"background: transparent; color: {p['text_secondary']};")
+        self.conf_label = conf_label
         bottom_row.addWidget(conf_label)
 
         if qc_status in ("failed", "needs_review") and qc_reasons:
             qc_label = QLabel(f"QC:{qc_reasons[:30]}")
             qc_label.setFont(QFont("Segoe UI", 7))
-            qc_label.setStyleSheet("background: transparent; color: #ff7043;")
+            qc_label.setStyleSheet(f"background: transparent; color: {p['status_bad']};")
             bottom_row.addWidget(qc_label)
 
         bottom_row.addStretch()
         info_layout.addLayout(bottom_row)
 
         layout.addLayout(info_layout)
+
+    def set_theme(self, theme: str):
+        self.theme = theme
+        p = get_palette_dict(theme)
+        if hasattr(self, "name_label"):
+            self.name_label.setStyleSheet(f"background: transparent; color: {p['card_dup_title'] if self._is_duplicate else p['card_title_color']};{' text-decoration: underline;' if self._is_duplicate else ''}")
+        if hasattr(self, "date_label"):
+            self.date_label.setStyleSheet(f"background: transparent; color: {p['status_done']};")
+        if hasattr(self, "conf_label"):
+            self.conf_label.setStyleSheet(f"background: transparent; color: {p['text_secondary']};")
+        self.setStyleSheet(self._get_style("reviewed" if self._reviewed else ("selected" if self._selected else ("duplicate" if self._is_duplicate else "normal"))))
 
     def set_selected(self, selected: bool):
         self._selected = selected
@@ -755,51 +805,48 @@ class PassedDocCardWidget(QFrame):
             self.setStyleSheet(self._get_style("duplicate" if is_duplicate else "normal"))
 
     def _get_style(self, state: str) -> str:
+        p = get_palette_dict(self.theme)
         if state == "selected":
-            return """
-                QFrame {
-                    background-color: #1a3a2a;
-                    border: 1px solid #4caf50;
+            return f"""
+                QFrame {{
+                    background-color: {p['bg_card_selected']};
+                    border: 1px solid {p['card_border_selected']};
                     border-radius: 8px;
-                }
+                }}
             """
         elif state == "reviewed":
-            return """
-                QFrame {
-                    background-color: #1a2a3a;
-                    border: 1px solid #4a6fa5;
+            return f"""
+                QFrame {{
+                    background-color: {p['bg_card_reviewed']};
+                    border: 1px solid {p['card_border_reviewed']};
                     border-radius: 8px;
-                }
-                QFrame:hover {
-                    background-color: #1f3045;
-                    border: 1px solid #5a7fb5;
-                }
+                }}
             """
         elif state == "duplicate":
-            return """
-                QFrame {
-                    background-color: #1a3a4a;
-                    border: 1px solid #00bcd4;
+            return f"""
+                QFrame {{
+                    background-color: {p['bg_card_duplicate']};
+                    border: 1px solid {p['card_border_duplicate']};
                     border-radius: 8px;
-                }
-                QFrame:hover {
-                    background-color: #1e4555;
-                    border: 1px solid #26c6da;
-                }
+                }}
+                QFrame:hover {{
+                    border: 1px solid {p['card_border_duplicate']};
+                }}
             """
         else:
-            return """
-                QFrame {
-                    background-color: #1a2a1a;
-                    border: 1px solid #2d4a2d;
+            return f"""
+                QFrame {{
+                    background-color: {p['bg_card']};
+                    border: 1px solid {p['card_border_normal']};
                     border-radius: 8px;
-                }
-                QFrame:hover {
-                    background-color: #1f351f;
-                    border: 1px solid #3a5a3a;
-                }
+                }}
+                QFrame:hover {{
+                    background-color: {p['bg_card_hover']};
+                    border: 1px solid {p['border_focus']};
+                }}
             """
 
     def mousePressEvent(self, event):
-        self.clicked.emit(self.idx)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self.idx, event.modifiers())
         super().mousePressEvent(event)

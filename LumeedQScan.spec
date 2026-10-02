@@ -34,6 +34,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=True,
+    icon='LumeedQScan.ico',
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

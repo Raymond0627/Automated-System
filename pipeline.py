@@ -12,6 +12,7 @@ from dataclasses import dataclass, asdict, field
 
 from date_extractor import extract_document_date, DateResult
 from auto_qc import run_qc_on_pdf, detect_docsep_flag
+from company_extractor import get_company_name_for_filename
 
 
 @dataclass
@@ -29,6 +30,8 @@ class Document:
     flagged_data: Optional[Dict] = None
     blank_pages: List[int] = field(default_factory=list)
     docsep_pages: List[int] = field(default_factory=list)
+    company_confidence: int = 0
+    company_tier: str = ""
 
 
 @dataclass
@@ -60,7 +63,6 @@ class PipelineConfig:
         self.enable_qc = None  # None = use config default
         self.qc_blank_threshold = 1.5
         self.qc_rotation_threshold = 65
-        self.qc_mirror_threshold = 15
         self.enable_docsep_removal = True
         self.enable_blank_removal = True
         self.rename_enabled = True
@@ -138,7 +140,7 @@ def parse_folder_structure(root: Path) -> List[DivisionBatch]:
 def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> None:
     for doc in batch.documents:
         try:
-            # DOCSEP detection: tag separator pages (removal happens at finalize)
+            # Module 1: DOCSEP detection
             if config.enable_docsep_removal:
                 try:
                     ds_result = detect_docsep_flag(doc.original_path)
@@ -146,22 +148,36 @@ def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> Non
                 except Exception:
                     pass
 
-            result = extract_document_date(doc.original_path, config.page_index, engine=config.ocr_engine)
+            # Module 2: Date extraction (blank detection runs inside, no early exit)
+            result = extract_document_date(doc.original_path, config.page_index, engine=config.ocr_engine, docsep_pages=doc.docsep_pages)
             doc.date_result = result
             doc.blank_pages = result.blank_pages or []
-            
+
+            # Module 3: Company name extraction from native PDF text
+            import fitz
+            try:
+                _doc = fitz.open(doc.original_path)
+                page_texts = [{"page_text": _doc[i].get_text().strip(), "page_idx": i} for i in range(len(_doc))]
+                _doc.close()
+            except Exception:
+                page_texts = [{"page_text": t, "page_idx": i} for i, t in enumerate(result.page_texts)]
+            company_result = get_company_name_for_filename(page_texts, doc.company_name)
+            doc.company_name = company_result.get("company_name", doc.company_name)
+            doc.company_confidence = company_result.get("company_confidence", 0)
+            doc.company_tier = company_result.get("tier_used", "")
+
+            # Module 4: QC checks
             qc_result = None
             if config.enable_qc and not result.all_blank:
                 try:
                     qc_result = run_qc_on_pdf(
                         doc.original_path,
-                        config.qc_blank_threshold,
-                        config.qc_rotation_threshold,
-                        config.qc_mirror_threshold,
+                        blank_threshold=config.qc_blank_threshold,
+                        rotation_threshold=config.qc_rotation_threshold,
                     )
                 except Exception:
                     pass
-            
+
             # Handle all-blank documents
             if result.all_blank:
                 doc.status = "failed"
@@ -169,39 +185,29 @@ def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> Non
                 if qc_result:
                     doc.flagged_data["qc"] = qc_result
                 continue
-            
+
             # Handle documents with some blank pages
             if result.blank_pages:
                 doc.flagged_data = doc.flagged_data or {}
                 doc.flagged_data["blank_pages"] = result.blank_pages
-            
-            # Determine if QC passes - only "failed" blocks auto-confirm
-            qc_passed = True
-            if qc_result and qc_result.get("qc_status") == "failed":
-                qc_passed = False
-            
-            if result.confidence >= config.confidence_threshold and result.date:
-                if result.date.year >= config.earliest_year and result.date <= date.today():
-                    if qc_passed:
-                        doc.confirmed_date = result.date
-                        doc.confirmed_method = "auto"
-                        doc.status = "confirmed"
-                    else:
-                        doc.status = "flagged"
-                        doc.flagged_data = create_flagged_data(doc, result)
-                        if qc_result:
-                            doc.flagged_data["qc"] = qc_result
-                else:
-                    doc.status = "flagged"
-                    doc.flagged_data = create_flagged_data(doc, result)
-                    if qc_result:
-                        doc.flagged_data["qc"] = qc_result
+
+            # --- Auto-confirm: ALL THREE must pass ---
+            date_valid = result.date and result.date.year >= config.earliest_year and result.date <= date.today()
+            date_conf_pass = result.confidence >= 90
+            company_conf_pass = doc.company_confidence >= 90
+            qc_passed = not (qc_result and qc_result.get("qc_status") == "failed")
+            blank_clean = not any(r.get("is_blank") == "needs_review" for r in [])  # no needs_review pages
+
+            if date_valid and date_conf_pass and company_conf_pass and qc_passed:
+                doc.confirmed_date = result.date
+                doc.confirmed_method = "auto"
+                doc.status = "confirmed"
             else:
                 doc.status = "flagged"
                 doc.flagged_data = create_flagged_data(doc, result)
                 if qc_result:
                     doc.flagged_data["qc"] = qc_result
-                
+
         except Exception as e:
             doc.status = "error"
             doc.flagged_data = create_flagged_data(doc, None, str(e))
@@ -468,6 +474,11 @@ def run_pipeline(config: PipelineConfig, progress_callback=None) -> List[Divisio
         print("Saving flagged documents for review...")
         save_flagged_documents(batches, config)
         print(f"Flagged documents saved to: {config.flagged_root}")
+
+    if confirmed_count > 0:
+        print("Saving confirmed documents...")
+        save_confirmed_documents(batches, config)
+        print(f"Confirmed documents saved to: {config.flagged_root}")
     
     if progress_callback:
         progress_callback({"stage": "complete", "message": f"Done: {confirmed_count} confirmed, {flagged_count} flagged", "progress": 100})
@@ -518,6 +529,24 @@ def move_confirmed_to_passed(config: PipelineConfig, batches: List[DivisionBatch
     print(f"Confirmed documents moved to: {passed_root}")
 
 
+def _next_folder_sequence(output_root: Path) -> int:
+    """
+    Compute the next continuous sequence number for the flat output folder,
+    continuing from the highest existing NNNN found across all files matching
+    the YYYYMM####_ filename prefix (regardless of division/company/month).
+    """
+    max_seq = 0
+    if output_root.exists():
+        try:
+            for p in output_root.glob("*.pdf"):
+                m = re.match(r"\d{6}(\d{4})_", p.name)
+                if m:
+                    max_seq = max(max_seq, int(m.group(1)))
+        except OSError:
+            pass
+    return max_seq + 1
+
+
 def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
     from datetime import datetime as _dt
     output_root = Path(config.output_root)
@@ -550,14 +579,12 @@ def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
     company_dir = sanitize_filename(company_name)
     if getattr(config, "output_layout", "company") == "flat":
         output_div_dir = output_root
-        flat_glob = output_root.glob(f"{yyyymm}*_{division_code}_{company_dir}.pdf")
+        seq = _next_folder_sequence(output_root)
     else:
         output_div_dir = output_root / division_code / company_dir
         flat_glob = output_div_dir.glob(f"{yyyymm}*_{division_code}_{company_dir}.pdf")
+        seq = len(list(flat_glob)) + 1
     output_div_dir.mkdir(parents=True, exist_ok=True)
-
-    existing = list(flat_glob)
-    seq = len(existing) + 1
     final_filename = f"{yyyymm}{seq:04d}_{division_code}_{company_dir}"
     if doc_data.get("is_duplicate"):
         final_filename += doc_data.get("duplicate_suffix", "")
@@ -663,7 +690,6 @@ if __name__ == "__main__":
         config.enable_blank_removal = cfg.get("enable_blank_removal", True)
         config.qc_blank_threshold = cfg.get("qc_blank_threshold", 1.5)
         config.qc_rotation_threshold = cfg.get("qc_rotation_threshold", 65)
-        config.qc_mirror_threshold = cfg.get("qc_mirror_threshold", 15)
         config.render_dpi = cfg.get("render_dpi", 150)
     else:
         import argparse

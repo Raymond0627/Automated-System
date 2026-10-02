@@ -4,9 +4,9 @@ import base64
 from pathlib import Path
 from datetime import datetime
 
-from paths import BASE_DIR
+from paths import DATA_DIR, ensure_data_dir
 
-SESSION_DIR = BASE_DIR / "sessions"
+SESSION_DIR = DATA_DIR / "sessions"
 SESSION_FILE = SESSION_DIR / "latest_session.json"
 SESSION_TMP = SESSION_DIR / "latest_session.json.tmp"
 SESSION_VERSION = 1
@@ -103,8 +103,11 @@ def serialize(rt) -> dict:
     for d in rt.all_flagged_docs:
         keep = bool(active_bytes) and _path_key(d) == active_doc_key
         if keep:
-            d["_pending_pdf_bytes"] = active_bytes
-        all_flagged.append(_clean_doc(d, keep))
+            d_copy = dict(d)
+            d_copy["_pending_pdf_bytes"] = active_bytes
+            all_flagged.append(_clean_doc(d_copy, keep))
+        else:
+            all_flagged.append(_clean_doc(d, keep))
 
     auto = [_clean_doc(d, True) for d in rt.auto_confirmed_docs]
     if rt.active_tab == "auto_confirmed" and active_bytes and active_doc_key:
@@ -112,6 +115,14 @@ def serialize(rt) -> dict:
             if _path_key(d) == active_doc_key:
                 d["_pending_pdf_bytes"] = _b64(active_bytes)
                 break
+
+    dashboard_data = {}
+    if hasattr(rt, "config"):
+        dashboard_data = {
+            "input_root": rt.config.get("input_root", ""),
+            "output_root": rt.config.get("output_root", ""),
+            "flagged_root": rt.config.get("flagged_root", ""),
+        }
 
     snap = {
         "version": SESSION_VERSION,
@@ -124,6 +135,7 @@ def serialize(rt) -> dict:
         "auto_confirmed_docs": auto,
         "reviewed_active_index": rt.active_index if rt.active_tab == "reviewed" else -1,
         "scan": scan_info,
+        "dashboard": dashboard_data,
     }
     return snap
 
@@ -158,10 +170,17 @@ def apply(rt, snap: dict) -> dict:
     rt.view_mode = snap.get("view_mode", "variable")
     rt.zoom_level = snap.get("zoom_level", 100)
 
+    dashboard_data = snap.get("dashboard", {})
+    if dashboard_data and hasattr(rt, "config"):
+        rt.config["input_root"] = dashboard_data.get("input_root", "")
+        rt.config["output_root"] = dashboard_data.get("output_root", "")
+        rt.config["flagged_root"] = dashboard_data.get("flagged_root", "")
+
     set_scan_info(snap.get("scan"))
     return {
         "active_tab": snap.get("active_tab", "pending"),
         "active_index": snap.get("active_index", -1),
         "reviewed_active_index": snap.get("reviewed_active_index", -1),
         "scan": snap.get("scan"),
+        "dashboard": dashboard_data,
     }

@@ -186,27 +186,23 @@ def run_qc(
             "qc_failure_reasons": "",
         }
     rotation = check_rotation(page_img, rotation_threshold)
-    mirrored = check_mirrored(page_img, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode)
 
     failures = []
     if rotation["is_rotated"]:
         failures.append(f"rotated: {rotation['angle']}deg ({rotation['confidence']}%)")
-    if mirrored["is_mirrored"]:
-        failures.append(f"mirrored: delta {mirrored['confidence_delta']}%")
 
-    # Only rotation and mirror cause QC failure; blank is informational (handled separately)
-    is_failure = rotation["is_rotated"] or mirrored["is_mirrored"]
-    needs_review = mirrored["needs_review"]
-    qc_status = "failed" if is_failure else ("needs_review" if needs_review else "passed")
+    # Only rotation causes QC failure; mirror check disabled, blank is informational
+    is_failure = rotation["is_rotated"]
+    qc_status = "failed" if is_failure else "passed"
 
     return {
         "blank_detected": blank["is_blank"],
         "blank_ink_ratio": blank["ink_ratio"],
         "rotation_detected": str(rotation["angle"]) + "deg" if rotation["is_rotated"] else "none",
         "rotation_confidence": rotation["confidence"],
-        "mirrored_detected": mirrored["is_mirrored"],
-        "mirror_delta": mirrored["confidence_delta"],
-        "mirror_needs_review": mirrored["needs_review"],
+        "mirrored_detected": False,
+        "mirror_delta": 0.0,
+        "mirror_needs_review": False,
         "qc_status": qc_status,
         "qc_failure_reasons": "; ".join(failures) if failures else "",
     }
@@ -214,55 +210,59 @@ def run_qc(
 
 def detect_docsep_page(page_img: np.ndarray) -> Dict:
     """
-    Detect DOCSEP separator page via QR code detection.
-    DOCSEP pages always have a QR code on the left side.
+    Detect DOCSEP separator page via image dimensions.
+    DOCSEP pages are always landscape ~1649x1170.
+    Rule: width > 1500 AND 1000 <= height <= 1300.
     Returns {'is_docsep': bool, 'confidence': float, 'matched_text': str}
     """
     try:
-        gray = cv2.cvtColor(page_img, cv2.COLOR_BGR2GRAY)
-        detector = cv2.QRCodeDetector()
-        data, points, _ = detector.detectAndDecode(gray)
-        if points is not None:
-            return {"is_docsep": True, "confidence": 95.0, "matched_text": "QR_CODE"}
+        h, w = page_img.shape[:2]
+        if w > 1500 and 1000 <= h <= 1300:
+            return {"is_docsep": True, "confidence": 95.0, "matched_text": "DIMENSION"}
     except Exception:
         pass
     return {"is_docsep": False, "confidence": 0.0, "matched_text": ""}
 
 
-def detect_docsep_flag(pdf_path: str, dpi: int = 150) -> Dict:
+def detect_docsep_flag(pdf_path: str, dpi: int = 150, doc: Optional["fitz.Document"] = None) -> Dict:
     """
-    Detect DOCSEP separator pages in a PDF without modifying the file.
+    Detect DOCSEP separator pages in a PDF using native image dimensions.
+    DOCSEP is always page 1 (index 0) if present.
     Returns {docsep_pages: List[int], count: int, confidence: float, reason: str}
     """
     import fitz
-    doc = None
+    own_doc = doc is None
+    if own_doc:
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            print(f"Error opening PDF: {e}")
+            return {"docsep_pages": [], "count": 0, "confidence": 0.0, "reason": ""}
     try:
-        doc = fitz.open(pdf_path)
-        total = len(doc)
         docsep_pages = []
         confidence = 0.0
 
-        if total > 0:
-            pix = doc[0].get_pixmap(dpi=dpi)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            result = detect_docsep_page(img)
-            del img, pix
-            if result["is_docsep"]:
-                docsep_pages.append(0)
-                confidence = result["confidence"]
+        if len(doc) > 0:
+            page = doc[0]
+            images = page.get_images(full=True)
+            if images:
+                base_image = doc.extract_image(images[0][0])
+                w, h = base_image["width"], base_image["height"]
+                if w > 1500 and 1000 <= h <= 1300:
+                    docsep_pages = [0]
+                    confidence = 95.0
 
         return {
             "docsep_pages": docsep_pages,
             "count": len(docsep_pages),
             "confidence": confidence,
-            "reason": "QR code detected" if docsep_pages else "",
+            "reason": "dimension match" if docsep_pages else "",
         }
     except Exception as e:
         print(f"Error detecting DOCSEP: {e}")
         return {"docsep_pages": [], "count": 0, "confidence": 0.0, "reason": ""}
     finally:
-        if doc:
+        if own_doc and doc:
             try:
                 doc.close()
             except Exception:
@@ -272,6 +272,7 @@ def detect_docsep_flag(pdf_path: str, dpi: int = 150) -> Dict:
 def remove_docsep_pages(pdf_path: str, output_dir: str, dpi: int = 150) -> Dict:
     """
     Open a PDF, detect and remove DOCSEP separator page from first page position.
+    Uses dimension-based detection (width > 1500 AND 1000 <= height <= 1300).
     Saves cleaned PDF to output_dir and returns details.
     Returns {removed: bool, count: int, pages_removed: List[int], cleaned_path: str}
     """
@@ -282,16 +283,13 @@ def remove_docsep_pages(pdf_path: str, output_dir: str, dpi: int = 150) -> Dict:
         total = len(doc)
         pages_to_remove = []
 
-        # Check first page
         if total > 0:
-            pix = doc[0].get_pixmap(dpi=dpi)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
-            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            del pix
-            result = detect_docsep_page(img)
-            del img
-            if result["is_docsep"]:
-                pages_to_remove.append(0)
+            images = doc[0].get_images(full=True)
+            if images:
+                base_image = doc.extract_image(images[0][0])
+                w, h = base_image["width"], base_image["height"]
+                if w > 1500 and 1000 <= h <= 1300:
+                    pages_to_remove = [0]
 
         if not pages_to_remove:
             return {"removed": False, "count": 0, "pages_removed": [], "cleaned_path": pdf_path}
@@ -373,15 +371,26 @@ def run_qc_on_pdf(
     dpi: int = 150,
     use_gpu: bool = False,
     gpu_mode: str = "cpu",
+    doc: Optional["fitz.Document"] = None,
 ) -> Dict:
     """
     Run QC on a PDF file. Processes all pages (max_pages=0) or up to max_pages.
     Returns aggregated QC results.
     """
     import fitz
-    doc = None
+    own_doc = doc is None
+    if own_doc:
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception as e:
+            return {
+                "blank_detected": False, "blank_ink_ratio": 0.0,
+                "rotation_detected": "none", "rotation_confidence": 100.0,
+                "mirrored_detected": False, "mirror_delta": 0.0,
+                "mirror_needs_review": False, "qc_status": "passed",
+                "qc_failure_reasons": "", "pages_checked": 0, "total_pages": 0,
+            }
     try:
-        doc = fitz.open(pdf_path)
         total = len(doc)
         pages_to_check = total if max_pages == 0 else min(total, max_pages)
 
@@ -414,11 +423,6 @@ def run_qc_on_pdf(
             if result["rotation_detected"] != "none":
                 agg["rotation_detected"] = result["rotation_detected"]
                 agg["rotation_confidence"] = min(agg["rotation_confidence"], result["rotation_confidence"])
-            if result["mirrored_detected"]:
-                agg["mirrored_detected"] = True
-                agg["mirror_delta"] = max(agg["mirror_delta"], result["mirror_delta"])
-            if result["mirror_needs_review"]:
-                agg["mirror_needs_review"] = True
 
             if result["qc_status"] != "passed":
                 agg["qc_status"] = result["qc_status"]
@@ -440,7 +444,7 @@ def run_qc_on_pdf(
             "qc_failure_reasons": "", "pages_checked": 0, "total_pages": 0,
         }
     finally:
-        if doc:
+        if own_doc and doc:
             try:
                 doc.close()
             except Exception:
