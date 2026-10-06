@@ -1,7 +1,7 @@
 @echo off
 echo ============================================
 echo  Lumeed QScan - Build Installer Script
-echo  Produces Output\LumeedQScan_Setup_1.8.2.exe
+echo  Produces Output\LumeedQScan_Setup_1.8.3.exe
 echo ============================================
 echo.
 
@@ -68,7 +68,7 @@ if errorlevel 1 (
 
 echo.
 echo ============================================
-echo  BUILD COMPLETE: Output\LumeedQScan_Setup_1.8.2.exe
+echo  BUILD COMPLETE: Output\LumeedQScan_Setup_1.8.3.exe
 echo ============================================
 echo.
 pause

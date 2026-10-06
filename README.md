@@ -15,7 +15,7 @@ Automatically extracts document dates from PDFs using OCR and renames files acco
 
 ### Option A — Installer (recommended for end users)
 
-Run `Output\LumeedQScan_Setup_1.8.0.exe` and follow the wizard. It installs to
+Run `Output\LumeedQScan_Setup_1.8.3.exe` and follow the wizard. It installs to
 `C:\Program Files\LumeedQScan`, bundles Tesseract OCR, and adds Start Menu /
 optional Desktop shortcuts. User data (config and sessions) is stored in
 `%APPDATA%\LumeedQScan`.
@@ -45,7 +45,7 @@ build.bat
 ```
 
 This rebuilds the PyInstaller package, bundles Tesseract, and compiles
-`Output\LumeedQScan_Setup_1.8.0.exe` via `installer.iss`.
+`Output\LumeedQScan_Setup_1.8.3.exe` via `installer.iss`.
 
 ## Project Structure
 
