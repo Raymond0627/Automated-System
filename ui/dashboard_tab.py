@@ -194,12 +194,35 @@ class DashboardTab(QWidget):
         btn_out.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         btn_out.clicked.connect(lambda: self._browse(self.output_var))
         self.output_var.textChanged.connect(self._sync_paths_from_widgets)
+        # Tracks whether the user hand-picked an output folder. Until they do,
+        # the output path is derived from the input folder name.
+        self._output_touched = False
+        self.output_var.textChanged.connect(self._mark_output_touched)
 
         folder_grid.addWidget(self.output_label, 1, 0)
         folder_grid.addWidget(self.output_var, 1, 1)
         folder_grid.addWidget(btn_out, 1, 2)
 
+        self.division_label = QLabel("Division Code:")
+        self.division_label.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        self.division_label.setStyleSheet("background: transparent;")
+        self.division_var = QLineEdit(self.config.get("division_code", ""))
+        self.division_var.setFont(QFont("Segoe UI", 9))
+        self.division_var.setPlaceholderText("e.g. 143")
+        self.division_var.setMaximumWidth(160)
+        self.division_var.setFixedHeight(26)
+        self.division_var.setStyleSheet(f"background-color: {p['bg_input']}; color: {p['text_main']}; border: 1px solid {p['border_input']}; border-radius: 6px; padding: 4px 10px;")
+        self.division_var.textChanged.connect(self._sync_paths_from_widgets)
+
+        folder_grid.addWidget(self.division_label, 2, 0)
+        folder_grid.addWidget(self.division_var, 2, 1, 1, 2)
+
+        self.division_hint = QLabel("Required before running the pipeline.")
+        self.division_hint.setFont(QFont("Segoe UI", 8, QFont.Weight.Medium))
+        self.division_hint.setStyleSheet("background: transparent;")
+
         config_layout.addLayout(folder_grid)
+        config_layout.addWidget(self.division_hint)
 
         # Buttons + Progress Row
         actions_row = QHBoxLayout()
@@ -330,6 +353,7 @@ class DashboardTab(QWidget):
     def clear_fields(self):
         self.input_var.setText("")
         self.output_var.setText("")
+        self._output_touched = False
         self.config["input_root"] = ""
         self.config["output_root"] = ""
         self.config["flagged_root"] = ""
@@ -369,10 +393,16 @@ class DashboardTab(QWidget):
             self.input_label.setStyleSheet(f"background: transparent; color: {p['text_main']};")
         if hasattr(self, "output_label"):
             self.output_label.setStyleSheet(f"background: transparent; color: {p['text_main']};")
+        if hasattr(self, "division_label"):
+            self.division_label.setStyleSheet(f"background: transparent; color: {p['text_main']};")
+        if hasattr(self, "division_hint"):
+            self.division_hint.setStyleSheet(f"background: transparent; color: {p['text_placeholder']};")
         if hasattr(self, "input_var"):
             self.input_var.setStyleSheet(f"background-color: {p['bg_input']}; color: {p['text_main']}; border: 1px solid {p['border_input']}; border-radius: 6px; padding: 4px 10px;")
         if hasattr(self, "output_var"):
             self.output_var.setStyleSheet(f"background-color: {p['bg_input']}; color: {p['text_main']}; border: 1px solid {p['border_input']}; border-radius: 6px; padding: 4px 10px;")
+        if hasattr(self, "division_var"):
+            self.division_var.setStyleSheet(f"background-color: {p['bg_input']}; color: {p['text_main']}; border: 1px solid {p['border_input']}; border-radius: 6px; padding: 4px 10px;")
 
         # Cards
         card_style = get_dashboard_card_style(theme_name)
@@ -465,14 +495,24 @@ class DashboardTab(QWidget):
         path = QFileDialog.getExistingDirectory(self, "Select Folder", var.text() or "/")
         if path:
             var.setText(path)
-            self.config["input_root"] = self.input_var.text()
-            self.config["output_root"] = self.output_var.text()
-            self.config["flagged_root"] = (self.output_var.text() + "/flagged") if self.output_var.text() else ""
+            if var is self.input_var and not self._output_touched:
+                # Keep the output folder derived from the (new) input folder
+                # until the user picks an output folder themselves.
+                derived = str(Path(path).parent / f"{Path(path).name} output")
+                self.output_var.blockSignals(True)
+                self.output_var.setText(derived)
+                self.output_var.blockSignals(False)
+                self._sync_paths_from_widgets()
+            self._sync_paths_from_widgets()
+
+    def _mark_output_touched(self, *_):
+        self._output_touched = True
 
     def _sync_paths_from_widgets(self):
         self.config["input_root"] = self.input_var.text()
         self.config["output_root"] = self.output_var.text()
-        self.config["flagged_root"] = (self.output_var.text() + "/flagged") if self.output_var.text() else ""
+        self.config["flagged_root"] = ""
+        self.config["division_code"] = self.division_var.text().strip()
 
     def _save_config(self):
         ensure_data_dir()
@@ -482,8 +522,31 @@ class DashboardTab(QWidget):
         to_save["input_root"] = ""
         to_save["output_root"] = ""
         to_save["flagged_root"] = ""
+        to_save["division_code"] = self.config.get("division_code", "")
         with open(config_file, "w", encoding="utf-8") as f:
             json.dump(to_save, f, indent=2, ensure_ascii=False)
+
+    def _require_division_code(self) -> bool:
+        """Return True when a usable division code is entered, else warn the user."""
+        code = self.division_var.text().strip()
+        if not code:
+            QMessageBox.warning(
+                self,
+                "Division Code Required",
+                "Please enter a Division Code before running the pipeline.\n\n"
+                "It is used to name the output folder and to build each PDF's filename.",
+            )
+            self.division_var.setFocus()
+            return False
+        if any(c in code for c in '<>:"/\\|?*'):
+            QMessageBox.warning(
+                self,
+                "Invalid Division Code",
+                'A Division Code cannot contain any of: < > : " / \\ | ? *',
+            )
+            self.division_var.setFocus()
+            return False
+        return True
 
     def _make_pill_widget(self, text: str, fg: str, bg: str) -> QWidget:
         container = QWidget()
@@ -661,16 +724,23 @@ class DashboardTab(QWidget):
         self.log_table.scrollToBottom()
 
     def _resolve_output_root(self, input_path: str) -> str:
-        output = self.output_var.text().strip()
+        # Default: sibling of the input folder named "<input folder name> output"
+        # so the parent folder name is preserved and the input tree stays clean.
+        # A hand-picked output folder always wins.
+        derived = str(Path(input_path).parent / f"{Path(input_path).name} output")
+        output = self.output_var.text().strip() if self._output_touched else ""
         if not output:
-            output = str(Path(input_path) / "output")
-            os.makedirs(output, exist_ok=True)
+            output = derived
+        os.makedirs(output, exist_ok=True)
+        if self.output_var.text().strip() != output:
+            self.output_var.blockSignals(True)
             self.output_var.setText(output)
-        else:
-            os.makedirs(output, exist_ok=True)
+            self.output_var.blockSignals(False)
         return output
 
     def scan_folder(self):
+        if not self._require_division_code():
+            return
         path = self.input_var.text()
         if not path or not os.path.isdir(path):
             QMessageBox.warning(self, "Warning", "Please select a valid input folder first.")
@@ -679,8 +749,8 @@ class DashboardTab(QWidget):
         self._set_status_pill("running", "SCANNING")
         from pipeline import parse_folder_structure
         try:
-            batches = parse_folder_structure(Path(path))
-            divs = len(batches)
+            division_code = self.division_var.text().strip()
+            batches = parse_folder_structure(Path(path), division_code)
             companies_set = set()
             pdfs = 0
             for b in batches:
@@ -699,11 +769,14 @@ class DashboardTab(QWidget):
         ocr = self.config.get("ocr_engine", "tesseract")
         thresh = self.config.get("confidence_threshold", 20)
         year = self.config.get("earliest_year", 1950)
-        self.scan_label.setText(f"OCR: {ocr.upper()}  ·  Threshold: {thresh}%  ·  Year: {year}+  ·  {pdfs} PDFs in {divs} division(s)")
+        self.scan_label.setText(f"OCR: {ocr.upper()}  ·  Threshold: {thresh}%  ·  Year: {year}+  ·  Division: {division_code or '—'}  ·  {pdfs} PDFs")
         self._set_status_pill("idle", "SCANNED")
 
     def run_pipeline(self):
         if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
+
+        if not self._require_division_code():
             return
 
         self.config["input_root"] = self.input_var.text()
@@ -712,7 +785,8 @@ class DashboardTab(QWidget):
             return
         output = self._resolve_output_root(self.config["input_root"])
         self.config["output_root"] = output
-        self.config["flagged_root"] = os.path.join(output, "flagged")
+        self.config["flagged_root"] = ""
+        self.config["division_code"] = self.division_var.text().strip()
         self._save_config()
 
         self.run_btn.setEnabled(False)

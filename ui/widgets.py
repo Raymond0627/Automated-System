@@ -150,8 +150,8 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
         except Exception:
             page_texts = [{"page_text": t, "page_idx": i} for i, t in enumerate(date_result.page_texts)]
 
-        company_result = get_company_name_for_filename(page_texts, company_name)
-        final_company = company_result.get('company_name', company_name)
+        company_result = get_company_name_for_filename(page_texts)
+        final_company = company_result.get('company_name', '')
         company_confidence = company_result.get('company_confidence', 0)
         company_tier = company_result.get('tier_used', '')
 
@@ -275,6 +275,7 @@ class PipelineThread(QThread):
     def run(self):
         try:
             self.progress.emit("Scanning folders...", 5)
+            division_code = self.config.get("division_code", "")
             pipeline_config = PipelineConfig(
                 input_root=self.config["input_root"],
                 output_root=self.config["output_root"],
@@ -283,18 +284,21 @@ class PipelineThread(QThread):
                 page_index=self.config["page_index"],
                 earliest_year=self.config["earliest_year"],
                 ocr_engine=self.config.get("ocr_engine", "tesseract"),
+                division_code=division_code,
             )
             pipeline_config.enable_docsep_removal = self.config.get("enable_docsep_removal", True)
             pipeline_config.enable_blank_removal = self.config.get("enable_blank_removal", True)
             pipeline_config.rename_enabled = self.config.get("rename_enabled", True)
             pipeline_config.audit_enabled = self.config.get("audit_enabled", True)
+            pipeline_config.output_layout = self.config.get("output_layout", "mirror")
 
             render_dpi = self.config.get("render_dpi", 200)
             pipeline_config.render_dpi = render_dpi
             max_workers = self.config.get("max_workers", 1)
             batch_size = self.config.get("batch_size", 50)
 
-            flagged_root = Path(self.config["flagged_root"])
+            flagged_root_str = self.config.get("flagged_root", "")
+            flagged_root = Path(flagged_root_str) if flagged_root_str else None
 
             if self.plan is not None:
                 remaining = [p for p in self.plan if p not in self.existing_paths]
@@ -314,20 +318,21 @@ class PipelineThread(QThread):
                     doc_infos.append({
                         "original_path": p,
                         "original_filename": os.path.basename(p),
-                        "division_code": "",
+                        "division_code": division_code,
                         "company_name": "",
                         "rel_path": rel,
                     })
                 total = len(doc_infos)
                 self.log_message.emit(f"Resume scan: {total} document(s) remaining")
             else:
-                flagged_root.mkdir(parents=True, exist_ok=True)
-                for f in ["flagged_index.json", "passed_index.json"]:
-                    pp = flagged_root / f
-                    if pp.exists():
-                        pp.unlink()
+                if flagged_root:
+                    flagged_root.mkdir(parents=True, exist_ok=True)
+                    for f in ["flagged_index.json", "passed_index.json"]:
+                        pp = flagged_root / f
+                        if pp.exists():
+                            pp.unlink()
 
-                batches = parse_folder_structure(pipeline_config.input_root)
+                batches = parse_folder_structure(pipeline_config.input_root, division_code)
                 total = sum(len(b.documents) for b in batches)
 
                 if self.max_files > 0:
@@ -338,9 +343,9 @@ class PipelineThread(QThread):
                                 doc.status = "skipped"
                             count += 1
                     total = min(total, self.max_files)
-                    self.log_message.emit(f"Found {total} PDFs (limited to {self.max_files}) in {len(batches)} divisions")
+                    self.log_message.emit(f"Found {total} PDFs (limited to {self.max_files})")
                 else:
-                    self.log_message.emit(f"Found {total} PDFs in {len(batches)} divisions")
+                    self.log_message.emit(f"Found {total} PDFs")
 
                 doc_infos = []
                 for batch in batches:
@@ -462,10 +467,11 @@ class PipelineThread(QThread):
 
             try:
                 if self.plan is not None:
-                    if new_flagged:
-                        self.progress.emit("Writing flagged index...", 95)
-                    self._write_merged_indexes(pipeline_config, flagged)
-                else:
+                    if flagged_root:
+                        if new_flagged:
+                            self.progress.emit("Writing flagged index...", 95)
+                        self._write_merged_indexes(pipeline_config, flagged)
+                elif flagged_root:
                     flagged_root.mkdir(parents=True, exist_ok=True)
                     with open(flagged_root / "flagged_index.json", "w", encoding="utf-8") as f:
                         json.dump(_json_safe_flagged(flagged), f, indent=2, ensure_ascii=False)
@@ -487,6 +493,8 @@ class PipelineThread(QThread):
             gc.collect()
 
     def _write_merged_indexes(self, config, flagged):
+        if not getattr(config, "flagged_root", None):
+            return
         flagged_root = Path(config.flagged_root)
         flagged_root.mkdir(parents=True, exist_ok=True)
         with open(flagged_root / "flagged_index.json", "w", encoding="utf-8") as f:

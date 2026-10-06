@@ -543,19 +543,6 @@ def extract_from_header_corroborated(page_text: str) -> Optional[Dict[str, Any]]
 
 
 # ─────────────────────────────────────────────────────────────
-# Tier 4: Folder fallback (NEVER auto-confirm)
-# ─────────────────────────────────────────────────────────────
-
-def extract_from_folder(fallback_folder_name: str) -> Dict[str, Any]:
-    normalized = normalize_company_name(fallback_folder_name)
-    return {
-        'company_name': normalized,
-        'tier': 'folder_fallback',
-        'confidence': 'none',
-    }
-
-
-# ─────────────────────────────────────────────────────────────
 # Fuzzy matching with tier-adjusted thresholds
 # ─────────────────────────────────────────────────────────────
 
@@ -609,7 +596,7 @@ def fuzzy_match_with_tier(
     elif tier == 'header_corroborated':
         threshold = 85
     else:
-        # folder_fallback or unknown tier: NEVER auto-confirm
+        # 'unresolved' or any unknown tier: NEVER auto-confirm
         threshold = 999
 
     best_entry = None
@@ -674,9 +661,9 @@ def fuzzy_match_with_tier(
 # Main entry point
 # ─────────────────────────────────────────────────────────────
 
-def get_company_name_for_filename(page_ocr_data_list: list, fallback_folder_name: str) -> dict:
+def get_company_name_for_filename(page_ocr_data_list: list) -> dict:
     """
-    Extract company name using 7-tier priority system.
+    Extract company name using a 6-tier priority system.
 
     Tiers:
     0. Caption regex (-versus- -> Respondent)
@@ -685,7 +672,11 @@ def get_company_name_for_filename(page_ocr_data_list: list, fallback_folder_name
     2. Caption keywords (caption span only)
     2b. Full-document keywords (wide net, strict)
     3. Header CEO/President (must be corroborated by "Respondent")
-    4. Folder fallback (NEVER auto-confirm)
+
+    There is no folder-name fallback: the source folder name is never treated as
+    a company value. When every tier fails the result is an empty company_name
+    with company_confidence 0, which fails the auto-confirm gate and routes the
+    document to manual review.
 
     Cross-validation: If Tier 0 and Tier 1 both match and agree (fuzzy >= 70),
     confidence is elevated.
@@ -822,13 +813,9 @@ def get_company_name_for_filename(page_ocr_data_list: list, fallback_folder_name
                 'header_corroborated',
             )
 
-    # Tier 4: Folder fallback (NEVER auto-confirm)
-    folder_result = extract_from_folder(fallback_folder_name)
-    return fuzzy_match_with_tier(
-        [folder_result['company_name']],
-        known_companies,
-        'folder_fallback',
-    )
+    # No tier produced a candidate. Return an empty name so the caller treats it
+    # as unresolved and routes the document to manual review.
+    return fuzzy_match_with_tier([], known_companies, 'unresolved')
 
 
 # ─────────────────────────────────────────────────────────────

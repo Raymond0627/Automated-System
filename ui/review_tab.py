@@ -227,44 +227,42 @@ class ReviewedScanWorker(QThread):
         if not root.exists():
             self.finished.emit(reviewed)
             return
-        for div_dir in root.iterdir():
-            if not div_dir.is_dir() or div_dir.name.startswith("."):
-                continue
-            try:
-                for company_dir in div_dir.iterdir():
-                    if not company_dir.is_dir():
-                        continue
-                    try:
-                        for pdf_file in company_dir.glob("*.pdf"):
-                            reviewed.append({
-                                "original_path": str(pdf_file),
-                                "original_filename": pdf_file.name,
-                                "division_code": div_dir.name,
-                                "company_name": company_dir.name,
-                                "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
-                                "confidence": 100,
-                                "method": "finalized",
-                                "blank_pages": [],
-                                "docsep_pages": [],
-                            })
-                    except PermissionError:
-                        continue
-            except PermissionError:
-                continue
+
+        def add_pdf(pdf_file: Path):
+            rel = pdf_file.relative_to(root)
+            parts = rel.parts
+            # Mirror layout: folder path under the output root stands in for
+            # division/company, so any depth is reported.
+            if len(parts) >= 3:
+                div = parts[0]
+                company = "/".join(parts[1:-1])
+            elif len(parts) == 2:
+                div = parts[0]
+                company = parts[0]
+            else:
+                div = ""
+                company = "All Documents"
+            reviewed.append({
+                "original_path": str(pdf_file),
+                "original_filename": pdf_file.name,
+                "division_code": div,
+                "company_name": company,
+                "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
+                "confidence": 100,
+                "method": "finalized",
+                "blank_pages": [],
+                "docsep_pages": [],
+            })
+
         try:
-            for pdf_file in root.iterdir():
-                if pdf_file.is_file() and pdf_file.suffix.lower() == ".pdf":
-                    reviewed.append({
-                        "original_path": str(pdf_file),
-                        "original_filename": pdf_file.name,
-                        "division_code": "",
-                        "company_name": "All Documents",
-                        "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
-                        "confidence": 100,
-                        "method": "finalized",
-                        "blank_pages": [],
-                        "docsep_pages": [],
-                    })
+            skip = {"flagged", "passed", "logs"}
+            for pdf_file in sorted(root.rglob("*.pdf")):
+                rel_parts = pdf_file.relative_to(root).parts
+                if any(part.startswith(".") for part in rel_parts):
+                    continue
+                if any(part.lower() in skip for part in rel_parts[:-1]):
+                    continue
+                add_pdf(pdf_file)
         except PermissionError:
             pass
         self.finished.emit(reviewed)
@@ -356,6 +354,8 @@ class ReviewTab(QWidget):
         self._auto_refresh_timer.setInterval(120)
         self._auto_refresh_timer.timeout.connect(self._on_auto_refresh)
         self.build_ui()
+        if self.config.get("output_root"):
+            QTimer.singleShot(150, self._start_reviewed_scan)
 
     def build_ui(self):
         main_layout = QVBoxLayout(self)
@@ -696,14 +696,18 @@ class ReviewTab(QWidget):
             lbl.deleteLater()
         self.page_labels = []
 
-        flagged_file = Path(self.config["flagged_root"]) / "flagged_index.json"
-        if flagged_file.exists():
-            try:
-                with open(flagged_file, "r", encoding="utf-8") as f:
-                    all_flagged = json.load(f)
-                if not all_flagged:
+        f_root = self.config.get("flagged_root", "")
+        if f_root and Path(f_root).exists():
+            flagged_file = Path(f_root) / "flagged_index.json"
+            if flagged_file.exists():
+                try:
+                    with open(flagged_file, "r", encoding="utf-8") as f:
+                        all_flagged = json.load(f)
+                    if not all_flagged:
+                        all_flagged = _prev_flagged
+                except Exception:
                     all_flagged = _prev_flagged
-            except Exception:
+            else:
                 all_flagged = _prev_flagged
         else:
             all_flagged = _prev_flagged
@@ -711,14 +715,17 @@ class ReviewTab(QWidget):
         self.all_flagged_docs = all_flagged
         self.pending_docs = [d for d in all_flagged if not d.get("reviewed")]
 
-        auto_file = Path(self.config["flagged_root"]) / "auto_confirmed_index.json"
-        if auto_file.exists():
-            try:
-                with open(auto_file, "r", encoding="utf-8") as f:
-                    self.auto_confirmed_docs = json.load(f)
-                if not self.auto_confirmed_docs:
+        if f_root and Path(f_root).exists():
+            auto_file = Path(f_root) / "auto_confirmed_index.json"
+            if auto_file.exists():
+                try:
+                    with open(auto_file, "r", encoding="utf-8") as f:
+                        self.auto_confirmed_docs = json.load(f)
+                    if not self.auto_confirmed_docs:
+                        self.auto_confirmed_docs = _prev_auto
+                except Exception:
                     self.auto_confirmed_docs = _prev_auto
-            except Exception:
+            else:
                 self.auto_confirmed_docs = _prev_auto
         else:
             self.auto_confirmed_docs = _prev_auto
@@ -728,9 +735,8 @@ class ReviewTab(QWidget):
             if key in _old_pending_bytes and "_pending_pdf_bytes" not in pd:
                 pd["_pending_pdf_bytes"] = _old_pending_bytes[key]
 
-        if self.active_tab == "reviewed":
-            self._start_reviewed_scan()
-        else:
+        self._start_reviewed_scan()
+        if self.active_tab != "reviewed":
             self.refresh_doc_list()
             if self.active_tab == "pending" and self.pending_docs:
                 self.doc_list.setCurrentRow(0)
@@ -821,50 +827,49 @@ class ReviewTab(QWidget):
             self.reviewed_docs = []
             return
         reviewed = []
-        for div_dir in sorted(output_root.iterdir()):
-            if not div_dir.is_dir() or div_dir.name.startswith("."):
+        skip = {"flagged", "passed", "logs"}
+        for pdf_file in sorted(output_root.rglob("*.pdf")):
+            rel_parts = pdf_file.relative_to(output_root).parts
+            if any(part.startswith(".") for part in rel_parts):
                 continue
-            for company_dir in sorted(div_dir.iterdir()):
-                if not company_dir.is_dir():
-                    continue
-                for pdf_file in company_dir.glob("*.pdf"):
-                    reviewed.append({
-                        "original_path": str(pdf_file),
-                        "original_filename": pdf_file.name,
-                        "division_code": div_dir.name,
-                        "company_name": company_dir.name,
-                        "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
-                        "confidence": 100,
-                        "method": "finalized",
-                        "blank_pages": [],
-                        "docsep_pages": [],
-                    })
-        for pdf_file in sorted(output_root.iterdir()):
-            if pdf_file.is_file() and pdf_file.suffix.lower() == ".pdf":
-                reviewed.append({
-                    "original_path": str(pdf_file),
-                    "original_filename": pdf_file.name,
-                    "division_code": "",
-                    "company_name": "All Documents",
-                    "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
-                    "confidence": 100,
-                    "method": "finalized",
-                    "blank_pages": [],
-                    "docsep_pages": [],
-                })
+            if any(part.lower() in skip for part in rel_parts[:-1]):
+                continue
+            # Mirror layout: the folder path under the output root stands in
+            # for division/company, at any depth.
+            if len(rel_parts) >= 3:
+                div, company = rel_parts[0], "/".join(rel_parts[1:-1])
+            elif len(rel_parts) == 2:
+                div, company = rel_parts[0], rel_parts[0]
+            else:
+                div, company = "", "All Documents"
+            reviewed.append({
+                "original_path": str(pdf_file),
+                "original_filename": pdf_file.name,
+                "division_code": div,
+                "company_name": company,
+                "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
+                "confidence": 100,
+                "method": "finalized",
+                "blank_pages": [],
+                "docsep_pages": [],
+            })
         self.reviewed_docs = reviewed
 
     def _start_reviewed_scan(self):
-        self.reviewed_tree.blockSignals(True)
-        self.reviewed_tree.clear()
-        self.reviewed_tree.blockSignals(False)
-        self.reviewed_index_to_item = {}
-        loading_item = QTreeWidgetItem(["Scanning output folder..."])
-        loading_item.setFlags(Qt.ItemFlag.NoItemFlags)
-        self.reviewed_tree.addTopLevelItem(loading_item)
+        out_root = self.config.get("output_root", "")
+        if not out_root or not os.path.exists(out_root):
+            return
+        if self.active_tab == "reviewed":
+            self.reviewed_tree.blockSignals(True)
+            self.reviewed_tree.clear()
+            self.reviewed_tree.blockSignals(False)
+            self.reviewed_index_to_item = {}
+            loading_item = QTreeWidgetItem(["Scanning output folder..."])
+            loading_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.reviewed_tree.addTopLevelItem(loading_item)
         self._reviewed_scan_token += 1
         token = self._reviewed_scan_token
-        self._reviewed_scan_worker = ReviewedScanWorker(self.config.get("output_root", ""))
+        self._reviewed_scan_worker = ReviewedScanWorker(out_root)
         self._reviewed_scan_worker.finished.connect(lambda docs, t=token: self._on_reviewed_scan_done(docs, t))
         self._reviewed_scan_worker.start()
 
@@ -873,6 +878,8 @@ class ReviewTab(QWidget):
             return
         reviewed.sort(key=lambda d: d.get("original_filename", ""))
         self.reviewed_docs = reviewed
+        self.tab_reviewed_btn.setText(f"Reviewed ({len(self.reviewed_docs)})")
+        self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.auto_confirmed_docs)} auto | {len(self.reviewed_docs)} reviewed")
         if self.active_tab == "reviewed":
             self._populate_reviewed_tree(reviewed)
             if self._reviewed_active_index >= 0:
@@ -885,6 +892,48 @@ class ReviewTab(QWidget):
                 self.active_index = idx
                 self.load_document(reviewed[idx])
                 self._session_changed()
+
+    def _register_finalized_doc(self, doc: dict, result: dict):
+        output_path = result.get("output_path", "")
+        final_filename = result.get("final_filename", "")
+        if not output_path or not final_filename:
+            return
+        root = Path(self.config.get("output_root", ""))
+        try:
+            rel = Path(output_path).relative_to(root)
+            parts = rel.parts
+            if len(parts) >= 3:
+                div = parts[0]
+                company = "/".join(parts[1:-1])
+            elif len(parts) == 2:
+                div = parts[0]
+                company = parts[0]
+            else:
+                div = doc.get("division_code", "")
+                company = doc.get("company_name", "All Documents")
+        except Exception:
+            div = doc.get("division_code", "")
+            company = doc.get("company_name", "All Documents")
+
+        new_entry = {
+            "original_path": str(output_path),
+            "original_filename": final_filename,
+            "division_code": div,
+            "company_name": company,
+            "detected_date": final_filename[:8] if len(final_filename) >= 8 else doc.get("detected_date", ""),
+            "confidence": 100,
+            "method": "finalized",
+            "blank_pages": [],
+            "docsep_pages": [],
+        }
+        norm_new = os.path.normcase(os.path.normpath(str(output_path)))
+        self.reviewed_docs = [d for d in self.reviewed_docs if os.path.normcase(os.path.normpath(d.get("original_path", ""))) != norm_new]
+        self.reviewed_docs.append(new_entry)
+        self.reviewed_docs.sort(key=lambda d: d.get("original_filename", ""))
+        self.tab_reviewed_btn.setText(f"Reviewed ({len(self.reviewed_docs)})")
+        self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.auto_confirmed_docs)} auto | {len(self.reviewed_docs)} reviewed")
+        if self.active_tab == "reviewed":
+            self._populate_reviewed_tree(self.reviewed_docs)
 
     def _populate_reviewed_tree(self, docs: list):
         self.reviewed_tree.blockSignals(True)
@@ -1327,11 +1376,13 @@ class ReviewTab(QWidget):
             self.load_document(self.reviewed_docs[row])
 
     def _save_auto_confirmed_updates(self):
-        auto_file = Path(self.config["flagged_root"]) / "auto_confirmed_index.json"
-        auto_file.parent.mkdir(parents=True, exist_ok=True)
-        clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.auto_confirmed_docs]
-        with open(auto_file, "w", encoding="utf-8") as f:
-            json.dump(clean, f, indent=2, ensure_ascii=False)
+        f_root = self.config.get("flagged_root", "")
+        if f_root:
+            auto_file = Path(f_root) / "auto_confirmed_index.json"
+            auto_file.parent.mkdir(parents=True, exist_ok=True)
+            clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.auto_confirmed_docs]
+            with open(auto_file, "w", encoding="utf-8") as f:
+                json.dump(clean, f, indent=2, ensure_ascii=False)
         self._session_changed()
 
     def clear_all(self):
@@ -1442,6 +1493,19 @@ class ReviewTab(QWidget):
             if pdf_path and os.path.exists(pdf_path):
                 try:
                     self.current_pdf_doc = fitz.open(pdf_path)
+                    self.total_pages = len(self.current_pdf_doc)
+                    loaded = True
+                except Exception:
+                    pass
+
+        if not loaded:
+            # Prefer the staged copy recorded at flag time (collision-free even
+            # when the company name was never resolved); fall back to the legacy
+            # {division}/{company}/{filename} shape for older indexes.
+            staged = doc.get("flagged_copy_path", "")
+            if staged and os.path.exists(staged):
+                try:
+                    self.current_pdf_doc = fitz.open(staged)
                     self.total_pages = len(self.current_pdf_doc)
                     loaded = True
                 except Exception:
@@ -2449,6 +2513,7 @@ class ReviewTab(QWidget):
                 self.pending_docs.pop(self.active_index)
                 self.all_flagged_docs = [d for d in self.all_flagged_docs if d is not doc]
                 self._save_flagged_updates()
+                self._register_finalized_doc(doc, result)
                 self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
                 self.current_pdf_doc = None
                 self.active_index = -1
@@ -2476,6 +2541,7 @@ class ReviewTab(QWidget):
             if result.get("success"):
                 self.auto_confirmed_docs.pop(self.active_index)
                 self._save_auto_confirmed_updates()
+                self._register_finalized_doc(doc, result)
                 self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
                 self.current_pdf_doc = None
                 self.active_index = -1
@@ -2607,11 +2673,13 @@ class ReviewTab(QWidget):
             return False
 
     def _save_flagged_updates(self):
-        flagged_file = Path(self.config["flagged_root"]) / "flagged_index.json"
-        flagged_file.parent.mkdir(parents=True, exist_ok=True)
-        clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.all_flagged_docs]
-        with open(flagged_file, "w", encoding="utf-8") as f:
-            json.dump(clean, f, indent=2, ensure_ascii=False)
+        f_root = self.config.get("flagged_root", "")
+        if f_root:
+            flagged_file = Path(f_root) / "flagged_index.json"
+            flagged_file.parent.mkdir(parents=True, exist_ok=True)
+            clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.all_flagged_docs]
+            with open(flagged_file, "w", encoding="utf-8") as f:
+                json.dump(clean, f, indent=2, ensure_ascii=False)
         self._session_changed()
 
     def _pipeline_config(self):
@@ -2624,6 +2692,7 @@ class ReviewTab(QWidget):
             page_index=self.config.get("page_index", 0),
             earliest_year=self.config.get("earliest_year", 1990),
             ocr_engine=self.config.get("ocr_engine", "tesseract"),
+            division_code=self.config.get("division_code", ""),
         )
         config.enable_qc = self.config.get("enable_qc", None)
         config.enable_docsep_removal = self.config.get("enable_docsep_removal", True)
@@ -2634,7 +2703,7 @@ class ReviewTab(QWidget):
         config.qc_oversized_margin = self.config.get("qc_oversized_margin", 0.3)
         config.qc_blur_threshold = self.config.get("qc_blur_threshold", 100)
         config.min_file_size_kb = self.config.get("min_file_size_kb", 10)
-        config.output_layout = self.config.get("output_layout", "company")
+        config.output_layout = self.config.get("output_layout", "mirror")
         return config
 
     def _show_document_menu(self, idx: int, global_pos: QPoint):
@@ -3177,6 +3246,7 @@ class ReviewTab(QWidget):
             self.auto_confirmed_docs.pop(self.active_index)
             self._save_auto_confirmed_updates()
 
+        self._register_finalized_doc(doc, result)
         self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
 
         self.current_pdf_doc = None
@@ -3227,6 +3297,7 @@ class ReviewTab(QWidget):
             self.auto_confirmed_docs = []
             self._save_auto_confirmed_updates()
             QMessageBox.information(self, "Confirm All", f"All {done} documents finalized and moved to the output folder.")
+        self._start_reviewed_scan()
         self.refresh_doc_list()
         self._session_changed()
 

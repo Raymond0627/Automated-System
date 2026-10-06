@@ -219,7 +219,7 @@ class TestPipelineResumeMode(unittest.TestCase):
             division_code="D",
             company_name="Acme",
         )
-        widgets.parse_folder_structure = lambda root: [DivisionBatch("D", [doc])]
+        widgets.parse_folder_structure = lambda root, division_code="": [DivisionBatch("D", [doc])]
 
         plan_events = []
         thread = PipelineThread(self.config, 0)

@@ -44,6 +44,8 @@ class MainWindow(QMainWindow):
         # 2. If no session was restored, check if first run setup is needed
         if not restored:
             self._check_first_run()
+        if self.config.get("output_root"):
+            self.review_tab._start_reviewed_scan()
 
     def _setup_ui(self):
         self.setWindowTitle("Lumeed QScan")
@@ -159,6 +161,7 @@ class MainWindow(QMainWindow):
             "input_root": "",
             "output_root": "",
             "flagged_root": "",
+            "division_code": "",
             "first_run_completed": True,
             "confidence_threshold": 85,
             "page_index": 0,
@@ -192,7 +195,7 @@ class MainWindow(QMainWindow):
             "enhance_color_clahe_tile": 8,
             "auto_save_enabled": False,
             "batch_size": 50,
-            "output_layout": "company",
+            "output_layout": "mirror",
         }
         if Path(self.config_path).exists():
             try:
@@ -234,10 +237,8 @@ class MainWindow(QMainWindow):
 
     def _on_pipeline_finished(self):
         if hasattr(self, "review_tab"):
-            # If on reviewed tab, scan output directory for newly created files
-            if self.review_tab.active_tab == "reviewed":
-                self.review_tab._start_reviewed_scan()
-            else:
+            self.review_tab._start_reviewed_scan()
+            if self.review_tab.active_tab != "reviewed":
                 self.review_tab._on_auto_refresh()
 
     def _sync_scan_to_session(self):

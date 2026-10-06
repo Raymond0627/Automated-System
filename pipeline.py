@@ -15,6 +15,11 @@ from auto_qc import run_qc_on_pdf, detect_docsep_flag
 from company_extractor import get_company_name_for_filename
 
 
+# Directories under the input/output roots that are pipeline artifacts, never
+# company folders.
+SKIP_NAMES = {"passed", "failed", "processed", "flagged", "logs", "data", "output"}
+
+
 @dataclass
 class Document:
     original_path: str
@@ -32,6 +37,9 @@ class Document:
     docsep_pages: List[int] = field(default_factory=list)
     company_confidence: int = 0
     company_tier: str = ""
+    # Folder path of this PDF relative to the input root ("" when the PDF sits
+    # directly in the input root). Used by the "mirror" output layout.
+    rel_dir: str = ""
 
 
 @dataclass
@@ -45,16 +53,21 @@ class PipelineConfig:
         self,
         input_root: str,
         output_root: str,
-        flagged_root: str,
+        flagged_root: str = "",
         confidence_threshold: int = 70,
         page_index: int = 0,
         sequence_start: int = 1,
         earliest_year: int = 1990,
         ocr_engine: str = "tesseract",
+        division_code: str = "",
     ):
         self.input_root = Path(input_root)
         self.output_root = Path(output_root)
-        self.flagged_root = Path(flagged_root)
+        self.flagged_root = Path(flagged_root) if flagged_root else None
+        # Division code is user-supplied on the Dashboard (never read from a
+        # folder name). Blank means "no division assigned", so the output stays
+        # flat instead of nesting under an empty/placeholder directory.
+        self.division_code = normalize_division_code(division_code.strip()) if division_code else ""
         self.confidence_threshold = confidence_threshold
         self.page_index = page_index
         self.sequence_start = sequence_start
@@ -69,72 +82,89 @@ class PipelineConfig:
         self.audit_enabled = True
         self.render_dpi = 150
         self.keep_input_structure = False
-        self.output_layout = "company"
+        self.output_layout = "mirror"
         
         self.output_root.mkdir(parents=True, exist_ok=True)
-        self.flagged_root.mkdir(parents=True, exist_ok=True)
+        if self.flagged_root:
+            self.flagged_root.mkdir(parents=True, exist_ok=True)
 
 
 def normalize_division_code(division: str) -> str:
-    return division.zfill(3)
-
-
-def sanitize_company_name(company: str) -> str:
-    words = company.strip().split()
-    title_words = [w.upper() for w in words]
-    return "_".join(title_words)
+    division = division.strip()
+    return division.zfill(3) if division.isdigit() else division
 
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', name)
 
 
-def parse_folder_structure(root: Path) -> List[DivisionBatch]:
-    divisions = []
-    
-    skip_names = {"passed", "failed", "processed", "flagged", "logs", "data", "output"}
-    
-    for div_dir in sorted(root.iterdir()):
-        if not div_dir.is_dir():
-            continue
-        
-        division_code = normalize_division_code(div_dir.name)
-        documents = []
-        
-        for item in sorted(div_dir.iterdir()):
-            # Skip certain directories that are not company folders
-            if item.is_dir() and item.name.lower() in skip_names:
+def default_output_root(input_root) -> Path:
+    """
+    Sibling of the input folder named "(input folder name) output".
+
+    C:\\Scans\\MyBatch  ->  C:\\Scans\\MyBatch output
+    """
+    input_path = Path(input_root)
+    return input_path.parent / f"{input_path.name} output"
+
+
+def mirrored_output_dir(config, doc_or_path, rel_dir: str = "") -> Path:
+    """
+    Recreate the input folder tree under output_root.
+
+    The PDF's folder path relative to input_root is rebuilt inside output_root,
+    so parent/child/grandchild folders all reappear exactly as they were.
+    """
+    if not rel_dir:
+        src = Path(getattr(doc_or_path, "original_path", doc_or_path) or "")
+        for base in (config.input_root, config.output_root):
+            try:
+                rel_dir = str(src.relative_to(base).parent).replace("\\", "/")
+                break
+            except (ValueError, OSError):
                 continue
-            
-            # If it's a directory, treat it as a company folder
-            if item.is_dir():
-                company_name = sanitize_company_name(item.name)
-                
-                for pdf_file in sorted(item.glob("*.pdf")):
-                    doc = Document(
-                        original_path=str(pdf_file),
-                        division_code=division_code,
-                        company_name=company_name,
-                        original_filename=pdf_file.name,
-                    )
-                    documents.append(doc)
-            # If it's a file (not a directory), it might be a PDF directly in the division folder
-            # or if it's in the company folder already, we handle it above
-            elif item.suffix.lower() == '.pdf':
-                # PDF directly in division folder - unusual but handle it
-                company_name = sanitize_company_name(div_dir.name)
-                doc = Document(
-                    original_path=str(item),
-                    division_code=division_code,
-                    company_name=company_name,
-                    original_filename=item.name,
-                )
-                documents.append(doc)
-        
-        if documents:
-            divisions.append(DivisionBatch(division_code=division_code, documents=documents))
-    
-    return divisions
+    if rel_dir and rel_dir not in (".", ""):
+        return config.output_root / Path(rel_dir)
+    return config.output_root
+
+
+def parse_folder_structure(root: Path, division_code: str = "") -> List[DivisionBatch]:
+    """
+    Walk {root} recursively for *.pdf at any depth.
+
+    Multi-hierarchy input is supported: every folder level below the input root
+    is preserved on the Document as `rel_dir` (the folder path relative to the
+    input root), so the mirror output layout can recreate the same tree.
+
+    The division code is supplied by the caller (from the Dashboard field), not
+    derived from folder names. Grouping is reported as a single batch carrying
+    `division_code`.
+    """
+    division_code = normalize_division_code(division_code.strip()) if division_code else ""
+
+    documents = []
+    if root.exists():
+        for path in sorted(root.rglob("*.pdf")):
+            if not path.is_file():
+                continue
+            # Skip pipeline artifact folders (output/flagged/processed/...)
+            # wherever they appear in the tree.
+            rel_parts = path.relative_to(root).parts
+            if any(part.lower() in SKIP_NAMES for part in rel_parts[:-1]):
+                continue
+            rel_dir_parts = rel_parts[:-1]
+            documents.append(Document(
+                original_path=str(path),
+                division_code=division_code,
+                company_name="",
+                original_filename=path.name,
+                rel_dir="/".join(rel_dir_parts),
+            ))
+
+    if not documents:
+        return []
+
+    return [DivisionBatch(division_code=division_code, documents=documents)]
 
 
 def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> None:
@@ -161,7 +191,7 @@ def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> Non
                 _doc.close()
             except Exception:
                 page_texts = [{"page_text": t, "page_idx": i} for i, t in enumerate(result.page_texts)]
-            company_result = get_company_name_for_filename(page_texts, doc.company_name)
+            company_result = get_company_name_for_filename(page_texts)
             doc.company_name = company_result.get("company_name", doc.company_name)
             doc.company_confidence = company_result.get("company_confidence", 0)
             doc.company_tier = company_result.get("tier_used", "")
@@ -220,6 +250,7 @@ def create_flagged_data(doc: Document, result: Optional[DateResult], error: str 
         "company_name": doc.company_name,
         "original_filename": doc.original_filename,
         "error": error,
+        "flagged_copy_path": "",
     }
     
     if result:
@@ -248,16 +279,27 @@ def create_flagged_data(doc: Document, result: Optional[DateResult], error: str 
 
 
 def save_flagged_documents(batches: List[DivisionBatch], config: PipelineConfig) -> None:
+    if not getattr(config, "flagged_root", None):
+        return
     flagged_data = []
     
     for batch in batches:
         for doc in batch.documents:
             if doc.status in ("flagged", "failed") and doc.flagged_data:
                 flagged_data.append(doc.flagged_data)
-                
+
+                # company_name is "" until a reviewer resolves it, so the same
+                # original filename can arrive from two different company folders.
+                # De-collide rather than silently overwriting a staged copy.
                 flagged_div_dir = config.flagged_root / doc.division_code / doc.company_name
                 flagged_div_dir.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(doc.original_path, flagged_div_dir / doc.original_filename)
+                staged = flagged_div_dir / doc.original_filename
+                counter = 1
+                while staged.exists():
+                    staged = flagged_div_dir / f"{Path(doc.original_filename).stem}_{counter}{Path(doc.original_filename).suffix}"
+                    counter += 1
+                shutil.copy2(doc.original_path, staged)
+                doc.flagged_data["flagged_copy_path"] = str(staged)
     
     flagged_index = config.flagged_root / "flagged_index.json"
     with open(flagged_index, "w", encoding="utf-8") as f:
@@ -265,6 +307,8 @@ def save_flagged_documents(batches: List[DivisionBatch], config: PipelineConfig)
 
 
 def save_confirmed_documents(batches: List[DivisionBatch], config: PipelineConfig) -> None:
+    if not getattr(config, "flagged_root", None):
+        return
     confirmed_data = []
 
     for batch in batches:
@@ -297,6 +341,8 @@ def save_confirmed_documents(batches: List[DivisionBatch], config: PipelineConfi
 
 
 def load_flagged_index(config: PipelineConfig) -> List[Dict]:
+    if not getattr(config, "flagged_root", None):
+        return []
     flagged_index = config.flagged_root / "flagged_index.json"
     if flagged_index.exists():
         with open(flagged_index, "r", encoding="utf-8") as f:
@@ -317,8 +363,21 @@ def update_document_from_review(doc: Document, review_data: Dict) -> None:
 def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) -> None:
     confirmed_docs = [d for d in batch.documents if d.status == "confirmed" and d.confirmed_date]
     confirmed_docs.sort(key=lambda d: d.confirmed_date)
-    
-    for i, doc in enumerate(confirmed_docs, start=config.sequence_start):
+
+    mirror = getattr(config, "output_layout", "company") == "mirror"
+    if mirror:
+        # Number documents within each mirrored folder so every child folder
+        # starts its own 0001, 0002, ... sequence.
+        seq_by_folder: Dict[str, int] = {}
+        for doc in confirmed_docs:
+            n = seq_by_folder.get(doc.rel_dir, config.sequence_start - 1) + 1
+            seq_by_folder[doc.rel_dir] = n
+            doc.sequence_number = n
+        doc_pairs = [(seq_by_folder[d.rel_dir], d) for d in confirmed_docs]
+    else:
+        doc_pairs = list(enumerate(confirmed_docs, start=config.sequence_start))
+
+    for i, doc in doc_pairs:
         try:
             doc.sequence_number = i
 
@@ -332,7 +391,9 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
 
             doc.final_filename = f"{yyyymm}{seq}_{div}_{company}.pdf"
 
-            if config.keep_input_structure:
+            if mirror:
+                output_div_dir = mirrored_output_dir(config, doc, doc.rel_dir)
+            elif config.keep_input_structure:
                 try:
                     path_for_rel = getattr(doc, '_original_input_path', doc.original_path)
                     rel = Path(path_for_rel).relative_to(config.input_root)
@@ -392,48 +453,50 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
                 else:
                     d.close()
 
-            log_writer.writerow({
-                "timestamp": datetime.now().isoformat(),
-                "original_path": doc.original_path,
-                "new_filename": output_path.name,
-                "new_path": str(output_path),
-                "division_code": doc.division_code,
-                "company_name": doc.company_name,
-                "document_date": doc.confirmed_date.isoformat() if hasattr(doc.confirmed_date, 'isoformat') else str(doc.confirmed_date),
-                "yyyymm": yyyymm,
-                "sequence_number": doc.sequence_number,
-                "confidence": doc.date_result.confidence if doc.date_result else 100,
-                "method": doc.confirmed_method,
-                "blank_pages": str(doc.blank_pages) if doc.blank_pages else "",
-                "blank_removed": blank_removed_count,
-                "docsep_pages": str(doc.docsep_pages) if doc.docsep_pages else "",
-                "docsep_removed": docsep_removed_count,
-                "status": "copied",
-            })
-        except Exception as e:
-            # Don't let one bad document abort the rest of the batch/run.
-            print(f"[finalize_division] Failed to finalize '{doc.original_path}': {e}")
-            try:
+            if log_writer:
                 log_writer.writerow({
                     "timestamp": datetime.now().isoformat(),
                     "original_path": doc.original_path,
-                    "new_filename": "",
-                    "new_path": "",
+                    "new_filename": output_path.name,
+                    "new_path": str(output_path),
                     "division_code": doc.division_code,
                     "company_name": doc.company_name,
-                    "document_date": doc.confirmed_date.isoformat() if hasattr(doc.confirmed_date, 'isoformat') else str(doc.confirmed_date) if doc.confirmed_date else "",
-                    "yyyymm": "",
+                    "document_date": doc.confirmed_date.isoformat() if hasattr(doc.confirmed_date, 'isoformat') else str(doc.confirmed_date),
+                    "yyyymm": yyyymm,
                     "sequence_number": doc.sequence_number,
-                    "confidence": doc.date_result.confidence if doc.date_result else "",
+                    "confidence": doc.date_result.confidence if doc.date_result else 100,
                     "method": doc.confirmed_method,
                     "blank_pages": str(doc.blank_pages) if doc.blank_pages else "",
-                    "blank_removed": 0,
+                    "blank_removed": blank_removed_count,
                     "docsep_pages": str(doc.docsep_pages) if doc.docsep_pages else "",
-                    "docsep_removed": 0,
-                    "status": f"error: {e}",
+                    "docsep_removed": docsep_removed_count,
+                    "status": "copied",
                 })
-            except Exception:
-                pass
+        except Exception as e:
+            # Don't let one bad document abort the rest of the batch/run.
+            print(f"[finalize_division] Failed to finalize '{doc.original_path}': {e}")
+            if log_writer:
+                try:
+                    log_writer.writerow({
+                        "timestamp": datetime.now().isoformat(),
+                        "original_path": doc.original_path,
+                        "new_filename": "",
+                        "new_path": "",
+                        "division_code": doc.division_code,
+                        "company_name": doc.company_name,
+                        "document_date": doc.confirmed_date.isoformat() if hasattr(doc.confirmed_date, 'isoformat') else str(doc.confirmed_date) if doc.confirmed_date else "",
+                        "yyyymm": "",
+                        "sequence_number": doc.sequence_number,
+                        "confidence": doc.date_result.confidence if doc.date_result else "",
+                        "method": doc.confirmed_method,
+                        "blank_pages": str(doc.blank_pages) if doc.blank_pages else "",
+                        "blank_removed": 0,
+                        "docsep_pages": str(doc.docsep_pages) if doc.docsep_pages else "",
+                        "docsep_removed": 0,
+                        "status": f"error: {e}",
+                    })
+                except Exception:
+                    pass
             continue
 
 
@@ -442,8 +505,8 @@ def run_pipeline(config: PipelineConfig, progress_callback=None) -> List[Divisio
         progress_callback({"stage": "scanning", "message": "Scanning input folder...", "progress": 5})
     
     print(f"Scanning input folder: {config.input_root}")
-    batches = parse_folder_structure(config.input_root)
-    print(f"Found {len(batches)} divisions with documents")
+    batches = parse_folder_structure(config.input_root, config.division_code)
+    print(f"Found {len(batches)} division batch(es) with documents")
     
     total_docs = sum(len(b.documents) for b in batches)
     print(f"Total documents: {total_docs}")
@@ -487,30 +550,9 @@ def run_pipeline(config: PipelineConfig, progress_callback=None) -> List[Divisio
 
 
 def finalize_all_divisions(batches: List[DivisionBatch], config: PipelineConfig) -> None:
-    log_path = config.output_root / "rename_log.csv"
-    log_exists = log_path.exists()
-
-    # NOTE: fieldnames must include every key written by finalize_division's
-    # log_writer.writerow(...) calls (including the error-path row), or
-    # csv.DictWriter raises ValueError mid-run and silently aborts the
-    # remaining divisions/documents.
-    fieldnames = [
-        "timestamp", "original_path", "new_filename", "new_path",
-        "division_code", "company_name", "document_date", "yyyymm",
-        "sequence_number", "confidence", "method", "blank_pages",
-        "blank_removed", "docsep_pages", "docsep_removed", "status"
-    ]
-
-    with open(log_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        
-        if not log_exists:
-            writer.writeheader()
-        
-        for batch in batches:
-            finalize_division(batch, config, writer)
-    
-    print(f"Finalization complete. Log saved to: {log_path}")
+    for batch in batches:
+        finalize_division(batch, config, None)
+    print("Finalization complete.")
 
 
 def move_confirmed_to_passed(config: PipelineConfig, batches: List[DivisionBatch]) -> None:
@@ -553,12 +595,21 @@ def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
     output_root.mkdir(parents=True, exist_ok=True)
 
     original_path = doc_data.get("original_path", "")
-    division_code = doc_data.get("division_code", "")
+    # Normalize here as well as in PipelineConfig: doc dicts carry the raw text
+    # the user typed on the Dashboard, and the filename must use the same padded
+    # form as the output folder name.
+    division_code = normalize_division_code((doc_data.get("division_code") or "").strip())
     company_name = doc_data.get("company_name", "")
     detected_date = doc_data.get("detected_date", "")
     blank_pages = doc_data.get("blank_pages", [])
     docsep_pages = doc_data.get("docsep_pages", [])
     pending_bytes = doc_data.get("_pending_pdf_bytes", None)
+
+    # The company name is resolved from the PDF text, not from the source folder,
+    # so it can legitimately still be empty here. Refuse rather than emit a
+    # malformed name like "2024010002154___.pdf".
+    if not company_name.strip():
+        return {"success": False, "error": "Company name is empty - enter a company name before finalizing"}
 
     try:
         parts = detected_date.split("-")
@@ -566,18 +617,14 @@ def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
     except (ValueError, IndexError):
         yyyymm = _dt.now().strftime("%Y%m")
 
-    import csv
-    log_path = output_root / "rename_log.csv"
-    log_exists = log_path.exists()
-    fieldnames = [
-        "timestamp", "original_path", "new_filename", "new_path",
-        "division_code", "company_name", "document_date", "yyyymm",
-        "sequence_number", "confidence", "method", "blank_pages",
-        "blank_removed", "docsep_pages", "docsep_removed", "status"
-    ]
-
     company_dir = sanitize_filename(company_name)
-    if getattr(config, "output_layout", "company") == "flat":
+    layout = getattr(config, "output_layout", "company")
+    if layout == "mirror":
+        # Recreate the input tree: <parent> output/<child>/.../<file>.pdf
+        output_div_dir = mirrored_output_dir(config, original_path, doc_data.get("rel_dir", ""))
+        flat_glob = output_div_dir.glob(f"{yyyymm}*_{division_code}_{company_dir}.pdf")
+        seq = len(list(flat_glob)) + 1
+    elif layout == "flat":
         output_div_dir = output_root
         seq = _next_folder_sequence(output_root)
     else:
@@ -634,32 +681,6 @@ def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
             shutil.move(tmp.name, str(output_path))
         else:
             d.close()
-
-    try:
-        with open(log_path, "a", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            if not log_exists:
-                writer.writeheader()
-            writer.writerow({
-                "timestamp": _dt.now().isoformat(),
-                "original_path": original_path,
-                "new_filename": output_path.name,
-                "new_path": str(output_path),
-                "division_code": division_code,
-                "company_name": company_name,
-                "document_date": detected_date,
-                "yyyymm": yyyymm,
-                "sequence_number": seq,
-                "confidence": doc_data.get("confidence", 100),
-                "method": doc_data.get("method", "auto"),
-                "blank_pages": str(blank_pages) if blank_pages else "",
-                "blank_removed": blank_removed_count,
-                "docsep_pages": str(docsep_pages) if docsep_pages else "",
-                "docsep_removed": docsep_removed_count,
-                "status": "copied",
-            })
-    except Exception:
-        pass
 
     return {
         "success": True,
