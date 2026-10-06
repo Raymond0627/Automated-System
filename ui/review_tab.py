@@ -2703,7 +2703,7 @@ class ReviewTab(QWidget):
         config.qc_oversized_margin = self.config.get("qc_oversized_margin", 0.3)
         config.qc_blur_threshold = self.config.get("qc_blur_threshold", 100)
         config.min_file_size_kb = self.config.get("min_file_size_kb", 10)
-        config.output_layout = self.config.get("output_layout", "mirror")
+        config.output_layout = self.config.get("output_layout", "flat")
         return config
 
     def _show_document_menu(self, idx: int, global_pos: QPoint):

@@ -290,7 +290,7 @@ class PipelineThread(QThread):
             pipeline_config.enable_blank_removal = self.config.get("enable_blank_removal", True)
             pipeline_config.rename_enabled = self.config.get("rename_enabled", True)
             pipeline_config.audit_enabled = self.config.get("audit_enabled", True)
-            pipeline_config.output_layout = self.config.get("output_layout", "mirror")
+            pipeline_config.output_layout = self.config.get("output_layout", "flat")
 
             render_dpi = self.config.get("render_dpi", 200)
             pipeline_config.render_dpi = render_dpi

@@ -82,7 +82,7 @@ class PipelineConfig:
         self.audit_enabled = True
         self.render_dpi = 150
         self.keep_input_structure = False
-        self.output_layout = "mirror"
+        self.output_layout = "flat"
         
         self.output_root.mkdir(parents=True, exist_ok=True)
         if self.flagged_root:

@@ -640,7 +640,7 @@ class SettingsTab(QWidget):
         self.layout_combo.addItem("Mirror input folders (same tree)", "mirror")
         self.layout_combo.addItem("Per-company folders (Division / Company)", "company")
         self.layout_combo.addItem("Single folder (all documents)", "flat")
-        idx = self.layout_combo.findData(self.config.get("output_layout", "mirror"))
+        idx = self.layout_combo.findData(self.config.get("output_layout", "flat"))
         self.layout_combo.setCurrentIndex(idx if idx >= 0 else 0)
         layout_row.addWidget(self.layout_combo, 1)
         format_col.addLayout(layout_row)

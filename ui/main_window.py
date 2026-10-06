@@ -161,7 +161,7 @@ class MainWindow(QMainWindow):
             "input_root": "",
             "output_root": "",
             "flagged_root": "",
-            "division_code": "",
+            "division_code": "155",
             "first_run_completed": True,
             "confidence_threshold": 85,
             "page_index": 0,
@@ -176,7 +176,7 @@ class MainWindow(QMainWindow):
             "rename_enabled": False,
             "audit_enabled": True,
             "render_dpi": 200,
-            "max_workers": 4,
+            "max_workers": 2,
             "gpu_mode": "cpu",
             "remote_gpu_url": "",
             "enhance_enabled": True,
@@ -195,7 +195,7 @@ class MainWindow(QMainWindow):
             "enhance_color_clahe_tile": 8,
             "auto_save_enabled": False,
             "batch_size": 50,
-            "output_layout": "mirror",
+            "output_layout": "flat",
         }
         if Path(self.config_path).exists():
             try:
