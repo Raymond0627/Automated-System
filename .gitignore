@@ -23,3 +23,5 @@ dist/
 *.exe
 __pycache__/
 *.pyc
+
+.worktrees/
