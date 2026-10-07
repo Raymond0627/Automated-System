@@ -182,3 +182,55 @@ def test_page_pane_selection_positions_sorted():
     assert pane.selected_positions() == [0, 2]
     press(pane.thumbs[1])
     assert pane.selected_positions() == [1]
+
+
+def test_page_pane_drop_event_routes_by_payload():
+    from PyQt6.QtCore import QEvent, QMimeData, QPoint, QPointF, Qt
+    from PyQt6.QtGui import QDropEvent
+
+    pane = _pane(3)
+    # drop positions are geometric: show the pane so the grid assigns real
+    # thumb rectangles (a never-shown pane lays everything out at 0,0)
+    pane.show()
+    pane.layout().activate()
+    from PyQt6.QtWidgets import QApplication
+    QApplication.instance().processEvents()
+    calls = []
+    pane.on_cross_drop = lambda src_id, positions, insert_at: calls.append(
+        (src_id, positions, insert_at)
+    )
+
+    def drop(text, thumb, local_x):
+        mime = QMimeData()
+        mime.setText(text)
+        pos = QPointF(thumb.mapTo(pane, QPoint(local_x, 4)))
+        event = QDropEvent(pos, Qt.DropAction.MoveAction, mime,
+                           Qt.MouseButton.LeftButton,
+                           Qt.KeyboardModifier.NoModifier)
+        pane.dropEvent(event)
+        return event
+
+    # cross-pane payload: delegates to the callback, left half of thumb 1
+    # inserts at index 1, and nothing about this pane changes
+    event = drop("pane:b:0", pane.thumbs[1], 3)
+    assert calls == [("b", [0], 1)]
+    assert event.isAccepted()
+    assert [r.src_page_index for r in pane.refs] == [0, 1, 2]
+
+    # same-pane payload: applied here, announced with pages_changed
+    fired = []
+    pane.pages_changed.connect(lambda: fired.append(True))
+    event = drop("pane:a:2", pane.thumbs[0], 3)
+    assert [r.src_page_index for r in pane.refs] == [2, 0, 1]
+    assert fired == [True]
+    assert event.isAccepted()
+
+    # unrelated mime data is refused
+    mime = QMimeData()
+    mime.setText("text/plain")
+    event = QDropEvent(QPointF(10, 10), Qt.DropAction.MoveAction, mime,
+                       Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier)
+    pane.dropEvent(event)
+    assert not event.isAccepted()
+    assert calls == [("b", [0], 1)]
+    pane.hide()
