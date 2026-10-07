@@ -28,6 +28,7 @@ from pipeline import (
 )
 from enhance import enhance_page
 from company_extractor import normalize_company_name, learn_company_name, load_known_companies, save_known_companies
+from organize_model import (PageRef, page_refs_for_source, markers_for, build_pdf_bytes)
 
 from .widgets import DocCardWidget, PassedDocCardWidget
 from .styles import get_palette_dict, get_combobox_popup_style, THEME_DARK
@@ -1044,7 +1045,17 @@ class ReviewTab(QWidget):
             duplicate_act = QAction(f"Duplicate ({count} files)", self)
             duplicate_act.triggered.connect(self._duplicate_selected_reviewed)
             menu.addAction(duplicate_act)
+
+            if count == 2 and len(self._get_current_docs()) >= 2:
+                organize_act = QAction("Organize These 2…", self)
+                organize_act.triggered.connect(self._organize_selected_pair)
+                menu.addAction(organize_act)
         else:
+            if len(self._get_current_docs()) >= 2:
+                organize_act = QAction("Organize Pages…", self)
+                organize_act.triggered.connect(lambda: self._organize_from_selection(selected[0]))
+                menu.addAction(organize_act)
+                menu.addSeparator()
             rename_act = QAction("Rename File...", self)
             rename_act.triggered.connect(lambda: self._rename_reviewed_at(selected[0]))
             menu.addAction(rename_act)
@@ -2731,7 +2742,17 @@ class ReviewTab(QWidget):
             duplicate_act = QAction(f"Duplicate ({count} files)", self)
             duplicate_act.triggered.connect(self._duplicate_selected_documents)
             menu.addAction(duplicate_act)
+
+            if count == 2 and len(self._get_current_docs()) >= 2:
+                organize_act = QAction("Organize These 2…", self)
+                organize_act.triggered.connect(self._organize_selected_pair)
+                menu.addAction(organize_act)
         else:
+            if len(self._get_current_docs()) >= 2:
+                organize_act = QAction("Organize Pages…", self)
+                organize_act.triggered.connect(lambda: self._organize_from_selection(idx))
+                menu.addAction(organize_act)
+                menu.addSeparator()
             duplicate_act = QAction("Duplicate", self)
             duplicate_act.triggered.connect(lambda: self._duplicate_document_at(idx))
             menu.addAction(duplicate_act)
@@ -2740,6 +2761,206 @@ class ReviewTab(QWidget):
             delete_act.triggered.connect(lambda: self._delete_document_at(idx))
             menu.addAction(delete_act)
         menu.exec(global_pos)
+
+    def _organize_source_doc(self, doc: dict):
+        """Open the readable source of ``doc``; returns ``(fitz_doc, kind)``.
+
+        ``kind`` is ``"bytes"`` when the content came from the in-memory
+        ``_pending_pdf_bytes`` buffer, otherwise ``"path"``.
+        """
+        pending_bytes = doc.get("_pending_pdf_bytes")
+        if pending_bytes:
+            return fitz.open("pdf", pending_bytes), "bytes"
+        for key in ("original_path", "flagged_copy_path"):
+            path = doc.get(key) or ""
+            if path and os.path.exists(path):
+                return fitz.open(path), "path"
+        raise FileNotFoundError(doc.get("original_filename", "document"))
+
+    def _organize_save_fn(self, tab: str):
+        if tab == "pending":
+            return self._save_flagged_updates
+        if tab == "auto_confirmed":
+            return self._save_auto_confirmed_updates
+        return lambda: None
+
+    def _refresh_organize_preview(self, doc_a: dict, doc_b: dict):
+        docs = self._get_current_docs()
+        if not (0 <= self.active_index < len(docs)):
+            return
+        current = docs[self.active_index]
+        if current is doc_a or current is doc_b:
+            self.load_document(current)
+
+    def _apply_organize(self, tab: str, doc_a: dict, doc_b: dict, sources: dict,
+                        refs_a: list[PageRef], refs_b: list[PageRef]):
+        """Apply an organizer commit for ``tab`` and return an undo callable.
+
+        Anything that can fail raises before the first write, so a failure
+        never leaves a half-applied commit behind.
+        """
+        if tab == "reviewed":
+            path_a = doc_a.get("original_path", "")
+            path_b = doc_b.get("original_path", "")
+            for path in (path_a, path_b):
+                # verify both paths before anything is read or written
+                if not path or not os.path.exists(path):
+                    raise FileNotFoundError(f"Cannot organize, file not found: {path}")
+            orig_a = Path(path_a).read_bytes()
+            orig_b = Path(path_b).read_bytes()
+            new_a = build_pdf_bytes(sources, refs_a)
+            new_b = build_pdf_bytes(sources, refs_b)
+            blank_a, docsep_a = markers_for(refs_a)
+            blank_b, docsep_b = markers_for(refs_b)
+            prev_a = (list(doc_a.get("blank_pages", [])), list(doc_a.get("docsep_pages", [])))
+            prev_b = (list(doc_b.get("blank_pages", [])), list(doc_b.get("docsep_pages", [])))
+
+            with open(path_a, "wb") as fh:
+                fh.write(new_a)
+            with open(path_b, "wb") as fh:
+                fh.write(new_b)
+
+            doc_a["blank_pages"], doc_a["docsep_pages"] = list(blank_a), list(docsep_a)
+            doc_b["blank_pages"], doc_b["docsep_pages"] = list(blank_b), list(docsep_b)
+            self._start_reviewed_scan()
+            self._refresh_organize_preview(doc_a, doc_b)
+
+            def undo():
+                with open(path_a, "wb") as fh:
+                    fh.write(orig_a)
+                with open(path_b, "wb") as fh:
+                    fh.write(orig_b)
+                doc_a["blank_pages"], doc_a["docsep_pages"] = prev_a
+                doc_b["blank_pages"], doc_b["docsep_pages"] = prev_b
+                self._start_reviewed_scan()
+                self._refresh_organize_preview(doc_a, doc_b)
+
+            return undo
+
+        new_a = build_pdf_bytes(sources, refs_a)
+        new_b = build_pdf_bytes(sources, refs_b)
+        blank_a, docsep_a = markers_for(refs_a)
+        blank_b, docsep_b = markers_for(refs_b)
+
+        snapshot = []
+        for doc, new_bytes, blanks, docseps in (
+            (doc_a, new_a, blank_a, docsep_a),
+            (doc_b, new_b, blank_b, docsep_b),
+        ):
+            snapshot.append({
+                "doc": doc,
+                "had_bytes": "_pending_pdf_bytes" in doc,
+                "bytes": bytes(doc["_pending_pdf_bytes"]) if "_pending_pdf_bytes" in doc else None,
+                "blank_pages": list(doc.get("blank_pages", [])),
+                "docsep_pages": list(doc.get("docsep_pages", [])),
+            })
+            doc["_pending_pdf_bytes"] = new_bytes
+            doc["blank_pages"] = list(blanks)
+            doc["docsep_pages"] = list(docseps)
+
+        def restore():
+            for snap in snapshot:
+                doc = snap["doc"]
+                if snap["had_bytes"]:
+                    doc["_pending_pdf_bytes"] = snap["bytes"]
+                else:
+                    doc.pop("_pending_pdf_bytes", None)
+                doc["blank_pages"] = snap["blank_pages"]
+                doc["docsep_pages"] = snap["docsep_pages"]
+
+        save = self._organize_save_fn(tab)
+        try:
+            save()
+        except Exception:
+            restore()
+            raise
+        self._refresh_organize_preview(doc_a, doc_b)
+
+        def undo():
+            restore()
+            save()
+            self._refresh_organize_preview(doc_a, doc_b)
+
+        return undo
+
+    def _pick_second_doc(self, docs: list, exclude_idx: int):
+        others = [(i, d) for i, d in enumerate(docs) if i != exclude_idx]
+        if not others:
+            return None
+        counts = {}
+        for _, d in others:
+            name = d.get("original_filename", "document")
+            counts[name] = counts.get(name, 0) + 1
+        seen = {}
+        labels = []
+        for _, d in others:
+            name = d.get("original_filename", "document")
+            seen[name] = seen.get(name, 0) + 1
+            labels.append(f"{name} #{seen[name]}" if counts[name] > 1 else name)
+        chosen, ok = QInputDialog.getItem(
+            self, "Organize Pages", "Combine with:", labels, 0, False)
+        if not ok or chosen not in labels:
+            return None
+        return others[labels.index(chosen)][1]
+
+    def _organize_from_selection(self, idx: int):
+        docs = self._get_current_docs()
+        if len(docs) < 2 or not (0 <= idx < len(docs)):
+            return
+        second = self._pick_second_doc(docs, idx)
+        if second is None:
+            return
+        self._open_organizer(docs[idx], second)
+
+    def _organize_selected_pair(self):
+        docs = self._get_current_docs()
+        if self.active_tab == "reviewed":
+            indices = self._get_reviewed_selected_indices()
+        else:
+            indices = [i for i in self.selected_indices if 0 <= i < len(docs)]
+        if len(indices) != 2:
+            return
+        self._open_organizer(docs[indices[0]], docs[indices[1]])
+
+    def _open_organizer(self, doc_a: dict, doc_b: dict):
+        from .organize_dialog import OrganizeDialog
+
+        try:
+            src_a, _ = self._organize_source_doc(doc_a)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Organize Pages",
+                f"Cannot open '{doc_a.get('original_filename', 'first document')}':\n{e}")
+            return
+
+        try:
+            src_b, _ = self._organize_source_doc(doc_b)
+        except Exception as e:
+            src_a.close()
+            QMessageBox.warning(
+                self, "Organize Pages",
+                f"Cannot open '{doc_b.get('original_filename', 'second document')}':\n{e}")
+            return
+
+        try:
+            refs_a = page_refs_for_source(
+                "a", len(src_a), doc_a.get("blank_pages"), doc_a.get("docsep_pages"))
+            refs_b = page_refs_for_source(
+                "b", len(src_b), doc_b.get("blank_pages"), doc_b.get("docsep_pages"))
+            dialog = OrganizeDialog(
+                {"a": src_a, "b": src_b}, refs_a, refs_b,
+                doc_a.get("original_filename", "Document A"),
+                doc_b.get("original_filename", "Document B"),
+                commit_fn=lambda ra, rb: self._apply_organize(
+                    self.active_tab, doc_a, doc_b,
+                    {"a": src_a, "b": src_b}, ra, rb),
+                config=self.config,
+                parent=self,
+            )
+            dialog.exec()
+        finally:
+            src_a.close()
+            src_b.close()
 
     def _merge_selected_documents(self):
         if self.active_tab not in ("pending", "auto_confirmed"):
