@@ -92,3 +92,93 @@ def test_build_pdf_bytes_multi_source_order():
     out = fitz.open("pdf", data)
     assert len(out) == 3
     out.close()
+
+
+def _pane(n_pages=3, pane_id="a", title="Doc A"):
+    from PyQt6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from ui.organize_dialog import PagePane
+    return PagePane(
+        {"a": _pdf(n_pages)}, page_refs_for_source("a", n_pages),
+        pane_id, title, {"theme": "Dark Mode"},
+    )
+
+
+def test_page_pane_refs_roundtrip():
+    from PyQt6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from ui.organize_dialog import PagePane
+
+    pane = PagePane({"a": _pdf(3)}, page_refs_for_source("a", 3), "a",
+                    "Doc A", {"theme": "Dark Mode"})
+    assert len(pane.refs) == 3
+    pane.set_refs(page_refs_for_source("a", 2))
+    assert len(pane.refs) == 2
+
+
+def test_page_pane_drag_payload_roundtrip():
+    from PyQt6.QtWidgets import QApplication
+    QApplication.instance() or QApplication([])
+    from ui.organize_dialog import build_drag_payload, parse_drag_payload
+
+    assert build_drag_payload("a", [2, 0]) == "pane:a:0,2"
+    assert parse_drag_payload("pane:a:0,2") == ("a", [0, 2])
+    assert parse_drag_payload("pane:b:1,0") == ("b", [0, 1])
+    assert parse_drag_payload("") is None
+    assert parse_drag_payload("not a payload") is None
+    assert parse_drag_payload("pane::1") is None
+    assert parse_drag_payload("pane:a:1,x") is None
+
+
+def test_page_pane_internal_drop_reorders_and_emits():
+    pane = _pane(3)
+    fired = []
+    pane.pages_changed.connect(lambda: fired.append(True))
+
+    assert pane.handle_drop_payload("pane:a:0", 3) is True
+    assert [r.src_page_index for r in pane.refs] == [1, 2, 0]
+    assert fired == [True]
+
+    assert pane.handle_drop_payload("pane:a:0,1,2", 0) is False
+    assert [r.src_page_index for r in pane.refs] == [1, 2, 0]
+
+
+def test_page_pane_cross_drop_delegates_to_callback():
+    pane = _pane(3)
+    calls = []
+    pane.on_cross_drop = lambda src_id, positions, insert_at: calls.append(
+        (src_id, positions, insert_at)
+    )
+    fired = []
+    pane.pages_changed.connect(lambda: fired.append(True))
+
+    assert pane.handle_drop_payload("pane:b:1,0", 2) is True
+    assert calls == [("b", [0, 1], 2)]
+    assert fired == []
+    assert [r.src_page_index for r in pane.refs] == [0, 1, 2]
+
+    pane.on_cross_drop = None
+    assert pane.handle_drop_payload("pane:b:1", 0) is False
+    assert len(calls) == 1
+
+
+def test_page_pane_selection_positions_sorted():
+    from PyQt6.QtCore import QEvent, QPointF, Qt
+    from PyQt6.QtGui import QMouseEvent
+
+    pane = _pane(3)
+
+    def press(thumb, modifiers=Qt.KeyboardModifier.NoModifier):
+        thumb.mousePressEvent(QMouseEvent(
+            QEvent.Type.MouseButtonPress, QPointF(4, 4), QPointF(4, 4),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, modifiers,
+        ))
+
+    press(pane.thumbs[0])
+    assert pane.selected_positions() == [0]
+    press(pane.thumbs[2], Qt.KeyboardModifier.ControlModifier)
+    assert pane.selected_positions() == [0, 2]
+    press(pane.thumbs[2])
+    assert pane.selected_positions() == [0, 2]
+    press(pane.thumbs[1])
+    assert pane.selected_positions() == [1]
