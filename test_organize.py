@@ -24,6 +24,13 @@ def test_page_refs_for_source_marks_blank_and_docsep():
     ]
 
 
+def test_page_ref_field_name_is_source_doc_id():
+    ref = PageRef(source_doc_id="a", src_page_index=0)
+    assert ref.source_doc_id == "a"
+    refs = page_refs_for_source(source_doc_id="a", page_count=1)
+    assert refs[0].source_doc_id == "a"
+
+
 def test_markers_for_rebuilds_indices():
     refs = [PageRef("a", 0, False, False),
             PageRef("a", 1, True, False),
