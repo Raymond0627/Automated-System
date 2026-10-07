@@ -10,10 +10,10 @@ Both ends must go through :func:`build_drag_payload` / :func:`parse_drag_payload
 
 import fitz
 from PyQt6.QtCore import QMimeData, QPoint, QSize, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QDrag, QImage, QPixmap
+from PyQt6.QtGui import QColor, QDrag, QImage, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QGridLayout, QHBoxLayout, QLabel, QScrollArea, QVBoxLayout,
-    QWidget,
+    QApplication, QDialog, QGridLayout, QHBoxLayout, QLabel, QPushButton,
+    QScrollArea, QSplitter, QVBoxLayout, QWidget,
 )
 
 from organize_model import PageRef, apply_move
@@ -533,3 +533,115 @@ class PagePane(QWidget):
             return
         if self._column_count() != self._cols:
             self._rebuild_grid()
+
+
+class OrganizeDialog(QDialog):
+    """Two-pane organizer shell: Save commits, Undo Save reverts the commit.
+
+    ``commit_fn(refs_a, refs_b)`` applies a save and returns an ``undo()``
+    callable; Save stores it, Undo Save calls it. Closing (Cancel/Esc) never
+    reverts an already-completed save. Cross-pane drops are coordinated here
+    because only this dialog can see both panes.
+    """
+
+    def __init__(self, sources: dict[str, fitz.Document], refs_a: list[PageRef],
+                 refs_b: list[PageRef], title_a: str, title_b: str, commit_fn,
+                 config: dict, parent=None):
+        _ensure_qapp()
+        super().__init__(parent)
+        self.setWindowTitle("Organize Pages")
+        self.setMinimumSize(880, 560)
+        self._commit_fn = commit_fn
+        self.config = dict(config or {})
+        self._initial_a = list(refs_a)
+        self._initial_b = list(refs_b)
+        self._undo_fn = None
+        self._saved = False
+
+        p = get_palette_dict(self.config.get("theme", THEME_DARK))
+        self.setStyleSheet(
+            f"QDialog {{ background-color: {p['bg_window']}; color: {p['text_main']}; }}"
+            f"QPushButton {{ background-color: {p['bg_input']}; color: {p['text_main']};"
+            f" border: 1px solid {p['border']}; border-radius: 6px; padding: 6px 16px;"
+            f" font-size: 9pt; }}"
+            f"QPushButton:hover {{ border: 1px solid {p['border_focus']}; }}"
+            f"QPushButton:disabled {{ background-color: {p['bg_tab']};"
+            f" color: {p['text_placeholder']}; border: 1px solid {p['border']}; }}"
+        )
+
+        self.pane_a = PagePane(sources, list(refs_a), "a", title_a, self.config)
+        self.pane_b = PagePane(sources, list(refs_b), "b", title_b, self.config)
+        self.pane_a.on_cross_drop = self._cross_to_a
+        self.pane_b.on_cross_drop = self._cross_to_b
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(self.pane_a)
+        splitter.addWidget(self.pane_b)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        self.save_btn = QPushButton("Save")
+        self.save_btn.clicked.connect(self._on_save)
+        self.undo_btn = QPushButton("Undo Save")
+        self.undo_btn.setEnabled(False)
+        self.undo_btn.clicked.connect(self._on_undo)
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(self.save_btn)
+        buttons.addWidget(self.undo_btn)
+        buttons.addStretch()
+        buttons.addWidget(self.cancel_btn)
+        layout.addLayout(buttons)
+
+        self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self._undo_shortcut.activated.connect(self._on_undo)
+        self._esc_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._esc_shortcut.activated.connect(self.reject)
+
+    # ---- cross-pane moves ----
+
+    def _cross_to_b(self, src_id, positions, insert_at):
+        result = apply_move(self.pane_a.refs, self.pane_b.refs, positions, insert_at)
+        if result is None:
+            return
+        a_refs, b_refs = result
+        self.pane_a.set_refs(a_refs)
+        self.pane_b.set_refs(b_refs)
+
+    def _cross_to_a(self, src_id, positions, insert_at):
+        result = apply_move(self.pane_b.refs, self.pane_a.refs, positions, insert_at)
+        if result is None:
+            return
+        b_refs, a_refs = result
+        self.pane_a.set_refs(a_refs)
+        self.pane_b.set_refs(b_refs)
+
+    # ---- save / undo ----
+
+    def _on_save(self):
+        if self._saved:
+            return
+        self._undo_fn = self._commit_fn(self.pane_a.refs, self.pane_b.refs)
+        self._saved = True
+        self.save_btn.setEnabled(False)
+        self.undo_btn.setEnabled(True)
+        self.cancel_btn.setText("Close")
+
+    def _on_undo(self):
+        if self._undo_fn is not None:
+            self._undo_fn()
+        self._undo_fn = None
+        self.pane_a.set_refs(self._initial_a)
+        self.pane_b.set_refs(self._initial_b)
+        self._saved = False
+        self.save_btn.setEnabled(True)
+        self.undo_btn.setEnabled(False)
+        self.cancel_btn.setText("Cancel")

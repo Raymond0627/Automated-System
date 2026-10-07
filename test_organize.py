@@ -234,3 +234,65 @@ def test_page_pane_drop_event_routes_by_payload():
     assert not event.isAccepted()
     assert calls == [("b", [0], 1)]
     pane.hide()
+
+
+def test_organize_dialog_save_then_undo():
+    from ui.organize_dialog import OrganizeDialog, _ensure_qapp
+    _ensure_qapp()
+
+    calls = {"commit": 0, "undo": 0}
+
+    def commit(refs_a, refs_b):
+        calls["commit"] += 1
+        return lambda: calls.__setitem__("undo", calls["undo"] + 1)
+
+    dlg = OrganizeDialog(
+        sources={"a": _pdf(2), "b": _pdf(2)},
+        refs_a=page_refs_for_source("a", 2),
+        refs_b=page_refs_for_source("b", 2),
+        title_a="A", title_b="B",
+        commit_fn=commit,
+        config={"theme": "Dark Mode"},
+    )
+    dlg._on_save()
+    assert calls["commit"] == 1
+    assert dlg._saved is True
+    assert dlg._undo_fn is not None
+    dlg._on_undo()
+    assert calls["undo"] == 1
+    assert dlg._saved is False
+
+
+def test_organize_dialog_cross_drop_moves_pages_in_drop_direction():
+    from ui.organize_dialog import OrganizeDialog, _ensure_qapp
+    _ensure_qapp()
+
+    dlg = OrganizeDialog(
+        sources={"a": _pdf(3), "b": _pdf(2)},
+        refs_a=page_refs_for_source("a", 3),
+        refs_b=page_refs_for_source("b", 2),
+        title_a="A", title_b="B",
+        commit_fn=lambda ra, rb: (lambda: None),
+        config={"theme": "Dark Mode"},
+    )
+
+    # A's page 0 dropped on pane B at index 1 -> leaves A, lands in B
+    assert dlg.pane_b.handle_drop_payload("pane:a:0", 1) is True
+    assert [(r.source_doc_id, r.src_page_index) for r in dlg.pane_a.refs] == [
+        ("a", 1), ("a", 2)]
+    assert [(r.source_doc_id, r.src_page_index) for r in dlg.pane_b.refs] == [
+        ("b", 0), ("a", 0), ("b", 1)]
+
+    # B's page 0 dropped on pane A at index 0 -> leaves B, lands in A
+    assert dlg.pane_a.handle_drop_payload("pane:b:0", 0) is True
+    assert [(r.source_doc_id, r.src_page_index) for r in dlg.pane_a.refs] == [
+        ("b", 0), ("a", 1), ("a", 2)]
+    assert [(r.source_doc_id, r.src_page_index) for r in dlg.pane_b.refs] == [
+        ("a", 0), ("b", 1)]
+
+    # a move that would empty the source pane is blocked: both panes unchanged
+    before_a = list(dlg.pane_a.refs)
+    before_b = list(dlg.pane_b.refs)
+    dlg.pane_b.handle_drop_payload("pane:a:0,1,2", 0)
+    assert dlg.pane_a.refs == before_a
+    assert dlg.pane_b.refs == before_b
