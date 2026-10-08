@@ -254,6 +254,9 @@ def test_organize_dialog_save_then_undo():
         commit_fn=commit,
         config={"theme": "Dark Mode"},
     )
+    ra, rb = apply_move(dlg.pane_a.refs, dlg.pane_b.refs, [0], 0)
+    dlg.pane_a.set_refs(ra)
+    dlg.pane_b.set_refs(rb)
     dlg._on_save()
     assert calls["commit"] == 1
     assert dlg._saved is True
@@ -374,3 +377,55 @@ def test_apply_organize_reviewed_missing_file_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         rt._apply_organize("reviewed", doc_a, doc_b, {}, [], [])
     assert not (tmp_path / "b.pdf").exists()
+
+
+def test_apply_organize_reviewed_mid_write_restores_first_file(tmp_path):
+    from ui.review_tab import ReviewTab
+    a = _pdf(2); b = _pdf(2)
+    pa = tmp_path / '1.pdf'; pb = tmp_path / '2.pdf'
+    a.save(str(pa)); b.save(str(pb))
+    orig_a = pa.read_bytes(); orig_b = pb.read_bytes()
+    doc_a = {'original_path': str(pa), 'original_filename': '1.pdf',
+             'division_code': '155', 'company_name': 'Acme', 'blank_pages': [], 'docsep_pages': []}
+    doc_b = {'original_path': str(pb), 'original_filename': '2.pdf',
+             'division_code': '155', 'company_name': 'Acme', 'blank_pages': [], 'docsep_pages': []}
+    rt = _review_tab(tmp_path)
+    src_a = fitz.open(str(pa)); src_b = fitz.open(str(pb))
+    refs_a = page_refs_for_source('a', 2); refs_b = page_refs_for_source('b', 2)
+    refs_a2, refs_b2 = apply_move(refs_a, refs_b, [0], 0)
+    import builtins
+    orig_open = builtins.open
+    writes = []
+    class FailingWrite:
+        def __init__(self, *args, **kwargs):
+            self._f = orig_open(*args, **kwargs)
+        def __enter__(self): return self
+        def __exit__(self, exc_type, exc, tb): return self._f.__exit__(exc_type, exc, tb)
+        def write(self, data):
+            writes.append(True)
+            if len(writes) == 2: raise IOError('disk full')
+            return self._f.write(data)
+    builtins.open = FailingWrite
+    try:
+        import pytest
+        with pytest.raises(IOError):
+            rt._apply_organize('reviewed', doc_a, doc_b, {'a': src_a, 'b': src_b}, refs_a2, refs_b2)
+    finally:
+        builtins.open = orig_open
+    assert pa.read_bytes() == orig_a
+    src_a.close(); src_b.close()
+
+def test_dialog_no_op_save_does_not_call_commit(tmp_path):
+    from ui.organize_dialog import OrganizeDialog, _ensure_qapp
+    _ensure_qapp()
+    calls = []
+    dlg = OrganizeDialog(
+        sources={'a': _pdf(2), 'b': _pdf(2)},
+        refs_a=page_refs_for_source('a', 2),
+        refs_b=page_refs_for_source('b', 2),
+        title_a='A', title_b='B',
+        commit_fn=lambda ra, rb: calls.append((list(ra), list(rb))) or (lambda: None),
+        config={'theme': 'Dark Mode'},
+    )
+    dlg.save_btn.click()
+    assert len(calls) == 0

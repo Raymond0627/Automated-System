@@ -629,7 +629,16 @@ class OrganizeDialog(QDialog):
     def _on_save(self):
         if self._saved:
             return
-        self._undo_fn = self._commit_fn(self.pane_a.refs, self.pane_b.refs)
+        if self.pane_a.refs == self._initial_a and self.pane_b.refs == self._initial_b:
+            self.accept()
+            return
+        try:
+            self._undo_fn = self._commit_fn(self.pane_a.refs, self.pane_b.refs)
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Organize Pages", f"Could not save: {e}")
+            self._saved = False
+            return
         self._saved = True
         self.save_btn.setEnabled(False)
         self.undo_btn.setEnabled(True)
@@ -637,7 +646,12 @@ class OrganizeDialog(QDialog):
 
     def _on_undo(self):
         if self._undo_fn is not None:
-            self._undo_fn()
+            try:
+                self._undo_fn()
+            except Exception as e:
+                from PyQt6.QtWidgets import QMessageBox
+                QMessageBox.critical(self, "Organize Pages", f"Could not undo: {e}")
+                return
         self._undo_fn = None
         self.pane_a.set_refs(self._initial_a)
         self.pane_b.set_refs(self._initial_b)

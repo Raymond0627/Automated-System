@@ -2789,7 +2789,7 @@ class ReviewTab(QWidget):
         if not (0 <= self.active_index < len(docs)):
             return
         current = docs[self.active_index]
-        if current is doc_a or current is doc_b:
+        if current.get("original_path") == doc_a.get("original_path") or current.get("original_path") == doc_b.get("original_path"):
             self.load_document(current)
 
     def _apply_organize(self, tab: str, doc_a: dict, doc_b: dict, sources: dict,
@@ -2815,10 +2815,18 @@ class ReviewTab(QWidget):
             prev_a = (list(doc_a.get("blank_pages", [])), list(doc_a.get("docsep_pages", [])))
             prev_b = (list(doc_b.get("blank_pages", [])), list(doc_b.get("docsep_pages", [])))
 
-            with open(path_a, "wb") as fh:
-                fh.write(new_a)
-            with open(path_b, "wb") as fh:
-                fh.write(new_b)
+            try:
+                with open(path_a, "wb") as fh:
+                    fh.write(new_a)
+                with open(path_b, "wb") as fh:
+                    fh.write(new_b)
+            except Exception:
+                try:
+                    with open(path_a, "wb") as fh:
+                        fh.write(orig_a)
+                except Exception:
+                    pass
+                raise
 
             doc_a["blank_pages"], doc_a["docsep_pages"] = list(blank_a), list(docsep_a)
             doc_b["blank_pages"], doc_b["docsep_pages"] = list(blank_b), list(docsep_b)
