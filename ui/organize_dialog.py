@@ -484,7 +484,7 @@ class PagePane(QWidget):
         pixmap = thumb.pixmap()
         if pixmap is not None and not pixmap.isNull():
             drag.setPixmap(pixmap)
-        drag.exec(QDrag.DropAction.MoveAction)
+        drag.exec(Qt.DropAction.MoveAction)
 
     def _insert_index_at(self, pos: QPoint):
         for index, thumb in enumerate(self.thumbs):
