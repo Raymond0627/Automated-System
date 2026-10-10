@@ -580,6 +580,14 @@ class SettingsTab(QWidget):
         self._steppers.append(self.workers_spin)
         pipe_grid.addWidget(self.make_field_column("Parallel Workers", self.workers_spin), 1, 2)
 
+        self.company_conf_spin = NumberStepper(
+            min_val=0, max_val=100, step=5,
+            initial=self.config.get("company_confidence_threshold", 90),
+            suffix=" %", theme=theme
+        )
+        self._steppers.append(self.company_conf_spin)
+        pipe_grid.addWidget(self.make_field_column("Company Confidence", self.company_conf_spin), 2, 0)
+
         pipe_layout.addLayout(pipe_grid)
         cards_grid.addWidget(pipe_card, 0, 1)
 
@@ -864,6 +872,7 @@ class SettingsTab(QWidget):
 
     def save_settings(self):
         self.config["confidence_threshold"] = self.conf_spin.value()
+        self.config["company_confidence_threshold"] = self.company_conf_spin.value()
         self.config["page_index"] = self.page_spin.value()
         self.config["earliest_year"] = self.year_spin.value()
         self.config["ocr_engine"] = self.ocr_combo.currentText()

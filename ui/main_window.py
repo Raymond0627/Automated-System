@@ -164,6 +164,7 @@ class MainWindow(QMainWindow):
             "division_code": "155",
             "first_run_completed": True,
             "confidence_threshold": 85,
+            "company_confidence_threshold": 90,
             "page_index": 0,
             "earliest_year": 1950,
             "ocr_engine": "tesseract",

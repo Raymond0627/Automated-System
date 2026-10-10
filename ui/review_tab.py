@@ -2506,6 +2506,25 @@ class ReviewTab(QWidget):
         self._company_completer.model().setStringList(companies)
         QMessageBox.information(self, "Added", f"'{normalized}' added to the company roster.")
 
+    def _learn_company_hints(self, doc: dict):
+        """Remember folder/letterhead -> company so future runs resolve faster."""
+        company = (doc.get("company_name") or "").strip()
+        if not company:
+            return
+        try:
+            from company_resolver import record_folder_hint, record_letterhead_hint
+            learn_company_name(company)
+            path = doc.get("original_path") or ""
+            if path:
+                folder = os.path.basename(os.path.dirname(path))
+                if folder:
+                    record_folder_hint(folder, company)
+            letterhead = doc.get("resolved_letterhead") or ""
+            if letterhead:
+                record_letterhead_hint(letterhead, company)
+        except Exception:
+            pass
+
     def confirm_date(self):
         if self.active_index < 0:
             return
@@ -2534,6 +2553,7 @@ class ReviewTab(QWidget):
                 self.all_flagged_docs = [d for d in self.all_flagged_docs if d is not doc]
                 self._save_flagged_updates()
                 self._register_finalized_doc(doc, result)
+                self._learn_company_hints(doc)
                 self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
                 self.current_pdf_doc = None
                 self.active_index = -1
@@ -2562,6 +2582,7 @@ class ReviewTab(QWidget):
                 self.auto_confirmed_docs.pop(self.active_index)
                 self._save_auto_confirmed_updates()
                 self._register_finalized_doc(doc, result)
+                self._learn_company_hints(doc)
                 self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
                 self.current_pdf_doc = None
                 self.active_index = -1
@@ -3498,6 +3519,8 @@ class ReviewTab(QWidget):
         if not result.get("success"):
             QMessageBox.warning(self, "Finalize Failed", f"Could not save: {result.get('error', 'Unknown')}")
             return
+
+        self._learn_company_hints(doc)
 
         if self.active_tab == "pending":
             doc["reviewed"] = True

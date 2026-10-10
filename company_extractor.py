@@ -661,7 +661,24 @@ def fuzzy_match_with_tier(
 # Main entry point
 # ─────────────────────────────────────────────────────────────
 
-def get_company_name_for_filename(page_ocr_data_list: list) -> dict:
+def get_company_name_for_filename(page_ocr_data_list: list, context: dict = None) -> dict:
+    """Resolve the company name for a document.
+
+    Delegates to the multi-source resolver (``company_resolver``), which
+    collects candidates from several detectors (caption, routing slip,
+    letterhead, signature, roster gazetteer, keyword window, folder hint,
+    learned hints), validates them against the roster, and decides by
+    corroboration. Falls back to the legacy tier ladder if the resolver is
+    unavailable.
+    """
+    try:
+        from company_resolver import resolve_company
+        return resolve_company(page_ocr_data_list, context=context)
+    except Exception:
+        return _legacy_get_company_name_for_filename(page_ocr_data_list)
+
+
+def _legacy_get_company_name_for_filename(page_ocr_data_list: list) -> dict:
     """
     Extract company name using a 6-tier priority system.
 

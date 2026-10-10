@@ -150,16 +150,21 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
         except Exception:
             page_texts = [{"page_text": t, "page_idx": i} for i, t in enumerate(date_result.page_texts)]
 
-        company_result = get_company_name_for_filename(page_texts)
+        company_result = get_company_name_for_filename(
+            page_texts,
+            context={"rel_dir": doc_info.get("rel_path", ""), "original_path": original_path},
+        )
         final_company = company_result.get('company_name', '')
         company_confidence = company_result.get('company_confidence', 0)
         company_tier = company_result.get('tier_used', '')
 
-        # Triple-check Auto-Confirm Gate: Date >= 90%, Company >= 90%, Valid Date, and QC passed
+        # Triple-check Auto-Confirm Gate: Date >= 90%, Company >= threshold,
+        # Valid Date, and QC passed.
+        company_conf_threshold = int(config.get("company_confidence_threshold", 90) or 90)
         earliest_year = config.get("earliest_year", 1950)
         date_valid = bool(date_result.date and date_result.date.year >= earliest_year and date_result.date <= date.today())
         date_conf_pass = date_result.confidence >= 90
-        company_conf_pass = company_confidence >= 90
+        company_conf_pass = company_confidence >= company_conf_threshold
         qc_passed = not qc_failed
 
         is_auto_confirmed = (not date_result.all_blank) and date_valid and date_conf_pass and company_conf_pass and qc_passed
@@ -180,6 +185,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 "docsep_pages": result["docsep_pages"],
                 "raw_ocr_text": date_result.raw_ocr_text,
                 "company_source": company_tier,
+                "resolved_letterhead": company_result.get("resolved_letterhead", ""),
             }
             if qc_result:
                 result["passed_data"]["qc_status"] = qc_result.get("qc_status", "")
@@ -203,7 +209,8 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 "all_blank": date_result.all_blank,
                 "error": "Document is entirely blank" if date_result.all_blank else "",
                 "company_source": company_tier,
-                "company_needs_review": company_confidence < 90,
+                "company_needs_review": company_confidence < company_conf_threshold,
+                "resolved_letterhead": company_result.get("resolved_letterhead", ""),
             }
             if qc_result:
                 result["flagged_data"]["qc"] = qc_result

@@ -191,7 +191,10 @@ def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> Non
                 _doc.close()
             except Exception:
                 page_texts = [{"page_text": t, "page_idx": i} for i, t in enumerate(result.page_texts)]
-            company_result = get_company_name_for_filename(page_texts)
+            company_result = get_company_name_for_filename(
+                page_texts,
+                context={"rel_dir": getattr(doc, "rel_dir", ""), "original_path": doc.original_path},
+            )
             doc.company_name = company_result.get("company_name", doc.company_name)
             doc.company_confidence = company_result.get("company_confidence", 0)
             doc.company_tier = company_result.get("tier_used", "")
