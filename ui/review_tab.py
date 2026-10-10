@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import shutil
+import calendar
 import fitz
 from pathlib import Path
 from datetime import date, datetime
@@ -372,7 +373,7 @@ class ReviewTab(QWidget):
         left_layout.setSpacing(4)
 
         self.month_combo = QComboBox()
-        self.month_combo.addItems([f"{m:02d}" for m in range(1, 13)])
+        self.month_combo.addItems([f"{m:02d} {calendar.month_abbr[m]}" for m in range(1, 13)])
         self.month_combo.setFixedHeight(26)
         self.month_combo.setFont(QFont("Segoe UI", 9))
         self.year_spin = QSpinBox()
