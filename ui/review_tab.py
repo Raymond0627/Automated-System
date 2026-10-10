@@ -1055,6 +1055,9 @@ class ReviewTab(QWidget):
                 organize_act = QAction("Organize Pages…", self)
                 organize_act.triggered.connect(lambda: self._organize_from_selection(selected[0]))
                 menu.addAction(organize_act)
+                merge_with_act = QAction("Merge with…", self)
+                merge_with_act.triggered.connect(lambda: self._merge_from_selection(selected[0]))
+                menu.addAction(merge_with_act)
                 menu.addSeparator()
             rename_act = QAction("Rename File...", self)
             rename_act.triggered.connect(lambda: self._rename_reviewed_at(selected[0]))
@@ -1074,11 +1077,18 @@ class ReviewTab(QWidget):
         selected = self._get_reviewed_selected_indices()
         if len(selected) < 2:
             return
+        docs_list = [self.reviewed_docs[i] for i in selected if 0 <= i < len(self.reviewed_docs)]
+        if len(docs_list) < 2:
+            return
+        self._merge_reviewed(docs_list)
 
-        first_doc = self.reviewed_docs[selected[0]]
+    def _merge_reviewed(self, docs_list: list):
+        if len(docs_list) < 2:
+            return
+        first_doc = docs_list[0]
         first_path = first_doc.get("original_path", "")
         first_name = os.path.basename(first_path) if first_path else "document.pdf"
-        count = len(selected)
+        count = len(docs_list)
 
         confirm = QMessageBox.question(
             self,
@@ -1092,8 +1102,7 @@ class ReviewTab(QWidget):
 
         try:
             merged_pdf = fitz.open()
-            for idx in selected:
-                doc = self.reviewed_docs[idx]
+            for doc in docs_list:
                 path = doc.get("original_path", "")
                 if not path or not os.path.exists(path):
                     QMessageBox.warning(self, "Merge Error", f"File not found on disk:\n{path}")
@@ -1118,8 +1127,8 @@ class ReviewTab(QWidget):
 
             # Delete the secondary files
             deleted_count = 0
-            for idx in selected[1:]:
-                path = self.reviewed_docs[idx].get("original_path", "")
+            for doc in docs_list[1:]:
+                path = doc.get("original_path", "")
                 if path and os.path.exists(path) and path != first_path:
                     try:
                         os.remove(path)
@@ -2752,6 +2761,9 @@ class ReviewTab(QWidget):
                 organize_act = QAction("Organize Pages…", self)
                 organize_act.triggered.connect(lambda: self._organize_from_selection(idx))
                 menu.addAction(organize_act)
+                merge_with_act = QAction("Merge with…", self)
+                merge_with_act.triggered.connect(lambda: self._merge_from_selection(idx))
+                menu.addAction(merge_with_act)
                 menu.addSeparator()
             duplicate_act = QAction("Duplicate", self)
             duplicate_act.triggered.connect(lambda: self._duplicate_document_at(idx))
@@ -2891,7 +2903,8 @@ class ReviewTab(QWidget):
 
         return undo
 
-    def _pick_second_doc(self, docs: list, exclude_idx: int):
+    def _pick_second_doc(self, docs: list, exclude_idx: int,
+                         title: str = "Organize Pages", prompt: str = "Combine with:"):
         others = [(i, d) for i, d in enumerate(docs) if i != exclude_idx]
         if not others:
             return None
@@ -2906,7 +2919,7 @@ class ReviewTab(QWidget):
             seen[name] = seen.get(name, 0) + 1
             labels.append(f"{name} #{seen[name]}" if counts[name] > 1 else name)
         chosen, ok = QInputDialog.getItem(
-            self, "Organize Pages", "Combine with:", labels, 0, False)
+            self, title, prompt, labels, 0, False)
         if not ok or chosen not in labels:
             return None
         return others[labels.index(chosen)][1]
@@ -2919,6 +2932,19 @@ class ReviewTab(QWidget):
         if second is None:
             return
         self._open_organizer(docs[idx], second)
+
+    def _merge_from_selection(self, idx: int):
+        docs = self._get_current_docs()
+        if len(docs) < 2 or not (0 <= idx < len(docs)):
+            return
+        second = self._pick_second_doc(docs, idx, title="Merge", prompt="Merge with:")
+        if second is None:
+            return
+        target = docs[idx]
+        if self.active_tab == "reviewed":
+            self._merge_reviewed([target, second])
+        else:
+            self._merge_documents([target, second])
 
     def _organize_selected_pair(self):
         docs = self._get_current_docs()
@@ -2977,8 +3003,15 @@ class ReviewTab(QWidget):
         valid_indices = [i for i in self.selected_indices if 0 <= i < len(docs)]
         if len(valid_indices) < 2:
             return
+        self._merge_documents([docs[i] for i in valid_indices])
 
-        selected_docs = [docs[i] for i in valid_indices]
+    def _merge_documents(self, docs_list: list):
+        if self.active_tab not in ("pending", "auto_confirmed"):
+            return
+        docs = self._get_current_docs()
+        selected_docs = [d for d in docs_list if d in docs]
+        if len(selected_docs) < 2:
+            return
         first_doc = selected_docs[0]
         first_name = first_doc.get("original_filename", "document.pdf")
         count = len(selected_docs)
