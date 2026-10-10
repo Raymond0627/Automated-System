@@ -152,3 +152,28 @@ def test_learned_folder_hint_autoconfirms(tmp_path, monkeypatch):
     assert res["matched_roster_entry"] == "ACME INSURANCE CORP"
     assert res["needs_review"] is False
 
+
+# ── auto roster add on confirm ───────────────────────────────
+
+def test_learn_company_hints_adds_new_company_once(tmp_path, monkeypatch):
+    import company_extractor as ce
+    monkeypatch.setattr(ce, "KNOWN_COMPANIES_FILE", tmp_path / "known_companies.json")
+    monkeypatch.setattr(cr, "HINTS_FILE", tmp_path / "company_hints.json")
+
+    from ui.organize_dialog import _ensure_qapp
+    _ensure_qapp()
+    from ui.review_tab import ReviewTab
+
+    rt = ReviewTab({"input_root": str(tmp_path), "output_root": str(tmp_path / "_out"),
+                    "flagged_root": "", "theme": "Dark Mode"})
+    doc = {"company_name": "NEW ZEALAND INSURANCE CORPORATION",
+           "original_path": str(tmp_path / "NEW ZEALAND INSURANCE CORPORATION" / "1.pdf")}
+
+    rt._learn_company_hints(doc)
+    assert "NEW ZEALAND INSURANCE CORPORATION" in ce.load_known_companies()
+
+    # Re-confirming the same company must not duplicate it.
+    rt._learn_company_hints(doc)
+    assert ce.load_known_companies().count("NEW ZEALAND INSURANCE CORPORATION") == 1
+
+

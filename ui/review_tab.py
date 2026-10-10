@@ -28,7 +28,7 @@ from pipeline import (
     PipelineConfig, parse_folder_structure, load_flagged_index
 )
 from enhance import enhance_page
-from company_extractor import normalize_company_name, learn_company_name, load_known_companies, save_known_companies
+from company_extractor import normalize_company_name, learn_company_name, load_known_companies
 from organize_model import (PageRef, page_refs_for_source, markers_for, build_pdf_bytes)
 
 from .widgets import DocCardWidget, PassedDocCardWidget
@@ -391,11 +391,6 @@ class ReviewTab(QWidget):
         self.ocr_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
         self.ocr_btn.clicked.connect(self.toggle_ocr_panel)
 
-        self.add_roster_btn = QPushButton("Add to Roster")
-        self.add_roster_btn.setFixedHeight(26)
-        self.add_roster_btn.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self.add_roster_btn.clicked.connect(self._add_to_roster)
-
         self.company_input = QLineEdit()
         self.company_input.setFixedHeight(26)
         self.company_input.setFont(QFont("Segoe UI", 9))
@@ -558,7 +553,6 @@ class ReviewTab(QWidget):
         self.save_crop_btn.clicked.connect(self.apply_crop)
         self.save_crop_btn.setVisible(False)
         bottom.addWidget(self.save_crop_btn)
-        bottom.addWidget(self.add_roster_btn)
         bottom.addWidget(self.ocr_btn)
         bottom.addStretch()
         self.confirm_all_btn = QPushButton("CONFIRM ALL")
@@ -2492,29 +2486,22 @@ class ReviewTab(QWidget):
             return self.reviewed_docs
         return []
 
-    def _add_to_roster(self):
-        company_text = self._get_company_from_widgets()
-        if not company_text:
-            QMessageBox.information(self, "No Company Name", "Enter a company name in the Company field first.")
-            return
-        normalized = normalize_company_name(company_text)
-        companies = load_known_companies()
-        if normalized in companies:
-            QMessageBox.information(self, "Already Exists", f"'{normalized}' is already in the roster.")
-            return
-        companies.append(normalized)
-        save_known_companies(companies)
-        self._company_completer.model().setStringList(companies)
-        QMessageBox.information(self, "Added", f"'{normalized}' added to the company roster.")
-
     def _learn_company_hints(self, doc: dict):
-        """Remember folder/letterhead -> company so future runs resolve faster."""
+        """Remember folder/letterhead -> company so future runs resolve faster.
+
+        Also auto-adds the confirmed company to the roster (new names only) so
+        the manual "Add to Roster" step is no longer needed.
+        """
         company = (doc.get("company_name") or "").strip()
         if not company:
             return
         try:
             from company_resolver import record_folder_hint, record_letterhead_hint
+            before = load_known_companies()
             learn_company_name(company)
+            after = load_known_companies()
+            if len(after) != len(before):
+                self._company_completer.model().setStringList(after)
             path = doc.get("original_path") or ""
             if path:
                 folder = os.path.basename(os.path.dirname(path))
@@ -2662,6 +2649,7 @@ class ReviewTab(QWidget):
             doc["detected_date"] = dt
             if company_text:
                 doc["company_name"] = normalize_company_name(company_text)
+            self._learn_company_hints(doc)
 
             self.active_index = -1
             for lbl in self.page_labels:
