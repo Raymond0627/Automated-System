@@ -1,4 +1,4 @@
-# Lumeed QScan
+# Lumeed QScan!
 
 Automatically extracts document dates from PDFs using OCR and renames files according to a standardized naming convention.
 
