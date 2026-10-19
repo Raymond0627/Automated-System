@@ -175,6 +175,7 @@ class MainWindow(QMainWindow):
             "qc_blank_threshold": 1.5,
             "qc_rotation_threshold": 65,
             "rename_enabled": False,
+            "document_date_enabled": False,
             "audit_enabled": True,
             "render_dpi": 200,
             "max_workers": 2,
@@ -211,6 +212,8 @@ class MainWindow(QMainWindow):
         tab_name = self.tabs.tabText(index)
         if tab_name == "Review":
             self.review_tab.refresh_completer()
+            # The Settings tab can toggle the Document date corrector off.
+            self.review_tab.apply_date_setting()
 
     def _check_first_run(self):
         if not self.config.get("first_run_completed", False):

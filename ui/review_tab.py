@@ -25,7 +25,8 @@ if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).parent.parent))
 from paths import BASE_DIR
 from pipeline import (
-    PipelineConfig, parse_folder_structure, load_flagged_index
+    PipelineConfig, parse_folder_structure, load_flagged_index,
+    parse_final_stem, build_final_filename,
 )
 from enhance import enhance_page
 from company_extractor import normalize_company_name, learn_company_name, load_known_companies
@@ -249,7 +250,7 @@ class ReviewedScanWorker(QThread):
                 "original_filename": pdf_file.name,
                 "division_code": div,
                 "company_name": company,
-                "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
+                "detected_date": _filename_date(pdf_file.name),
                 "confidence": 100,
                 "method": "finalized",
                 "blank_pages": [],
@@ -292,6 +293,15 @@ class FinalizeAllWorker(QThread):
                 failures.append((doc.get("original_path", ""), doc.get("original_filename", ""), result.get("error", "Unknown")))
             self.progress.emit(done, total)
         self.finished.emit(done, failures)
+
+
+def _filename_date(name: str) -> str:
+    """YYYYMM date prefix of an output filename, or "" when it has none.
+
+    Dateless names (Document date setting off) must never be mistaken for a
+    date, so anything that is not 8 leading digits yields "".
+    """
+    return name[:8] if len(name) >= 8 and name[:8].isdigit() else ""
 
 
 class ReviewTab(QWidget):
@@ -538,7 +548,8 @@ class ReviewTab(QWidget):
         sep = QLabel("|")
         self.sep1 = sep
         bottom.addWidget(sep)
-        bottom.addWidget(QLabel("Date:"))
+        self.date_label = QLabel("Date:")
+        bottom.addWidget(self.date_label)
         bottom.addWidget(self.month_combo)
         bottom.addWidget(self.year_spin)
         sep2 = QLabel("|")
@@ -562,6 +573,7 @@ class ReviewTab(QWidget):
         self.confirm_all_btn.clicked.connect(self.confirm_all_auto)
         bottom.addWidget(self.confirm_all_btn)
         main_layout.addLayout(bottom)
+        self.apply_date_setting()
 
         self.undo_shortcut = QShortcut(QKeySequence.StandardKey.Undo, self)
         self.undo_shortcut.activated.connect(self._undo)
@@ -843,7 +855,7 @@ class ReviewTab(QWidget):
                 "original_filename": pdf_file.name,
                 "division_code": div,
                 "company_name": company,
-                "detected_date": pdf_file.name[:8] if len(pdf_file.name) >= 8 else "",
+                "detected_date": _filename_date(pdf_file.name),
                 "confidence": 100,
                 "method": "finalized",
                 "blank_pages": [],
@@ -916,7 +928,7 @@ class ReviewTab(QWidget):
             "original_filename": final_filename,
             "division_code": div,
             "company_name": company,
-            "detected_date": final_filename[:8] if len(final_filename) >= 8 else doc.get("detected_date", ""),
+            "detected_date": _filename_date(final_filename) or doc.get("detected_date", ""),
             "confidence": 100,
             "method": "finalized",
             "blank_pages": [],
@@ -1565,6 +1577,12 @@ class ReviewTab(QWidget):
                 self.month_combo.setCurrentIndex(month - 1)
             except (ValueError, IndexError):
                 pass
+
+    def apply_date_setting(self):
+        """Hide the document date corrector while the Document date setting is off."""
+        enabled = self.config.get("document_date_enabled", False)
+        for widget in (self.date_label, self.month_combo, self.year_spin):
+            widget.setHidden(not enabled)
 
     def _get_date_from_widgets(self) -> str:
         month = self.month_combo.currentIndex() + 1
@@ -2513,10 +2531,14 @@ class ReviewTab(QWidget):
         except Exception:
             pass
 
+    def date_setting_enabled(self) -> bool:
+        return bool(self.config.get("document_date_enabled", False))
+
     def confirm_date(self):
         if self.active_index < 0:
             return
         dt = self._get_date_from_widgets()
+        with_date = self.date_setting_enabled()
         company_text = self._get_company_from_widgets()
         from pipeline import finalize_single_document
         config = self._pipeline_config()
@@ -2528,8 +2550,12 @@ class ReviewTab(QWidget):
                 confirmed_company = normalize_company_name(company_text)
             else:
                 confirmed_company = original_company
-            doc["confirmed_date"] = dt
-            doc["detected_date"] = dt
+            if with_date:
+                doc["confirmed_date"] = dt
+                doc["detected_date"] = dt
+            else:
+                doc["confirmed_date"] = ""
+                doc["detected_date"] = ""
             doc["company_name"] = confirmed_company
             doc["reviewed"] = True
             doc["review_timestamp"] = str(datetime.now())
@@ -2560,7 +2586,7 @@ class ReviewTab(QWidget):
                 confirmed_company = normalize_company_name(company_text)
             else:
                 confirmed_company = original_company
-            doc["detected_date"] = dt
+            doc["detected_date"] = dt if with_date else ""
             doc["company_name"] = confirmed_company
             doc["reviewed"] = True
             if self.document_modified and self.current_pdf_doc:
@@ -2592,16 +2618,19 @@ class ReviewTab(QWidget):
                 return
 
             stem = os.path.splitext(old_name)[0]
-            parts = stem.split("_")
-            if len(parts) < 3 or not parts[0][:6].isdigit() or len(parts[0]) < 10:
-                QMessageBox.warning(self, "Cannot Rename", "This file name doesn't match the expected YYYYMM####_###_COMPANY format.")
+            parsed = parse_final_stem(stem)
+            if parsed is None:
+                QMessageBox.warning(
+                    self, "Cannot Rename",
+                    "This file name doesn't match the expected "
+                    "YYYYMM####_###_COMPANY or ####_###_COMPANY format.",
+                )
                 return
-            old_ym = parts[0][:6]
-            seq = parts[0][6:10]
-            division = parts[1]
-            old_company = "_".join(parts[2:]).strip()
+            seq = parsed["seq"]
+            division = parsed["division"]
+            old_company = parsed["company"].strip()
+            include_date = self.date_setting_enabled()
 
-            new_ym = dt.replace("-", "")[:6]
             company_text = (company_text or "").strip()
             if company_text:
                 from pipeline import sanitize_filename
@@ -2609,7 +2638,10 @@ class ReviewTab(QWidget):
             else:
                 new_company = old_company
 
-            new_name = f"{new_ym}{seq}_{division}_{new_company}.pdf"
+            new_ym = dt.replace("-", "")[:6]
+            new_name = build_final_filename(
+                seq, division, new_company, include_date=include_date, yyyymm=new_ym
+            )
             if os.path.normcase(os.path.normpath(new_name)) == os.path.normcase(os.path.normpath(old_name)):
                 self.refresh_doc_list()
                 self._session_changed()
@@ -2646,7 +2678,8 @@ class ReviewTab(QWidget):
 
             doc["original_path"] = new_path
             doc["original_filename"] = new_name
-            doc["detected_date"] = dt
+            if include_date:
+                doc["detected_date"] = dt
             if company_text:
                 doc["company_name"] = normalize_company_name(company_text)
             self._learn_company_hints(doc)
@@ -2734,6 +2767,7 @@ class ReviewTab(QWidget):
         config.qc_blur_threshold = self.config.get("qc_blur_threshold", 100)
         config.min_file_size_kb = self.config.get("min_file_size_kb", 10)
         config.output_layout = self.config.get("output_layout", "flat")
+        config.document_date_enabled = self.config.get("document_date_enabled", False)
         return config
 
     def _show_document_menu(self, idx: int, global_pos: QPoint):
@@ -3494,9 +3528,12 @@ class ReviewTab(QWidget):
 
         dt = self._get_date_from_widgets()
         company_text = self._get_company_from_widgets()
-        if dt:
+        if dt and self.date_setting_enabled():
             doc["detected_date"] = dt
             doc["confirmed_date"] = dt
+        elif not self.date_setting_enabled():
+            doc["detected_date"] = ""
+            doc["confirmed_date"] = ""
         original_company = doc.get("company_name", "")
         if company_text and company_text != original_company:
             doc["company_name"] = normalize_company_name(company_text)

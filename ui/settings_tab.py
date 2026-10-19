@@ -633,12 +633,23 @@ class SettingsTab(QWidget):
         format_col = QVBoxLayout()
         format_col.setSpacing(6)
 
-        self.pattern_label = QLabel("{YYYYMM}{SEQ}_{DIVISION}_{Company_Name}.pdf")
+        self.document_date_check = QCheckBox("Document date in filename")
+        self.document_date_check.setChecked(self.config.get("document_date_enabled", False))
+        self.document_date_check.toggled.connect(self._toggle_date_format)
+        format_col.addWidget(self.document_date_check)
+
+        self._dated_pattern = "{YYYYMM}{SEQ}_{DIVISION}_{Company_Name}.pdf"
+        self._dated_example = "Example: 2026010001_031_NEW_ZEALAND_INS_CORP.pdf"
+        self._dateless_pattern = "{SEQ}_{DIVISION}_{Company_Name}.pdf"
+        self._dateless_example = "Example: 0001_031_NEW_ZEALAND_INS_CORP.pdf"
+
+        self.pattern_label = QLabel(self._dated_pattern)
         self.pattern_label.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
         format_col.addWidget(self.pattern_label)
 
-        self.example_label = QLabel("Example: 2026010001031_NEW_ZEALAND_INS_CORP.pdf")
+        self.example_label = QLabel(self._dated_example)
         format_col.addWidget(self.example_label)
+        self._toggle_date_format(self.document_date_check.isChecked())
 
         layout_row = QHBoxLayout()
         layout_row.setSpacing(10)
@@ -870,6 +881,10 @@ class SettingsTab(QWidget):
         companies = load_known_companies()
         self.roster_count_label.setText(f"{len(companies)} companies in lookup roster")
 
+    def _toggle_date_format(self, enabled: bool):
+        self.pattern_label.setText(self._dated_pattern if enabled else self._dateless_pattern)
+        self.example_label.setText(self._dated_example if enabled else self._dateless_example)
+
     def save_settings(self):
         self.config["confidence_threshold"] = self.conf_spin.value()
         self.config["company_confidence_threshold"] = self.company_conf_spin.value()
@@ -879,6 +894,7 @@ class SettingsTab(QWidget):
         self.config["render_dpi"] = self.dpi_spin.value()
         self.config["max_workers"] = self.workers_spin.value()
         self.config["output_layout"] = self.layout_combo.currentData()
+        self.config["document_date_enabled"] = self.document_date_check.isChecked()
         self.config["enable_qc"] = self.enable_qc_check.isChecked()
         self.config["enable_docsep_removal"] = self.enable_docsep.isChecked()
         self.config["enable_blank_removal"] = self.enable_blank_rm.isChecked()

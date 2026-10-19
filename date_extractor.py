@@ -488,7 +488,7 @@ def _quick_confidence(all_candidates, page_ocr_data_list, control_results):
     return int(min(best_score, 100)), True
 
 
-def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150, doc: Optional["fitz.Document"] = None, docsep_pages: Optional[List[int]] = None) -> DateResult:
+def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150, doc: Optional["fitz.Document"] = None, docsep_pages: Optional[List[int]] = None, include_date: bool = True) -> DateResult:
     all_candidates = []
     raw_texts = []
     page_ocr_data_list = []
@@ -573,6 +573,11 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
                 del processed
                 raw_text = ' '.join([t for t in ocr_data['text'] if t.strip()])
                 raw_texts.append(raw_text)
+                if not include_date:
+                    # Date scan disabled: keep the OCR text (company matching and
+                    # blank verification still need it) but drop the date work.
+                    del ocr_data
+                    continue
                 ctrl = find_document_date_via_control_anchor(raw_text)
                 if ctrl:
                     control_results[page_idx] = ctrl
@@ -587,7 +592,7 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
                 del processed
                 continue
 
-        if page_idx >= 1:
+        if include_date and page_idx >= 1:
             conf, ok = _quick_confidence(all_candidates, page_ocr_data_list, control_results)
             labeled_pages = {page for _, page in find_labeled_date_candidates(page_ocr_data_list)}
             page_anchored = page_idx in control_results or page_idx in labeled_pages
@@ -602,6 +607,19 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
 
     # Check if all pages were blank
     all_blank = len(blank_pages) == num_pages
+
+    if not include_date:
+        return DateResult(
+            date=None,
+            confidence=0,
+            method="skipped",
+            candidates=[],
+            raw_ocr_text=' '.join(raw_texts),
+            blank_pages=blank_pages,
+            all_blank=all_blank,
+            needs_review=False,
+            page_texts=raw_texts,
+        )
 
     # --- Module 3: Routing slip date (PRIMARY source) ---
     # Check ALL pages: both native text and Tesseract OCR text

@@ -60,6 +60,7 @@ class PipelineConfig:
         earliest_year: int = 1990,
         ocr_engine: str = "tesseract",
         division_code: str = "",
+        document_date_enabled: bool = False,
     ):
         self.input_root = Path(input_root)
         self.output_root = Path(output_root)
@@ -79,6 +80,9 @@ class PipelineConfig:
         self.enable_docsep_removal = True
         self.enable_blank_removal = True
         self.rename_enabled = True
+        # "Document date" tickbox on the Settings tab: when False the date is
+        # neither scanned nor written into the output filename.
+        self.document_date_enabled = document_date_enabled
         self.audit_enabled = True
         self.render_dpi = 150
         self.keep_input_structure = False
@@ -96,6 +100,65 @@ def normalize_division_code(division: str) -> str:
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', name)
+
+
+def build_final_filename(
+    seq,
+    division_code: str,
+    company: str,
+    include_date: bool = True,
+    yyyymm: str = "",
+    duplicate_suffix: str = "",
+) -> str:
+    """Build the output filename: [YYYYMM]####_###_COMPANY.pdf"""
+    prefix = yyyymm if (include_date and yyyymm) else ""
+    seq_str = seq if isinstance(seq, str) else f"{seq:04d}"
+    return f"{prefix}{seq_str}_{division_code}_{company}{duplicate_suffix}.pdf"
+
+
+def parse_final_stem(stem: str) -> Optional[Dict[str, str]]:
+    """Split an output filename stem into its parts.
+
+    Accepts both the dated form (``2021010047_003_COMPANY``) and the dateless
+    form used when the Document date setting is off (``0047_003_COMPANY``).
+    Returns None when the stem is not an output filename.
+    """
+    parts = stem.split("_")
+    if len(parts) < 3:
+        return None
+
+    head = parts[0]
+    if len(head) >= 10 and head.isdigit():
+        yyyymm, seq = head[:6], head[6:]
+    elif len(head) == 4 and head.isdigit():
+        yyyymm, seq = "", head
+    else:
+        return None
+
+    division = parts[1]
+    company = "_".join(parts[2:])
+    if not division or not company:
+        return None
+
+    return {"yyyymm": yyyymm, "seq": seq, "division": division, "company": company}
+
+
+def passes_auto_confirm(
+    config: "PipelineConfig",
+    date_result: Optional[DateResult],
+    company_confidence: float,
+    qc_passed: bool,
+) -> bool:
+    """Auto-confirm gate: company name + QC, plus the date when it is enabled."""
+    if not qc_passed or company_confidence < 90:
+        return False
+    if not getattr(config, "document_date_enabled", False):
+        return True
+    if date_result is None or date_result.date is None:
+        return False
+    return date_result.date >= date(config.earliest_year, 1, 1) and (
+        date_result.date <= date.today() and date_result.confidence >= 90
+    )
 
 
 def default_output_root(input_root) -> Path:
@@ -178,8 +241,16 @@ def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> Non
                 except Exception:
                     pass
 
-            # Module 2: Date extraction (blank detection runs inside, no early exit)
-            result = extract_document_date(doc.original_path, config.page_index, engine=config.ocr_engine, docsep_pages=doc.docsep_pages)
+            # Module 2: Date extraction (blank detection runs inside, no early exit).
+            # The date scan itself is skipped when the Document date setting is
+            # off; blank detection and the OCR text still run for company/blank use.
+            result = extract_document_date(
+                doc.original_path,
+                config.page_index,
+                engine=config.ocr_engine,
+                docsep_pages=doc.docsep_pages,
+                include_date=getattr(config, "document_date_enabled", False),
+            )
             doc.date_result = result
             doc.blank_pages = result.blank_pages or []
 
@@ -224,15 +295,11 @@ def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> Non
                 doc.flagged_data = doc.flagged_data or {}
                 doc.flagged_data["blank_pages"] = result.blank_pages
 
-            # --- Auto-confirm: ALL THREE must pass ---
-            date_valid = result.date and result.date.year >= config.earliest_year and result.date <= date.today()
-            date_conf_pass = result.confidence >= 90
-            company_conf_pass = doc.company_confidence >= 90
+            # --- Auto-confirm: company + QC, plus the date when enabled ---
             qc_passed = not (qc_result and qc_result.get("qc_status") == "failed")
-            blank_clean = not any(r.get("is_blank") == "needs_review" for r in [])  # no needs_review pages
 
-            if date_valid and date_conf_pass and company_conf_pass and qc_passed:
-                doc.confirmed_date = result.date
+            if passes_auto_confirm(config, result, doc.company_confidence, qc_passed):
+                doc.confirmed_date = result.date if config.document_date_enabled else None
                 doc.confirmed_method = "auto"
                 doc.status = "confirmed"
             else:
@@ -312,18 +379,25 @@ def save_flagged_documents(batches: List[DivisionBatch], config: PipelineConfig)
 def save_confirmed_documents(batches: List[DivisionBatch], config: PipelineConfig) -> None:
     if not getattr(config, "flagged_root", None):
         return
+    include_date = getattr(config, "document_date_enabled", False)
     confirmed_data = []
 
     for batch in batches:
         for doc in batch.documents:
-            if doc.status == "confirmed" and doc.confirmed_date:
+            if doc.status == "confirmed" and (doc.confirmed_date or not include_date):
                 qc = doc.flagged_data.get("qc", {}) if doc.flagged_data else {}
+                if doc.confirmed_date is None:
+                    detected_date = ""
+                elif hasattr(doc.confirmed_date, 'isoformat'):
+                    detected_date = doc.confirmed_date.isoformat()
+                else:
+                    detected_date = str(doc.confirmed_date)
                 entry = {
                     "original_path": doc.original_path,
                     "division_code": doc.division_code,
                     "company_name": doc.company_name,
                     "original_filename": doc.original_filename,
-                    "detected_date": doc.confirmed_date.isoformat() if hasattr(doc.confirmed_date, 'isoformat') else str(doc.confirmed_date),
+                    "detected_date": detected_date,
                     "confidence": doc.date_result.confidence if doc.date_result else 100,
                     "method": doc.confirmed_method,
                     "blank_pages": doc.blank_pages or [],
@@ -364,8 +438,14 @@ def update_document_from_review(doc: Document, review_data: Dict) -> None:
 
 
 def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) -> None:
-    confirmed_docs = [d for d in batch.documents if d.status == "confirmed" and d.confirmed_date]
-    confirmed_docs.sort(key=lambda d: d.confirmed_date)
+    include_date = getattr(config, "document_date_enabled", False)
+    confirmed_docs = [
+        d for d in batch.documents if d.status == "confirmed" and (d.confirmed_date or not include_date)
+    ]
+    # Without a document date there is nothing to sort on, so the scan order is
+    # what drives the sequence numbers.
+    if include_date:
+        confirmed_docs.sort(key=lambda d: d.confirmed_date or date.max)
 
     mirror = getattr(config, "output_layout", "company") == "mirror"
     if mirror:
@@ -384,15 +464,18 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
         try:
             doc.sequence_number = i
 
-            if hasattr(doc.confirmed_date, 'strftime'):
+            if not include_date:
+                yyyymm = ""
+            elif hasattr(doc.confirmed_date, 'strftime'):
                 yyyymm = doc.confirmed_date.strftime("%Y%m")
             else:
                 yyyymm = str(doc.confirmed_date)[:7].replace('-', '')
-            seq = f"{i:04d}"
             div = doc.division_code
             company = sanitize_filename(doc.company_name)
 
-            doc.final_filename = f"{yyyymm}{seq}_{div}_{company}.pdf"
+            doc.final_filename = build_final_filename(
+                i, div, company, include_date=include_date, yyyymm=yyyymm
+            )
 
             if mirror:
                 output_div_dir = mirrored_output_dir(config, doc, doc.rel_dir)
@@ -578,13 +661,13 @@ def _next_folder_sequence(output_root: Path) -> int:
     """
     Compute the next continuous sequence number for the flat output folder,
     continuing from the highest existing NNNN found across all files matching
-    the YYYYMM####_ filename prefix (regardless of division/company/month).
+    the YYYYMM####_ or ####_ filename prefix (regardless of division/company/month).
     """
     max_seq = 0
     if output_root.exists():
         try:
             for p in output_root.glob("*.pdf"):
-                m = re.match(r"\d{6}(\d{4})_", p.name)
+                m = re.match(r"(?:\d{6})?(\d{4})_", p.name)
                 if m:
                     max_seq = max(max_seq, int(m.group(1)))
         except OSError:
@@ -614,31 +697,40 @@ def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
     if not company_name.strip():
         return {"success": False, "error": "Company name is empty - enter a company name before finalizing"}
 
-    try:
-        parts = detected_date.split("-")
-        yyyymm = f"{parts[0]}{parts[1]}"
-    except (ValueError, IndexError):
-        yyyymm = _dt.now().strftime("%Y%m")
+    include_date = getattr(config, "document_date_enabled", False)
+    if not include_date:
+        yyyymm = ""
+    else:
+        try:
+            parts = detected_date.split("-")
+            yyyymm = f"{parts[0]}{parts[1]}"
+        except (ValueError, IndexError):
+            yyyymm = _dt.now().strftime("%Y%m")
 
     company_dir = sanitize_filename(company_name)
+    date_glob = f"{yyyymm}*" if yyyymm else "*"
     layout = getattr(config, "output_layout", "company")
     if layout == "mirror":
         # Recreate the input tree: <parent> output/<child>/.../<file>.pdf
         output_div_dir = mirrored_output_dir(config, original_path, doc_data.get("rel_dir", ""))
-        flat_glob = output_div_dir.glob(f"{yyyymm}*_{division_code}_{company_dir}.pdf")
+        flat_glob = output_div_dir.glob(f"{date_glob}_{division_code}_{company_dir}.pdf")
         seq = len(list(flat_glob)) + 1
     elif layout == "flat":
         output_div_dir = output_root
         seq = _next_folder_sequence(output_root)
     else:
         output_div_dir = output_root / division_code / company_dir
-        flat_glob = output_div_dir.glob(f"{yyyymm}*_{division_code}_{company_dir}.pdf")
+        flat_glob = output_div_dir.glob(f"{date_glob}_{division_code}_{company_dir}.pdf")
         seq = len(list(flat_glob)) + 1
     output_div_dir.mkdir(parents=True, exist_ok=True)
-    final_filename = f"{yyyymm}{seq:04d}_{division_code}_{company_dir}"
-    if doc_data.get("is_duplicate"):
-        final_filename += doc_data.get("duplicate_suffix", "")
-    final_filename += ".pdf"
+    final_filename = build_final_filename(
+        seq,
+        division_code,
+        company_dir,
+        include_date=include_date,
+        yyyymm=yyyymm,
+        duplicate_suffix=doc_data.get("duplicate_suffix", "") if doc_data.get("is_duplicate") else "",
+    )
     
     output_path = output_div_dir / final_filename
 
@@ -708,6 +800,7 @@ if __name__ == "__main__":
             page_index=cfg.get("page_index", 0),
             earliest_year=cfg.get("earliest_year", 1990),
             ocr_engine=cfg.get("ocr_engine", "tesseract"),
+            document_date_enabled=cfg.get("document_date_enabled", False),
         )
         config.enable_qc = cfg.get("enable_qc", None)
         config.enable_docsep_removal = cfg.get("enable_docsep_removal", True)

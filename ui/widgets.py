@@ -63,7 +63,8 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 pass
 
         page_index = config.get("page_index", 0)
-        date_result = extract_document_date(original_path, page_index, dpi=render_dpi, doc=_shared_doc, docsep_pages=result.get("docsep_pages", []))
+        include_date = config.get("document_date_enabled", False)
+        date_result = extract_document_date(original_path, page_index, dpi=render_dpi, doc=_shared_doc, docsep_pages=result.get("docsep_pages", []), include_date=include_date)
         result["blank_pages"] = list(date_result.blank_pages or [])
 
         total_pages = 0
@@ -158,14 +159,17 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
         company_confidence = company_result.get('company_confidence', 0)
         company_tier = company_result.get('tier_used', '')
 
-        # Triple-check Auto-Confirm Gate: Date >= 90%, Company >= threshold,
-        # Valid Date, and QC passed.
+        # Auto-Confirm Gate: Company >= threshold, QC passed, and (when the
+        # Document date setting is on) a valid confident date.
         company_conf_threshold = int(config.get("company_confidence_threshold", 90) or 90)
         earliest_year = config.get("earliest_year", 1950)
         date_valid = bool(date_result.date and date_result.date.year >= earliest_year and date_result.date <= date.today())
         date_conf_pass = date_result.confidence >= 90
         company_conf_pass = company_confidence >= company_conf_threshold
         qc_passed = not qc_failed
+
+        if not include_date:
+            date_valid = date_conf_pass = True
 
         is_auto_confirmed = (not date_result.all_blank) and date_valid and date_conf_pass and company_conf_pass and qc_passed
 
@@ -178,7 +182,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                 "company_confidence": company_confidence,
                 "company_tier": company_tier,
                 "original_filename": original_filename,
-                "detected_date": date_result.date.isoformat(),
+                "detected_date": date_result.date.isoformat() if date_result.date else "",
                 "confidence": date_result.confidence,
                 "method": date_result.method,
                 "blank_pages": result["blank_pages"],
@@ -190,7 +194,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
             if qc_result:
                 result["passed_data"]["qc_status"] = qc_result.get("qc_status", "")
                 result["passed_data"]["qc_failure_reasons"] = qc_result.get("qc_failure_reasons", "")
-            result["log_messages"].append(f"[AUTO] {original_filename} -> {date_result.date} ({date_result.confidence}%) | {final_company} ({company_confidence}%){blank_str}{qc_str}{docsep_msg}")
+            result["log_messages"].append(f"[AUTO] {original_filename} -> {date_result.date or ''} ({date_result.confidence}%) | {final_company} ({company_confidence}%){blank_str}{qc_str}{docsep_msg}")
         else:
             result["status"] = "flagged"
             result["flagged_data"] = {
@@ -296,6 +300,7 @@ class PipelineThread(QThread):
             pipeline_config.enable_docsep_removal = self.config.get("enable_docsep_removal", True)
             pipeline_config.enable_blank_removal = self.config.get("enable_blank_removal", True)
             pipeline_config.rename_enabled = self.config.get("rename_enabled", True)
+            pipeline_config.document_date_enabled = self.config.get("document_date_enabled", False)
             pipeline_config.audit_enabled = self.config.get("audit_enabled", True)
             pipeline_config.output_layout = self.config.get("output_layout", "flat")
 
