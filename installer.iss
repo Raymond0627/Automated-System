@@ -1,9 +1,9 @@
 ; Lumeed QScan - Inno Setup installer script
-; Produces a single installable LumeedQScan_Setup_1.8.4.exe
+; Produces a single installable LumeedQScan_Setup_1.9.0.exe
 ; with embedded Tesseract OCR and pre-configured settings.
 
 #define MyAppName "Lumeed QScan"
-#define MyAppVersion "1.8.4"
+#define MyAppVersion "1.9.0"
 #define MyAppPublisher "Lumeed"
 #define MyAppExeName "LumeedQScan.exe"
 #define MyAppDataDir "LumeedQScan"

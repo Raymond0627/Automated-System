@@ -10,12 +10,13 @@ Automatically extracts document dates from PDFs using OCR and renames files acco
 - **Batch Processing**: Process entire folders of PDFs with automatic date extraction
 - **Duplicate & Delete**: Right-click a document to duplicate (Ctrl+D) or delete (Ctrl+Z to undo)
 - **Auto-Create Output**: If Output is left blank, it is created inside the input folder on Scan/Run
+- **Optional Document Date**: Untick *Document date in filename* on the Settings tab to rename as `0001_003_COMPANY.pdf`, skip the date scan, and hide the date corrector
 
 ## Installation
 
 ### Option A — Installer (recommended for end users)
 
-Run `Output\LumeedQScan_Setup_1.8.4.exe` and follow the wizard. It installs to
+Run `Output\LumeedQScan_Setup_1.9.0.exe` and follow the wizard. It installs to
 `C:\Program Files\LumeedQScan`, bundles Tesseract OCR, and adds Start Menu /
 optional Desktop shortcuts. User data (config and sessions) is stored in
 `%APPDATA%\LumeedQScan`.
@@ -45,7 +46,7 @@ build.bat
 ```
 
 This rebuilds the PyInstaller package, bundles Tesseract, and compiles
-`Output\LumeedQScan_Setup_1.8.4.exe` via `installer.iss`.
+`Output\LumeedQScan_Setup_1.9.0.exe` via `installer.iss`.
 
 ## Project Structure
 
