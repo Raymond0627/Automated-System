@@ -800,6 +800,15 @@ class ReviewTab(QWidget):
     def refresh_doc_list(self, select_row=None, preserve_current=False):
         if self.active_tab == "reviewed":
             return
+
+        # Capture current scroll position and selected document key before clearing
+        scroll_bar = self.doc_list.verticalScrollBar()
+        saved_scroll_pos = scroll_bar.value() if scroll_bar else 0
+        current_docs_pre = self.pending_docs if self.active_tab == "pending" else self.auto_confirmed_docs
+        saved_doc_key = None
+        if 0 <= self.active_index < len(current_docs_pre):
+            saved_doc_key = doc_key(current_docs_pre[self.active_index])
+
         self.doc_list.blockSignals(True)
         self.doc_list.clear()
         self.doc_card_widgets = []
@@ -835,8 +844,21 @@ class ReviewTab(QWidget):
         self.confirm_all_btn.setEnabled(self.active_tab == "auto_confirmed" and bool(docs))
         self.doc_list.blockSignals(False)
         if docs:
-            row = select_row if select_row is not None else 0
+            # Determine target row to select
+            if select_row is not None:
+                row = min(max(0, select_row), len(docs) - 1)
+            elif saved_doc_key is not None:
+                # Find matching doc by key in new list
+                matching = next((i for i, d in enumerate(docs) if doc_key(d) == saved_doc_key), None)
+                if matching is not None:
+                    row = matching
+                else:
+                    row = min(max(0, self.active_index), len(docs) - 1)
+            else:
+                row = min(max(0, self.active_index), len(docs) - 1)
+
             self.selected_indices = [row]
+            self.active_index = row
             if preserve_current:
                 # Rebuild the list but do NOT emit currentRowChanged, otherwise
                 # _on_doc_selected → load_document would reset the company/date
@@ -847,6 +869,10 @@ class ReviewTab(QWidget):
             else:
                 self.doc_list.setCurrentRow(row)
             self._update_cards_selection()
+
+            # Restore scroll position so user does not jump back to top
+            if scroll_bar:
+                scroll_bar.setValue(saved_scroll_pos)
         else:
             self.selected_indices = []
 
@@ -3228,6 +3254,9 @@ class ReviewTab(QWidget):
                 parent=self,
             )
             dialog.exec()
+            # Ensure the current selection and scroll position are explicitly retained
+            if self.active_tab != "reviewed":
+                self.refresh_doc_list(preserve_current=True)
         finally:
             src_a.close()
             src_b.close()
