@@ -917,6 +917,12 @@ class ReviewTab(QWidget):
         if not out_root or not os.path.exists(out_root):
             return
         if self.active_tab == "reviewed":
+            # Save selection and scroll state before showing loading item
+            if 0 <= self.active_index < len(self.reviewed_docs):
+                self._reviewed_saved_doc_path = self.reviewed_docs[self.active_index].get("original_path")
+            sb = self.reviewed_tree.verticalScrollBar()
+            self._reviewed_saved_scroll = sb.value() if sb else 0
+
             self.reviewed_tree.blockSignals(True)
             self.reviewed_tree.clear()
             self.reviewed_tree.blockSignals(False)
@@ -939,16 +945,30 @@ class ReviewTab(QWidget):
         self.count_label.setText(f"{len(self.pending_docs)} pending | {len(self.auto_confirmed_docs)} auto | {len(self.reviewed_docs)} reviewed")
         if self.active_tab == "reviewed":
             self._populate_reviewed_tree(reviewed)
-            if self._reviewed_active_index >= 0:
-                idx = self._reviewed_active_index
-                self._reviewed_active_index = -1
-                item = self.reviewed_index_to_item.get(idx)
+            # Restore active item by doc path or active index
+            target_idx = self._reviewed_active_index
+            self._reviewed_active_index = -1
+            if target_idx < 0 and hasattr(self, "_reviewed_saved_doc_path") and self._reviewed_saved_doc_path:
+                target_idx = next(
+                    (i for i, d in enumerate(reviewed) if d.get("original_path") == self._reviewed_saved_doc_path),
+                    -1
+                )
+            if target_idx < 0 and 0 <= self.active_index < len(reviewed):
+                target_idx = self.active_index
+
+            if target_idx >= 0:
+                item = self.reviewed_index_to_item.get(target_idx)
                 if item:
                     self.reviewed_tree.setCurrentItem(item)
                     self.reviewed_tree.scrollToItem(item)
-                self.active_index = idx
-                self.load_document(reviewed[idx])
+                self.active_index = target_idx
+                self.reviewed_selected_indices = [target_idx]
+                if self.active_index < len(reviewed):
+                    self.load_document(reviewed[target_idx])
                 self._session_changed()
+
+            if hasattr(self, "_reviewed_saved_scroll") and self.reviewed_tree.verticalScrollBar():
+                self.reviewed_tree.verticalScrollBar().setValue(self._reviewed_saved_scroll)
 
     def _register_finalized_doc(self, doc: dict, result: dict):
         output_path = result.get("output_path", "")
@@ -993,6 +1013,14 @@ class ReviewTab(QWidget):
             self._populate_reviewed_tree(self.reviewed_docs)
 
     def _populate_reviewed_tree(self, docs: list):
+        # Save selection and scroll state before tree clear
+        saved_doc_idx = self.active_index
+        saved_doc_path = None
+        if 0 <= saved_doc_idx < len(self.reviewed_docs):
+            saved_doc_path = self.reviewed_docs[saved_doc_idx].get("original_path")
+        sb = self.reviewed_tree.verticalScrollBar()
+        saved_scroll = sb.value() if sb else 0
+
         self.reviewed_tree.blockSignals(True)
         self.reviewed_tree.clear()
         self.reviewed_index_to_item = {}
@@ -1021,6 +1049,24 @@ class ReviewTab(QWidget):
 
         self.reviewed_tree.resizeColumnToContents(0)
         self.reviewed_tree.expandAll()
+
+        # Restore selection and scroll position
+        target_idx = saved_doc_idx
+        if saved_doc_path:
+            match = next((i for i, d in enumerate(docs) if d.get("original_path") == saved_doc_path), None)
+            if match is not None:
+                target_idx = match
+
+        if 0 <= target_idx < len(docs):
+            item = self.reviewed_index_to_item.get(target_idx)
+            if item:
+                self.reviewed_tree.setCurrentItem(item)
+            self.active_index = target_idx
+            self.reviewed_selected_indices = [target_idx]
+
+        if sb:
+            sb.setValue(saved_scroll)
+
         self.reviewed_tree.blockSignals(False)
 
         self.tab_reviewed_btn.setText(f"Reviewed ({len(self.reviewed_docs)})")
@@ -2557,6 +2603,7 @@ class ReviewTab(QWidget):
             os.replace(temp_path, out_path)
 
             self.document_modified = False
+            self.load_document(doc)
             self._show_toast(f"Re-saved: {os.path.basename(out_path)}\n→ {os.path.dirname(out_path)}")
             self._session_changed()
         except Exception as e:
