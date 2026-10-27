@@ -9,17 +9,80 @@ from PyQt6.QtWidgets import (
     QLineEdit, QProgressBar, QFileDialog, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QFont, QColor, QPixmap
 
 if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).parent.parent))
 from paths import BASE_DIR, DATA_DIR, ensure_data_dir
 from .widgets import PipelineThread
+from find_remaining import build_report as build_remaining_report
+from find_remaining import plan_for_pipeline
 from .styles import (
     get_palette_dict, get_stat_card_style, get_dashboard_card_style,
     get_badge_pill_style, THEME_DARK
 )
+
+
+class ScanWorker(QThread):
+    """Runs the folder scan off the GUI thread so a deep/large tree (or a
+    network share) never freezes the window."""
+
+    progress = pyqtSignal(int, int, str)
+    done = pyqtSignal(list, str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, root: str, division_code: str, parent=None):
+        super().__init__(parent)
+        self.root = root
+        self.division_code = division_code
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        from pathlib import Path
+        from pipeline import parse_folder_structure
+
+        def on_progress(dirs, pdfs, current):
+            self.progress.emit(dirs, pdfs, current)
+
+        try:
+            batches = parse_folder_structure(
+                Path(self.root),
+                self.division_code,
+                progress_callback=on_progress,
+                should_cancel=lambda: self._cancelled,
+            )
+            self.done.emit(batches, self.division_code)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
+class CompareWorker(QThread):
+    """Compare Input against Output before a fresh run.
+
+    Runs off the GUI thread because page-image fingerprinting can take a while
+    on large scanned batches.
+    """
+
+    done = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+    def __init__(self, input_root: str, output_root: str, parent=None):
+        super().__init__(parent)
+        self.input_root = input_root
+        self.output_root = output_root
+
+    def run(self):
+        try:
+            report = build_remaining_report(
+                self.input_root, self.output_root, session_snapshot=None
+            )
+            self.done.emit(report)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 class StatCard(QFrame):
@@ -80,6 +143,8 @@ class DashboardTab(QWidget):
         self.pipeline_thread = None
         self._cancel_requested = False
         self._scan_plan = None
+        self._scan_worker = None
+        self._compare_worker = None
         self._processed_paths = set()
 
         # KPI metric counters
@@ -745,23 +810,30 @@ class DashboardTab(QWidget):
         if not path or not os.path.isdir(path):
             QMessageBox.warning(self, "Warning", "Please select a valid input folder first.")
             return
+        if getattr(self, "_scan_worker", None) and self._scan_worker.isRunning():
+            return
 
         self._set_status_pill("running", "SCANNING")
-        from pipeline import parse_folder_structure
-        try:
-            division_code = self.division_var.text().strip()
-            batches = parse_folder_structure(Path(path), division_code)
-            companies_set = set()
-            pdfs = 0
-            for b in batches:
-                for doc in b.documents:
-                    pdfs += 1
-                    companies_set.add((b.division_code, doc.company_name))
-            companies = len(companies_set)
-        except Exception as e:
-            QMessageBox.critical(self, "Scan Error", f"Failed to scan folder:\n{e}")
-            self._set_status_pill("error", "ERROR")
-            return
+        self.scan_btn.setEnabled(False)
+        self.scan_btn.setText("Scanning...")
+
+        self._scan_worker = ScanWorker(path, self.division_var.text().strip())
+        self._scan_worker.progress.connect(self._on_scan_progress)
+        self._scan_worker.done.connect(self._on_scan_done)
+        self._scan_worker.failed.connect(self._on_scan_failed)
+        self._scan_worker.start()
+
+    def _on_scan_progress(self, dirs: int, pdfs: int, current: str):
+        self.scan_label.setText(f"Scanning... {dirs} folders, {pdfs} PDFs found")
+
+    def _on_scan_done(self, batches: list, division_code: str):
+        companies_set = set()
+        pdfs = 0
+        for b in batches:
+            for doc in b.documents:
+                pdfs += 1
+                companies_set.add((b.division_code, doc.company_name))
+        companies = len(companies_set)
 
         self._stat_total = pdfs
         self._update_kpi_cards()
@@ -771,9 +843,21 @@ class DashboardTab(QWidget):
         year = self.config.get("earliest_year", 1950)
         self.scan_label.setText(f"OCR: {ocr.upper()}  ·  Threshold: {thresh}%  ·  Year: {year}+  ·  Division: {division_code or '—'}  ·  {pdfs} PDFs")
         self._set_status_pill("idle", "SCANNED")
+        self._reset_scan_btn()
+
+    def _on_scan_failed(self, message: str):
+        self._set_status_pill("error", "ERROR")
+        self._reset_scan_btn()
+        QMessageBox.critical(self, "Scan Error", f"Failed to scan folder:\n{message}")
+
+    def _reset_scan_btn(self):
+        self.scan_btn.setEnabled(True)
+        self.scan_btn.setText("⟳  Scan Folder")
 
     def run_pipeline(self):
         if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
+        if self._compare_worker and self._compare_worker.isRunning():
             return
 
         if not self._require_division_code():
@@ -789,20 +873,150 @@ class DashboardTab(QWidget):
         self.config["division_code"] = self.division_var.text().strip()
         self._save_config()
 
+        if self._output_has_pdfs(output):
+            self._start_output_check(self.config["input_root"], output)
+        else:
+            self._start_pipeline()
+
+    def _output_has_pdfs(self, root: str) -> bool:
+        try:
+            return next(Path(root).rglob("*.pdf"), None) is not None
+        except OSError:
+            return False
+
+    def _start_output_check(self, input_root: str, output_root: str):
         self.run_btn.setEnabled(False)
-        self.run_btn.setText("Running...")
+        self.run_btn.setText("Checking...")
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFormat("Checking existing output...")
+        self._set_status_pill("running", "CHECKING")
+        self.log_signal.emit("=== Checking existing output before scanning ===")
+
+        self._compare_worker = CompareWorker(input_root, output_root, self)
+        self._compare_worker.done.connect(self._on_compare_done)
+        self._compare_worker.failed.connect(self._on_compare_failed)
+        self._compare_worker.start()
+
+    def _reset_compare_ui(self):
+        self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("Starting...")
+        self.progress_bar.setFormat("")
+        self.run_btn.setEnabled(True)
+        self.run_btn.setText("▶  Run Pipeline")
         self.cancel_btn.setEnabled(True)
-        self._set_status_pill("running", "RUNNING")
-        self.log_signal.emit("=== Pipeline Started ===")
+        self._set_status_pill("idle", "READY")
+
+    def _ask_process_scope(self, done: int, remaining: int, total: int) -> str:
+        answer = QMessageBox.question(
+            self,
+            "Existing Output Found",
+            f"{done} of {total} input PDFs already have output files.\n\n"
+            f"Remaining to process: {remaining}\n\n"
+            "Yes = process only the remaining PDFs\n"
+            "No = process all PDFs again\n"
+            "Cancel = do nothing",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            return "remaining"
+        if answer == QMessageBox.StandardButton.No:
+            return "all"
+        return "cancel"
+
+    def _ask_reprocess_all(self, total: int) -> bool:
+        answer = QMessageBox.question(
+            self,
+            "Nothing Remaining",
+            f"All {total} input PDFs already have output files.\n\n"
+            "Reprocess everything anyway?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _on_compare_done(self, report):
+        self._reset_compare_ui()
+        done = report.done_count
+        remaining = len(report.remaining)
+        total = len(report.rows)
+        self.log_signal.emit(
+            f"=== Output check: {done}/{total} already processed, "
+            f"{remaining} remaining ==="
+        )
+
+        if total == 0:
+            self.log_signal.emit("No input PDFs found.")
+            return
+
+        if remaining == 0:
+            if self._ask_reprocess_all(total):
+                self._start_pipeline()
+            else:
+                self.log_signal.emit("Run cancelled: nothing remaining.")
+            return
+
+        if done == 0:
+            self._start_pipeline()
+            return
+
+        action = self._ask_process_scope(done, remaining, total)
+        if action == "remaining":
+            plan, existing = plan_for_pipeline(report)
+            self._start_pipeline(plan=plan, existing_paths=existing)
+        elif action == "all":
+            self._start_pipeline()
+        else:
+            self.log_signal.emit("Run cancelled after output check.")
+
+    def _on_compare_failed(self, message: str):
+        self._reset_compare_ui()
+        self.log_signal.emit(
+            f"[WARNING] Could not compare existing output: {message}. "
+            "Running all files."
+        )
+        self._start_pipeline()
+
+    def _start_pipeline(self, plan=None, existing_paths=None):
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            return
+
+        resuming = plan is not None
+        self.run_btn.setEnabled(False)
+        self.run_btn.setText("Resuming..." if resuming else "Running...")
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(5 if resuming else 0)
+        self.progress_bar.setFormat(
+            f"Resuming ({len(plan) - len(existing_paths or ())} remaining)..."
+            if resuming
+            else "Starting..."
+        )
+        self.cancel_btn.setEnabled(True)
+        self._set_status_pill("running", "RESUMING" if resuming else "RUNNING")
+        self.log_signal.emit(
+            "=== Resuming Pipeline (existing output) ==="
+            if resuming
+            else "=== Pipeline Started ==="
+        )
         self.pipeline_started.emit()
-        self._scan_plan = None
-        self._processed_paths = set()
+        self._scan_plan = list(plan) if resuming else None
+        self._processed_paths = set(existing_paths or ()) if resuming else set()
+        if resuming:
+            self._stat_total = len(plan)
+            self._update_kpi_cards()
         self._emit_state_changed()
 
-        self.pipeline_thread = PipelineThread(self.config, 0)
+        if resuming:
+            self.pipeline_thread = PipelineThread(
+                self.config, 0, plan=plan, existing_paths=existing_paths
+            )
+        else:
+            self.pipeline_thread = PipelineThread(self.config, 0)
         self.pipeline_thread.progress.connect(self._on_progress)
+        self.pipeline_thread.page_progress.connect(self._on_page_progress)
         self.pipeline_thread.log_message.connect(self._append_log)
         self.pipeline_thread.finished_signal.connect(self._on_finished)
         self.pipeline_thread.error_signal.connect(self._on_error)
@@ -855,6 +1069,7 @@ class DashboardTab(QWidget):
             merged_confirmed=merged_confirmed,
         )
         self.pipeline_thread.progress.connect(self._on_progress)
+        self.pipeline_thread.page_progress.connect(self._on_page_progress)
         self.pipeline_thread.log_message.connect(self._append_log)
         self.pipeline_thread.finished_signal.connect(self._on_finished)
         self.pipeline_thread.error_signal.connect(self._on_error)
@@ -874,6 +1089,16 @@ class DashboardTab(QWidget):
     def _on_progress(self, msg: str, pct: int):
         self.progress_bar.setValue(pct)
         self.progress_bar.setFormat(msg)
+
+    def _on_page_progress(self, filename: str, page_idx: int, total_pages: int):
+        # Keep the overall percentage; just make the frozen "working..." state
+        # show live page movement on long documents.
+        pct = self.progress_bar.value()
+        if total_pages > 0:
+            short = filename if len(filename) <= 32 else filename[:29] + "..."
+            self.progress_bar.setFormat(
+                f"{short} - page {page_idx + 1}/{total_pages} ({pct}%)"
+            )
 
     def _on_doc_completed(self, kind: str, path: str):
         if kind == "doc":
@@ -907,8 +1132,9 @@ class DashboardTab(QWidget):
             self.progress_bar.setValue(100)
             self.progress_bar.setFormat("Completed")
             self._set_status_pill("done", "COMPLETED")
-            self._scan_plan = None
-            self._processed_paths = set()
+            # Keep _scan_plan/_processed_paths: if the app is closed before the
+            # review queue is finished, the next launch can resume instead of
+            # losing the whole scan. A new Run resets them at start.
         self._emit_state_changed()
         self.log_signal.emit("=== Pipeline Completed ===")
         self.pipeline_finished.emit()

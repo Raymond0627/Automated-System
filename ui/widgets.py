@@ -3,12 +3,14 @@ import sys
 import json
 import time
 import gc
+import shutil
+import tempfile
 import numpy as np
 import cv2
 import fitz
 from pathlib import Path
 from typing import Dict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import date, datetime
 
 from PyQt6.QtWidgets import QWidget, QFrame, QHBoxLayout, QVBoxLayout, QLabel
@@ -27,6 +29,64 @@ from .styles import get_palette_dict, THEME_DARK
 import pytesseract
 
 
+def _is_network_path(path: str) -> bool:
+    """True for UNC shares and mapped network drives (best-effort, Windows)."""
+    try:
+        norm = os.path.abspath(path)
+    except Exception:
+        norm = path
+    if norm.startswith("\\\\") or norm.startswith("//"):
+        return True
+    if os.name == "nt" and len(norm) >= 2 and norm[1] == ":":
+        try:
+            import ctypes
+
+            drive = norm[:2] + "\\"
+            DRIVE_REMOTE = 4
+            return ctypes.windll.kernel32.GetDriveTypeW(drive) == DRIVE_REMOTE
+        except Exception:
+            return False
+    if norm.startswith("/"):
+        try:
+            return os.statvfs("/").f_flag & getattr(os, "ST_REMOTE", 0) != 0
+        except Exception:
+            return False
+    return False
+
+
+def _stage_local_copy(path: str, should_cancel=None):
+    """Copy a network file to a local temp dir so PDF/OCR work runs on a fast
+    local disk instead of crossing the network per page. Returns
+    (work_path, temp_dir); temp_dir is None when no copy was made."""
+    src = Path(path)
+    if not _is_network_path(path):
+        return path, None
+    temp_dir = tempfile.mkdtemp(prefix="lumeedqscan_")
+    work_path = Path(temp_dir) / src.name
+    try:
+        with open(src, "rb") as fsrc, open(work_path, "wb") as fdst:
+            while True:
+                if should_cancel is not None and should_cancel():
+                    raise InterruptedError("cancelled while staging")
+                chunk = fsrc.read(1024 * 1024)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+    except Exception:
+        _cleanup_staged(temp_dir)
+        return path, None
+    return str(work_path), temp_dir
+
+
+def _cleanup_staged(temp_dir):
+    if not temp_dir:
+        return
+    try:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
     """Process a single document in a worker thread. Returns result dict."""
     result = {
@@ -39,22 +99,31 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
         "total_pages": 0,
     }
 
+    ocr_timeout = config.get("ocr_timeout_sec", 120) or 0
+    should_cancel = doc_info.get("_should_cancel")
+    original_path = doc_info["original_path"]
+    temp_dir = None
+    _shared_doc = None
+    started = time.time()
     try:
-        original_path = doc_info["original_path"]
+        work_path, temp_dir = _stage_local_copy(original_path, should_cancel=should_cancel)
+        if temp_dir:
+            result["log_messages"].append(f"[STAGE] {doc_info['original_filename']}: copied to local temp for processing")
+
         original_filename = doc_info["original_filename"]
         division_code = doc_info["division_code"]
         company_name = doc_info["company_name"]
 
         docsep_msg = ""
-        _shared_doc = None
         try:
-            _shared_doc = fitz.open(original_path)
+            _shared_doc = fitz.open(work_path)
         except Exception:
             pass
 
+        stage_t0 = time.time()
         if config.get("enable_docsep_removal", True):
             try:
-                ds_result = detect_docsep_flag(original_path, dpi=render_dpi, doc=_shared_doc)
+                ds_result = detect_docsep_flag(work_path, dpi=render_dpi, doc=_shared_doc)
                 result["docsep_pages"] = ds_result.get("docsep_pages", [])
                 if result["docsep_pages"]:
                     docsep_msg = f" | docsep:{len(result['docsep_pages'])}"
@@ -62,16 +131,45 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
             except Exception:
                 pass
 
+        # When the date scan is off and the PDF already carries native text, the
+        # per-page OCR pass is redundant (blank verification and company
+        # matching can use the native text), so skip it.
+        skip_ocr = False
+        if not config.get("document_date_enabled", False):
+            try:
+                if _shared_doc is not None and len(_shared_doc) > 0:
+                    probe_pages = min(len(_shared_doc), 3)
+                    native_chars = sum(
+                        len(_shared_doc[i].get_text().strip()) for i in range(probe_pages)
+                    )
+                    skip_ocr = native_chars >= 40
+            except Exception:
+                skip_ocr = False
+
         page_index = config.get("page_index", 0)
         include_date = config.get("document_date_enabled", False)
-        date_result = extract_document_date(original_path, page_index, dpi=render_dpi, doc=_shared_doc, docsep_pages=result.get("docsep_pages", []), include_date=include_date)
+        date_result = extract_document_date(
+            work_path,
+            page_index,
+            dpi=render_dpi,
+            doc=_shared_doc,
+            docsep_pages=result.get("docsep_pages", []),
+            include_date=include_date,
+            skip_ocr=skip_ocr,
+            should_cancel=should_cancel,
+            ocr_timeout=ocr_timeout,
+            page_progress_callback=doc_info.get("_page_progress"),
+        )
         result["blank_pages"] = list(date_result.blank_pages or [])
+        result["log_messages"].append(
+            f"[TIMING] {original_filename}: docsep+blank {time.time() - stage_t0:.1f}s"
+        )
 
         total_pages = 0
         if result["blank_pages"]:
             pdf_for_ocr = None
             try:
-                pdf_for_ocr = fitz.open(original_path) if _shared_doc is None else _shared_doc
+                pdf_for_ocr = fitz.open(work_path) if _shared_doc is None else _shared_doc
                 total_pages = len(pdf_for_ocr)
                 for blank_pg in list(result["blank_pages"]):
                     if blank_pg >= total_pages:
@@ -83,7 +181,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                     del img
-                    text = pytesseract.image_to_string(gray, config='--psm 6').strip()
+                    text = pytesseract.image_to_string(gray, config='--psm 6', timeout=ocr_timeout).strip()
                     del gray
                     words = [w for w in text.split() if len(w) >= 2]
                     if len(words) >= 2:
@@ -103,7 +201,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
             total_pages = len(_shared_doc)
         else:
             try:
-                with fitz.open(original_path) as _tmp:
+                with fitz.open(work_path) as _tmp:
                     total_pages = len(_tmp)
             except Exception:
                 total_pages = 0
@@ -111,24 +209,53 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
         result["total_pages"] = total_pages
 
         qc_result = None
+        rotation_enabled = bool(config.get("qc_rotation_enabled", False))
         if config.get("enable_qc", True) and not date_result.all_blank:
-            try:
-                gpu_mode = config.get("gpu_mode", "cpu")
-                use_gpu = gpu_mode == "local_gpu"
-                if gpu_mode == "remote":
-                    from auto_qc import set_remote_gpu_url
-                    set_remote_gpu_url(config.get("remote_gpu_url", ""))
-                qc_result = run_qc_on_pdf(
-                    original_path,
-                    blank_threshold=config.get("qc_blank_threshold", 1.5),
-                    rotation_threshold=config.get("qc_rotation_threshold", 65),
-                    dpi=render_dpi,
-                    use_gpu=use_gpu,
-                    gpu_mode=gpu_mode,
-                    doc=_shared_doc,
-                )
-            except Exception:
-                pass
+            if not rotation_enabled:
+                # With the rotation check off, QC has nothing left to do that the
+                # blank scan in extract_document_date has not already done. Skip
+                # the extra page pass so huge documents are not rasterised twice.
+                qc_result = {
+                    "blank_detected": bool(result["blank_pages"]),
+                    "blank_ink_ratio": 0.0,
+                    "rotation_detected": "skipped",
+                    "rotation_confidence": 0.0,
+                    "mirrored_detected": False,
+                    "mirror_delta": 0.0,
+                    "mirror_needs_review": False,
+                    "qc_status": "passed",
+                    "qc_failure_reasons": "",
+                    "pages_checked": 0,
+                    "total_pages": total_pages,
+                }
+            else:
+                try:
+                    qc_t0 = time.time()
+                    gpu_mode = config.get("gpu_mode", "cpu")
+                    use_gpu = gpu_mode == "local_gpu"
+                    if gpu_mode == "remote":
+                        from auto_qc import set_remote_gpu_url
+                        set_remote_gpu_url(config.get("remote_gpu_url", ""))
+                    # Do not buffer every page image: QC renders each page itself
+                    # and releases it immediately, so memory stays flat no matter
+                    # how many pages the document has.
+                    qc_result = _run_qc_on_pages(
+                        [],
+                        work_path=work_path,
+                        blank_threshold=config.get("qc_blank_threshold", 1.5),
+                        rotation_threshold=config.get("qc_rotation_threshold", 65),
+                        dpi=render_dpi,
+                        use_gpu=use_gpu,
+                        gpu_mode=gpu_mode,
+                        ocr_timeout=ocr_timeout,
+                        should_cancel=should_cancel,
+                        rotation_enabled=rotation_enabled,
+                    )
+                    result["log_messages"].append(
+                        f"[TIMING] {original_filename}: qc {time.time() - qc_t0:.1f}s ({total_pages} pages)"
+                    )
+                except Exception:
+                    pass
 
         qc_failed = qc_result and qc_result.get("qc_status") == "failed"
         qc_str = ""
@@ -146,7 +273,7 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
             if _shared_doc is not None:
                 page_texts = [{"page_text": _shared_doc[i].get_text().strip(), "page_idx": i} for i in range(len(_shared_doc))]
             else:
-                with fitz.open(original_path) as _d:
+                with fitz.open(work_path) as _d:
                     page_texts = [{"page_text": _d[i].get_text().strip(), "page_idx": i} for i in range(len(_d))]
         except Exception:
             page_texts = [{"page_text": t, "page_idx": i} for i, t in enumerate(date_result.page_texts)]
@@ -228,14 +355,100 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
     except Exception as e:
         result["status"] = "error"
         result["log_messages"].append(f"[ERROR] {doc_info['original_filename']}: {e}")
-
-    if _shared_doc is not None:
-        try:
-            _shared_doc.close()
-        except Exception:
-            pass
+    finally:
+        if _shared_doc is not None:
+            try:
+                _shared_doc.close()
+            except Exception:
+                pass
+        _cleanup_staged(temp_dir)
+        result["log_messages"].append(
+            f"[TIMING] {doc_info['original_filename']}: total {time.time() - started:.1f}s"
+        )
 
     return result
+
+
+def _run_qc_on_pages(
+    page_images,
+    work_path: str,
+    blank_threshold: float,
+    rotation_threshold: float,
+    dpi: int,
+    use_gpu: bool,
+    gpu_mode: str,
+    ocr_timeout: float,
+    should_cancel=None,
+    rotation_enabled: bool = True,
+) -> dict:
+    """Run QC over every page.
+
+    ``page_images`` may be empty: pages not present in it are rendered here one
+    at a time and released immediately, so memory stays flat regardless of the
+    document length. Callers should pass an empty list for large documents.
+    """
+    import fitz
+    from auto_qc import run_qc
+
+    agg = {
+        "blank_detected": False,
+        "blank_ink_ratio": 0.0,
+        "rotation_detected": "none",
+        "rotation_confidence": 100.0,
+        "mirrored_detected": False,
+        "mirror_delta": 0.0,
+        "mirror_needs_review": False,
+        "qc_status": "passed",
+        "qc_failure_reasons": "",
+        "pages_checked": 0,
+        "total_pages": 0,
+    }
+
+    images_by_idx = {idx: img for idx, img in page_images}
+    total = 0
+    try:
+        with fitz.open(work_path) as doc:
+            total = len(doc)
+            for pn in range(total):
+                if should_cancel is not None and should_cancel():
+                    break
+                img = images_by_idx.get(pn)
+                if img is None:
+                    page = doc[pn]
+                    pix = page.get_pixmap(dpi=dpi)
+                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                    del pix
+                agg["pages_checked"] += 1
+                result = run_qc(
+                    img,
+                    blank_threshold,
+                    rotation_threshold,
+                    use_gpu=use_gpu,
+                    gpu_mode=gpu_mode,
+                    dpi=dpi,
+                    ocr_timeout=ocr_timeout,
+                    rotation_enabled=rotation_enabled,
+                )
+                del img
+                if result["blank_detected"]:
+                    agg["blank_detected"] = True
+                agg["blank_ink_ratio"] = max(agg["blank_ink_ratio"], result["blank_ink_ratio"])
+                if result["rotation_detected"] not in ("none", "skipped"):
+                    agg["rotation_detected"] = result["rotation_detected"]
+                    agg["rotation_confidence"] = min(agg["rotation_confidence"], result["rotation_confidence"])
+                if result["qc_status"] != "passed":
+                    agg["qc_status"] = result["qc_status"]
+                if result["qc_failure_reasons"]:
+                    agg["qc_failure_reasons"] = (
+                        agg["qc_failure_reasons"] + "; " + result["qc_failure_reasons"]
+                        if agg["qc_failure_reasons"]
+                        else result["qc_failure_reasons"]
+                    )
+    except Exception:
+        pass
+    agg["total_pages"] = total
+    return agg
 
 
 def _json_safe_flagged(flagged):
@@ -253,8 +466,35 @@ def _json_safe_flagged(flagged):
     return safe
 
 
+def _flagged_key(doc: dict) -> str:
+    path = doc.get("original_path") or doc.get("modified_path") or ""
+    if path:
+        path = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    name = doc.get("original_filename", "") or ""
+    return f"{path}|{name}"
+
+
+def _merge_flagged_docs(existing, new):
+    """Merge resume results, replacing stale entries for the same source.
+
+    A resumed document can already exist in the restored pending list.  New
+    OCR/QC results must replace that entry instead of adding a duplicate.
+    """
+    merged = list(existing or [])
+    positions = {_flagged_key(doc): index for index, doc in enumerate(merged)}
+    for doc in new or []:
+        key = _flagged_key(doc)
+        if key in positions:
+            merged[positions[key]] = doc
+        else:
+            positions[key] = len(merged)
+            merged.append(doc)
+    return merged
+
+
 class PipelineThread(QThread):
     progress = pyqtSignal(str, int)
+    page_progress = pyqtSignal(str, int, int)
     log_message = pyqtSignal(str)
     finished_signal = pyqtSignal(list)
     error_signal = pyqtSignal(str)
@@ -302,6 +542,7 @@ class PipelineThread(QThread):
             pipeline_config.rename_enabled = self.config.get("rename_enabled", True)
             pipeline_config.document_date_enabled = self.config.get("document_date_enabled", False)
             pipeline_config.audit_enabled = self.config.get("audit_enabled", True)
+            pipeline_config.qc_rotation_enabled = self.config.get("qc_rotation_enabled", False)
             pipeline_config.output_layout = self.config.get("output_layout", "flat")
 
             render_dpi = self.config.get("render_dpi", 200)
@@ -344,7 +585,28 @@ class PipelineThread(QThread):
                         if pp.exists():
                             pp.unlink()
 
-                batches = parse_folder_structure(pipeline_config.input_root, division_code)
+                scan_stats = {"dirs": 0, "pdfs": 0, "last": 0.0}
+
+                def scan_progress(dirs, pdfs, current):
+                    now = time.time()
+                    if now - scan_stats["last"] < 0.25:
+                        return
+                    scan_stats["last"] = now
+                    self.progress.emit(
+                        f"Scanning folders... {dirs} folders, {pdfs} PDFs found", 5
+                    )
+
+                batches = parse_folder_structure(
+                    pipeline_config.input_root,
+                    division_code,
+                    progress_callback=scan_progress,
+                    should_cancel=lambda: self._cancelled,
+                )
+                if self._cancelled:
+                    self.log_message.emit("--- Pipeline Cancelled ---")
+                    self.progress.emit("Cancelled", 0)
+                    self.finished_signal.emit([])
+                    return
                 total = sum(len(b.documents) for b in batches)
 
                 if self.max_files > 0:
@@ -375,6 +637,22 @@ class PipelineThread(QThread):
 
             self.scan_plan.emit([info["original_path"] for info in doc_infos])
 
+            # Let in-flight workers abort between pages once Cancel is pressed.
+            for info in doc_infos:
+                info["_should_cancel"] = lambda: self._cancelled
+
+            def _make_page_progress(name):
+                def _cb(page_idx, total_pages):
+                    self.page_progress.emit(name, page_idx, total_pages)
+                return _cb
+
+            for info in doc_infos:
+                info["_page_progress"] = _make_page_progress(info["original_filename"])
+
+            # Extra workers beyond the number of documents add nothing: the pool
+            # creates threads lazily per submitted task, so clamp for clarity.
+            max_workers = max(1, min(int(max_workers), max(1, len(doc_infos))))
+
             processed = 0
             start_time = time.time()
             results_by_path = {}
@@ -394,82 +672,96 @@ class PipelineThread(QThread):
                     if submitted % batch_size == 0:
                         self.log_message.emit(f"[INFO] Submitted {submitted}/{len(doc_infos)} documents...")
 
-                for future in as_completed(future_to_info):
+                pending = set(future_to_info)
+                while pending:
+                    done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
                     if self._cancelled:
                         self.log_message.emit("--- Pipeline Cancelled ---")
                         self.progress.emit("Cancelled", 0)
                         self.finished_signal.emit([])
                         executor.shutdown(wait=False, cancel_futures=True)
                         return
+                    if not done:
+                        # Heartbeat keeps the UI responsive while a long document
+                        # is still being processed.
+                        elapsed = time.time() - start_time
+                        avg_per = elapsed / max(1, processed)
+                        remaining = avg_per * (total - processed)
+                        eta = f" ~{int(remaining)}s left" if remaining > 5 else ""
+                        pct = 10 + int(80 * processed / max(1, total))
+                        self.progress.emit(f"Processing {processed}/{total} (working...){eta}", pct)
+                        continue
 
-                    info = future_to_info[future]
-                    try:
-                        worker_result = future.result()
-                    except Exception as e:
-                        worker_result = {"status": "error", "log_messages": [f"[ERROR] {info['original_filename']}: {e}"]}
+                    for future in done:
+                        info = future_to_info[future]
+                        try:
+                            worker_result = future.result()
+                        except Exception as e:
+                            worker_result = {"status": "error", "log_messages": [f"[ERROR] {info['original_filename']}: {e}"]}
 
-                    doc = info.get("_doc")
-                    batch = info.get("_batch")
-                    original_path = info["original_path"]
+                        doc = info.get("_doc")
+                        batch = info.get("_batch")
+                        original_path = info["original_path"]
 
-                    results_by_path[original_path] = worker_result
+                        results_by_path[original_path] = worker_result
 
-                    for msg in worker_result.get("log_messages", []):
-                        self.log_message.emit(msg)
+                        for msg in worker_result.get("log_messages", []):
+                            self.log_message.emit(msg)
 
-                    status = worker_result["status"]
+                        status = worker_result["status"]
 
-                    if status == "confirmed" and worker_result.get("passed_data"):
-                        passed_data = worker_result["passed_data"]
-                        self.doc_processed.emit("passed", passed_data)
-                    elif worker_result.get("flagged_data"):
-                        flagged_data = worker_result["flagged_data"]
-                        new_flagged.append(flagged_data)
-                        self.doc_processed.emit("pending", flagged_data)
+                        if status == "confirmed" and worker_result.get("passed_data"):
+                            passed_data = worker_result["passed_data"]
+                            self.doc_processed.emit("passed", passed_data)
+                        elif worker_result.get("flagged_data"):
+                            flagged_data = worker_result["flagged_data"]
+                            new_flagged.append(flagged_data)
+                            self.doc_processed.emit("pending", flagged_data)
 
-                    if doc is not None:
-                        doc.blank_pages = list(worker_result.get("blank_pages", []))
-                        doc.docsep_pages = list(worker_result.get("docsep_pages", []))
-                        doc.status = status
-                        if status == "flagged" and worker_result.get("flagged_data"):
-                            doc.flagged_data = worker_result["flagged_data"]
-                            doc.company_name = worker_result["flagged_data"].get("company_name", doc.company_name)
-                            doc.company_confidence = worker_result["flagged_data"].get("company_confidence", 0)
-                        elif status == "confirmed" and worker_result.get("passed_data"):
-                            doc.confirmed_date = passed_data.get("detected_date")
-                            doc.confirmed_method = passed_data.get("method", "auto")
-                            doc.company_name = passed_data.get("company_name", doc.company_name)
-                            doc.company_confidence = passed_data.get("company_confidence", 100)
-                            doc.flagged_data = None
-                        else:
-                            doc.flagged_data = None
+                        if doc is not None:
+                            doc.blank_pages = list(worker_result.get("blank_pages", []))
+                            doc.docsep_pages = list(worker_result.get("docsep_pages", []))
+                            doc.status = status
+                            if status == "flagged" and worker_result.get("flagged_data"):
+                                doc.flagged_data = worker_result["flagged_data"]
+                                doc.company_name = worker_result["flagged_data"].get("company_name", doc.company_name)
+                                doc.company_confidence = worker_result["flagged_data"].get("company_confidence", 0)
+                            elif status == "confirmed" and worker_result.get("passed_data"):
+                                doc.confirmed_date = passed_data.get("detected_date")
+                                doc.confirmed_method = passed_data.get("method", "auto")
+                                doc.company_name = passed_data.get("company_name", doc.company_name)
+                                doc.company_confidence = passed_data.get("company_confidence", 100)
+                                doc.flagged_data = None
+                            else:
+                                doc.flagged_data = None
 
-                    self.doc_completed.emit("doc", original_path)
+                        self.doc_completed.emit("doc", original_path)
 
-                    processed += 1
-                    elapsed = time.time() - start_time
-                    avg_per = elapsed / max(1, processed)
-                    remaining = avg_per * (total - processed)
-                    eta = f" ~{int(remaining)}s left" if remaining > 5 else ""
-                    pct = 10 + int(80 * processed / max(1, total))
-                    self.progress.emit(f"Processing {processed}/{total}...{eta}", pct)
+                        processed += 1
+                        elapsed = time.time() - start_time
+                        avg_per = elapsed / max(1, processed)
+                        remaining = avg_per * (total - processed)
+                        eta = f" ~{int(remaining)}s left" if remaining > 5 else ""
+                        pct = 10 + int(80 * processed / max(1, total))
+                        self.progress.emit(f"Processing {processed}/{total}...{eta}", pct)
 
-                    if processed % 50 == 0:
-                        gc.collect()
+                        if processed % 50 == 0:
+                            gc.collect()
 
-            flagged = list(self.merged_flagged)
             if self.plan is None:
+                fresh_flagged = []
                 for b in batches:
                     for d in b.documents:
                         if d.status == "flagged" and d.flagged_data:
-                            flagged.append(d.flagged_data)
+                            fresh_flagged.append(d.flagged_data)
+                flagged = _merge_flagged_docs(self.merged_flagged, fresh_flagged)
             else:
-                flagged.extend(new_flagged)
+                flagged = _merge_flagged_docs(self.merged_flagged, new_flagged)
 
             confirmed = list(self.merged_confirmed)
             if self.plan is not None:
                 confirmed_count = len(confirmed)
-                flagged_count = len(self.merged_flagged) + len(new_flagged)
+                flagged_count = len(flagged)
                 errors = 0
             else:
                 confirmed_count = sum(1 for b in batches for d in b.documents if d.status == "confirmed")

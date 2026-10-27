@@ -16,7 +16,7 @@ Automatically extracts document dates from PDFs using OCR and renames files acco
 
 ### Option A — Installer (recommended for end users)
 
-Run `Output\LumeedQScan_Setup_1.9.0.exe` and follow the wizard. It installs to
+Run `Output\LumeedQScan_Setup_1.9.1.exe` and follow the wizard. It installs to
 `C:\Program Files\LumeedQScan`, bundles Tesseract OCR, and adds Start Menu /
 optional Desktop shortcuts. User data (config and sessions) is stored in
 `%APPDATA%\LumeedQScan`.
@@ -46,7 +46,7 @@ build.bat
 ```
 
 This rebuilds the PyInstaller package, bundles Tesseract, and compiles
-`Output\LumeedQScan_Setup_1.9.0.exe` via `installer.iss`.
+`Output\LumeedQScan_Setup_1.9.1.exe` via `installer.iss`.
 
 ## Project Structure
 
@@ -56,6 +56,8 @@ Automated System/
 ├── blank_page_detector.py # Blank page detection module
 ├── date_extractor.py     # OCR date extraction module
 ├── pipeline.py           # Processing pipeline
+├── find_remaining.py     # Input/output comparison and resume helper
+├── manifest.py           # rename_manifest.csv reader/writer
 ├── desktop_app.py        # PyQt6 desktop GUI entry point
 ├── paths.py              # Resource/data path resolution
 ├── installer.iss         # Inno Setup installer script
@@ -108,7 +110,62 @@ python desktop_app.py
 ### Step 4: Check Results
 
 - Renamed PDFs are in the output folder
-- Rename log is at `{output_folder}/rename_log.csv`
+- Rename manifest is at `{output_folder}/rename_manifest.csv`
+
+## Checking What Is Left to Process
+
+If a scan was interrupted (or a folder already has some renamed files), use the
+comparison tool before running the pipeline again:
+
+```bat
+python find_remaining.py
+```
+
+It reads the input/output folders and the last saved session automatically, then
+writes:
+
+- `resume_reports/remaining_pdfs.csv`
+- `resume_reports/remaining_pdfs.txt`
+- `resume_reports/output_files.csv`
+
+Every input PDF is classified as done, remaining, shared/merged, borderline,
+raw-copy-only, or unreadable. The matcher uses the saved session first, then the
+SHA-256 manifest, then page-text fingerprints, then page-image fingerprints, so
+renamed output files do not have to be matched by filename. Image fingerprints
+also handle scanned PDFs with no text layer and QC edits that removed pages.
+
+The Dashboard also runs this comparison automatically before a fresh **Run
+Pipeline** when the output folder already contains PDFs. It reports how many
+inputs are already processed and offers to process only the remaining files, to
+reprocess everything, or to cancel. This means dismissing the “Restore Session”
+prompt no longer causes duplicate outputs.
+
+To create an input folder containing **only** the remaining PDFs (hardlinks, with
+the original folder name preserved):
+
+```bat
+python find_remaining.py --stage "%TEMP%\qscan_resume"
+```
+
+Point the Dashboard Input at `%TEMP%\qscan_resume\<input folder name>` and keep
+the real Output folder. Nothing in the input or output folders is changed.
+
+To make the installed app resume only the remaining files directly, back up and
+patch the saved session:
+
+```bat
+python find_remaining.py --repair-session reprocess
+```
+
+Useful options: `--input`, `--output`, `--session`, `--threshold`,
+`--page-threshold`, `--json`.
+
+### Rename manifest
+
+Every finalized document appends a row to `<output folder>/rename_manifest.csv`
+containing the original path, original SHA-256, and final output path. Future
+comparisons are exact without fuzzy matching. If an output file is later renamed
+or moved, the manifest still recognizes it by output hash or final filename.
 
 ## Blank Page Detection
 

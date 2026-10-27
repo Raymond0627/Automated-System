@@ -5,6 +5,7 @@ from pathlib import Path
 from datetime import datetime
 
 from paths import DATA_DIR, ensure_data_dir
+from doc_identity import doc_key as _doc_key, ensure_doc_id
 
 SESSION_DIR = DATA_DIR / "sessions"
 SESSION_FILE = SESSION_DIR / "latest_session.json"
@@ -17,6 +18,37 @@ scan_info = None
 def set_scan_info(info) -> None:
     global scan_info
     scan_info = info
+
+
+def derive_scan_info(snapshot: dict):
+    """Recover resume state for sessions saved before ``scan`` was persisted.
+
+    Pending/auto docs have already been processed, so they are reported as
+    ``processed``; this prevents a restored session from rescanning (and
+    duplicating) documents that are simply waiting for review.
+    """
+    if not snapshot:
+        return None
+    scan = snapshot.get("scan")
+    if scan and (scan.get("plan") or scan.get("processed")):
+        return scan
+
+    plan = []
+    seen = set()
+    processed = set()
+    for key in ("all_flagged_docs", "auto_confirmed_docs"):
+        for doc in snapshot.get(key) or []:
+            path = doc.get("original_path")
+            if not path:
+                continue
+            norm = os.path.normcase(os.path.abspath(path))
+            if norm not in seen:
+                seen.add(norm)
+                plan.append(path)
+            processed.add(path)
+    if not plan:
+        return scan
+    return {"plan": plan, "processed": sorted(processed)}
 
 
 def get_scan_info() -> dict:
@@ -88,7 +120,7 @@ def _clean_doc(doc: dict, keep_bytes: bool) -> dict:
 
 def serialize(rt) -> dict:
     active_doc = rt._get_current_doc()
-    active_doc_key = _path_key(active_doc) if active_doc is not None else ""
+    active_doc_key = _doc_key(active_doc) if active_doc is not None else ""
 
     active_bytes = None
     if (
@@ -101,7 +133,8 @@ def serialize(rt) -> dict:
 
     all_flagged = []
     for d in rt.all_flagged_docs:
-        keep = bool(active_bytes) and _path_key(d) == active_doc_key
+        ensure_doc_id(d)
+        keep = bool(active_bytes) and _doc_key(d) == active_doc_key
         if keep:
             d_copy = dict(d)
             d_copy["_pending_pdf_bytes"] = active_bytes
@@ -109,10 +142,13 @@ def serialize(rt) -> dict:
         else:
             all_flagged.append(_clean_doc(d, keep))
 
-    auto = [_clean_doc(d, True) for d in rt.auto_confirmed_docs]
+    auto = []
+    for d in rt.auto_confirmed_docs:
+        ensure_doc_id(d)
+        auto.append(_clean_doc(d, True))
     if rt.active_tab == "auto_confirmed" and active_bytes and active_doc_key:
         for d in auto:
-            if _path_key(d) == active_doc_key:
+            if _doc_key(d) == active_doc_key:
                 d["_pending_pdf_bytes"] = _b64(active_bytes)
                 break
 
@@ -140,13 +176,6 @@ def serialize(rt) -> dict:
     return snap
 
 
-def _path_key(doc):
-    if not doc:
-        return ""
-    p = doc.get("original_path", "") or doc.get("modified_path", "")
-    return os.path.normcase(os.path.normpath(os.path.abspath(p))) if p else ""
-
-
 def apply(rt, snap: dict) -> dict:
     all_flagged = []
     for d in snap.get("all_flagged_docs", []):
@@ -154,6 +183,7 @@ def apply(rt, snap: dict) -> dict:
         pb = clean.get("_pending_pdf_bytes")
         if isinstance(pb, str):
             clean["_pending_pdf_bytes"] = _unb64(pb)
+        ensure_doc_id(clean)
         all_flagged.append(clean)
 
     auto = []
@@ -162,6 +192,7 @@ def apply(rt, snap: dict) -> dict:
         pb = clean.get("_pending_pdf_bytes")
         if isinstance(pb, str):
             clean["_pending_pdf_bytes"] = _unb64(pb)
+        ensure_doc_id(clean)
         auto.append(clean)
 
     rt.all_flagged_docs = all_flagged

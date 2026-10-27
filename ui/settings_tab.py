@@ -577,8 +577,24 @@ class SettingsTab(QWidget):
             initial=self.config.get("max_workers", 4),
             suffix=" workers", theme=theme
         )
+        self.workers_spin.setToolTip(
+            "Number of documents processed in parallel. Workers do not affect "
+            "folder scanning; extra workers beyond the number of PDFs are unused."
+        )
         self._steppers.append(self.workers_spin)
         pipe_grid.addWidget(self.make_field_column("Parallel Workers", self.workers_spin), 1, 2)
+
+        self.ocr_timeout_spin = NumberStepper(
+            min_val=0, max_val=600, step=10,
+            initial=self.config.get("ocr_timeout_sec", 120),
+            suffix=" s", theme=theme
+        )
+        self.ocr_timeout_spin.setToolTip(
+            "Per-page OCR time budget. When exceeded the page is treated as "
+            "unreadable instead of hanging the pipeline (0 = no limit)."
+        )
+        self._steppers.append(self.ocr_timeout_spin)
+        pipe_grid.addWidget(self.make_field_column("OCR Timeout", self.ocr_timeout_spin), 2, 1)
 
         self.company_conf_spin = NumberStepper(
             min_val=0, max_val=100, step=5,
@@ -708,7 +724,7 @@ class SettingsTab(QWidget):
         # Row 2, Right: 6. Auto Quality Control (QC) Card
         qc_card, qc_layout = self._create_card(
             "Auto Quality Control (QC)",
-            "Blank page detection, rotation alignment, and separator cleanup"
+            "Blank page detection, optional rotation check, and separator cleanup"
         )
         toggles_row = QVBoxLayout()
         toggles_row.setSpacing(6)
@@ -750,6 +766,15 @@ class SettingsTab(QWidget):
         )
         self._steppers.append(self.qc_rotation_spin)
         qc_grid.addWidget(self.make_field_column("Rotation Threshold", self.qc_rotation_spin), 0, 1)
+
+        self.qc_rotation_check = QCheckBox("Check page rotation (slow on large PDFs)")
+        self.qc_rotation_check.setChecked(self.config.get("qc_rotation_enabled", False))
+        self.qc_rotation_check.setToolTip(
+            "Tesseract orientation detection costs ~0.5 s per page. Leave off for "
+            "hundreds-of-pages PDFs; rotated pages are then not auto-flagged."
+        )
+        self.qc_rotation_check.toggled.connect(self._toggle_rotation_field)
+        qc_layout.addWidget(self.qc_rotation_check)
 
         qc_layout.addLayout(qc_grid)
         cards_grid.addWidget(qc_card, 2, 1)
@@ -863,7 +888,11 @@ class SettingsTab(QWidget):
         self.enable_docsep.setEnabled(enabled)
         self.enable_blank_rm.setEnabled(enabled)
         self.qc_blank_spin.setEnabled(enabled)
-        self.qc_rotation_spin.setEnabled(enabled)
+        self.qc_rotation_check.setEnabled(enabled)
+        self.qc_rotation_spin.setEnabled(enabled and self.qc_rotation_check.isChecked())
+
+    def _toggle_rotation_field(self, checked: bool):
+        self.qc_rotation_spin.setEnabled(checked and self.enable_qc_check.isChecked())
 
     def _toggle_gpu_fields(self, text: str):
         is_remote = text == "Remote GPU Server"
@@ -893,6 +922,7 @@ class SettingsTab(QWidget):
         self.config["ocr_engine"] = self.ocr_combo.currentText()
         self.config["render_dpi"] = self.dpi_spin.value()
         self.config["max_workers"] = self.workers_spin.value()
+        self.config["ocr_timeout_sec"] = self.ocr_timeout_spin.value()
         self.config["output_layout"] = self.layout_combo.currentData()
         self.config["document_date_enabled"] = self.document_date_check.isChecked()
         self.config["enable_qc"] = self.enable_qc_check.isChecked()
@@ -900,6 +930,7 @@ class SettingsTab(QWidget):
         self.config["enable_blank_removal"] = self.enable_blank_rm.isChecked()
         self.config["qc_blank_threshold"] = self.qc_blank_spin.value()
         self.config["qc_rotation_threshold"] = self.qc_rotation_spin.value()
+        self.config["qc_rotation_enabled"] = self.qc_rotation_check.isChecked()
         self.config.pop("qc_mirror_threshold", None)
         self.config["enhance_enabled"] = self.enhance_enable_check.isChecked()
         self.config["enhance_dpi"] = self.enhance_dpi_spin.value()

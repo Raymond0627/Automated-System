@@ -31,6 +31,8 @@ from pipeline import (
 from enhance import enhance_page
 from company_extractor import normalize_company_name, learn_company_name, load_known_companies
 from organize_model import (PageRef, page_refs_for_source, markers_for, build_pdf_bytes)
+from doc_identity import clone_document, doc_key, ensure_doc_id
+from crop_geometry import cropbox_rect_from_display
 
 from .widgets import DocCardWidget, PassedDocCardWidget
 from .styles import get_palette_dict, get_combobox_popup_style, THEME_DARK
@@ -92,6 +94,16 @@ class ClickableLabel(QLabel):
             self._drag_active = False
             self._sort_handler.on_sort_release(self._sort_slot)
         super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep an active crop overlay aligned to the pixmap after a resize.
+        refit = getattr(self, "_crop_refit", None)
+        if refit is not None and getattr(self, "_crop_overlay", None) is not None:
+            try:
+                refit()
+            except Exception:
+                pass
 
 
 class CropOverlay(QWidget):
@@ -343,6 +355,8 @@ class ReviewTab(QWidget):
         self._crop_mode = False
         self._crop_page_num = -1
         self._crop_overlay = None
+        self._crop_saved_cropbox = None
+        self._crop_label = None
         self.undo_stack = []
         self.undo_max = 50
         self.undo_max_bytes = 64 * 1024 * 1024
@@ -621,8 +635,8 @@ class ReviewTab(QWidget):
         self._company_completer.model().setStringList(companies)
 
     def _session_changed(self):
-        if get_scan_info():
-            return
+        # Save even while a scan is active: completing a pipeline used to clear
+        # scan info before the save, which made the session un-resumable.
         self._session_timer.start()
 
     def _schedule_session_save(self):
@@ -694,7 +708,7 @@ class ReviewTab(QWidget):
         for pd in _prev_auto:
             pb = pd.get("_pending_pdf_bytes")
             if pb:
-                _old_pending_bytes[_norm_path(pd.get("original_path", ""))] = pb
+                _old_pending_bytes[doc_key(pd)] = pb
 
         self.doc_list.clear()
         self.doc_card_widgets = []
@@ -722,6 +736,8 @@ class ReviewTab(QWidget):
 
         self.all_flagged_docs = all_flagged
         self.pending_docs = [d for d in all_flagged if not d.get("reviewed")]
+        for d in self.all_flagged_docs:
+            ensure_doc_id(d)
 
         if f_root and Path(f_root).exists():
             auto_file = Path(f_root) / "auto_confirmed_index.json"
@@ -738,8 +754,10 @@ class ReviewTab(QWidget):
         else:
             self.auto_confirmed_docs = _prev_auto
 
+        for d in self.auto_confirmed_docs:
+            ensure_doc_id(d)
         for pd in self.auto_confirmed_docs:
-            key = _norm_path(pd.get("original_path", ""))
+            key = doc_key(pd)
             if key in _old_pending_bytes and "_pending_pdf_bytes" not in pd:
                 pd["_pending_pdf_bytes"] = _old_pending_bytes[key]
 
@@ -861,6 +879,8 @@ class ReviewTab(QWidget):
                 "blank_pages": [],
                 "docsep_pages": [],
             })
+        for d in reviewed:
+            ensure_doc_id(d, prefix="reviewed:")
         self.reviewed_docs = reviewed
 
     def _start_reviewed_scan(self):
@@ -2059,64 +2079,163 @@ class ReviewTab(QWidget):
     def enter_crop_mode(self, page_num):
         if not self.current_pdf_doc or self._crop_mode:
             return
-        if page_num < 0 or page_num >= len(self.page_labels):
+        if page_num < 0 or page_num >= len(self.current_pdf_doc):
             return
         self._push_undo()
+        page = self.current_pdf_doc[page_num]
+        # Cropping always starts from the full original page: remember the crop
+        # currently applied and temporarily show the whole MediaBox.
+        self._crop_saved_cropbox = fitz.Rect(page.cropbox)
+        try:
+            page.set_cropbox(page.mediabox)
+        except Exception:
+            self._crop_saved_cropbox = None
+
         self._crop_mode = True
         self._crop_page_num = page_num
+        # Rebuild the preview so every label is sized for the box it shows now
+        # (the target page is currently the full, uncropped page).
+        self.render_preview()
+
+        if page_num >= len(self.page_labels):
+            self.exit_crop_mode(restore=True)
+            return
+
         lbl = self.page_labels[page_num]
-        if getattr(lbl, "_lazy_page_num", None) is not None and not getattr(lbl, "_lazy_rendered", False):
-            self._ensure_label_rendered(lbl, page_num)
         self._crop_label = lbl
+        if not getattr(lbl, "_lazy_rendered", False):
+            self._ensure_label_rendered(lbl, page_num)
+
         overlay = CropOverlay(lbl)
-        overlay.setGeometry(0, 0, lbl.width(), lbl.height())
-        overlay.set_crop_rect(QRectF(0, 0, lbl.width(), lbl.height()))
-        overlay.show()
         self._crop_overlay = overlay
+        self._fit_crop_overlay()
+
+        # Keep the overlay aligned with the pixmap if the label is resized.
+        try:
+            lbl._crop_overlay = overlay
+            lbl._crop_refit = self._fit_crop_overlay
+        except Exception:
+            pass
+
+        overlay.show()
         self.save_crop_btn.setVisible(True)
         self.confirm_btn.setEnabled(False)
         self.page_label.setText(f"CROPPING Page {page_num + 1}  (Enter=save crop, Esc=cancel)")
+
+    def _render_crop_target(self, lbl, page_num):
+        """Re-render the target page for the box currently shown."""
+        width = getattr(lbl, "_lazy_width", None) or lbl.width() or 400
+        try:
+            pixmap = self._make_page_pixmap(page_num, width)
+            lbl.setPixmap(pixmap)
+            lbl._lazy_rendered = True
+        except Exception:
+            self._ensure_label_rendered(lbl, page_num)
+
+    def _fit_crop_overlay(self):
+        """Size the overlay to the rendered pixmap and rescale any selection."""
+        lbl = self._crop_label
+        overlay = self._crop_overlay
+        if lbl is None or overlay is None:
+            return
+        old_w, old_h = overlay.width(), overlay.height()
+        pm = lbl.pixmap()
+        content = lbl.contentsRect()
+        if pm is not None and not pm.isNull() and pm.width() > 0 and pm.height() > 0:
+            ow, oh = pm.width(), pm.height()
+        else:
+            ow, oh = max(1, content.width()), max(1, content.height())
+        # QLabel centres a pixmap inside its content rect (padding/border excluded).
+        ox = content.x() + max(0, (content.width() - ow) // 2)
+        oy = content.y() + max(0, (content.height() - oh) // 2)
+        overlay.setGeometry(ox, oy, ow, oh)
+
+        current = overlay.get_crop_rect()
+        if current is None or old_w <= 0 or old_h <= 0:
+            overlay.set_crop_rect(QRectF(0, 0, ow, oh))
+        else:
+            sx = ow / old_w
+            sy = oh / old_h
+            overlay.set_crop_rect(QRectF(
+                current.left() * sx, current.top() * sy,
+                current.width() * sx, current.height() * sy,
+            ))
 
     def apply_crop(self):
         if not self._crop_mode or not self._crop_overlay or not self.current_pdf_doc:
             return
         crop_rect = self._crop_overlay.get_crop_rect()
-        if not crop_rect:
-            self.exit_crop_mode()
-            return
-        lbl = self._crop_label
         page_num = self._crop_page_num
+        if not crop_rect or page_num < 0:
+            self.exit_crop_mode()
+            return
+
         page = self.current_pdf_doc[page_num]
-        page_w_pts = page.rect.width
-        page_h_pts = page.rect.height
-        if lbl.width() <= 0 or lbl.height() <= 0:
-            self.exit_crop_mode()
+        try:
+            new_box = cropbox_rect_from_display(
+                page,
+                self._crop_overlay.width(),
+                self._crop_overlay.height(),
+                crop_rect.left(),
+                crop_rect.top(),
+                crop_rect.right(),
+                crop_rect.bottom(),
+            )
+        except Exception as e:
+            self._restore_saved_cropbox()
+            self.exit_crop_mode(restore=False)
+            QMessageBox.warning(self, "Crop Failed", f"Could not apply crop:\n{e}")
             return
-        sx = page_w_pts / lbl.width()
-        sy = page_h_pts / lbl.height()
-        pdf_rect = fitz.Rect(
-            crop_rect.left() * sx,
-            crop_rect.top() * sy,
-            crop_rect.right() * sx,
-            crop_rect.bottom() * sy,
-        )
-        full = page.rect
-        if (abs(pdf_rect.x0 - full.x0) < 1 and abs(pdf_rect.y0 - full.y0) < 1
-                and abs(pdf_rect.x1 - full.x1) < 1 and abs(pdf_rect.y1 - full.y1) < 1):
-            self.exit_crop_mode()
+
+        previous = self._crop_saved_cropbox
+        if previous is not None and (
+            abs(new_box.x0 - previous.x0) < 0.5
+            and abs(new_box.y0 - previous.y0) < 0.5
+            and abs(new_box.x1 - previous.x1) < 0.5
+            and abs(new_box.y1 - previous.y1) < 0.5
+        ):
+            self.exit_crop_mode(restore=True)
             return
-        page.set_cropbox(pdf_rect)
+
+        try:
+            page.set_cropbox(new_box)
+        except Exception as e:
+            self._restore_saved_cropbox()
+            self.exit_crop_mode(restore=False)
+            QMessageBox.warning(self, "Crop Failed", f"Could not apply crop:\n{e}")
+            return
+
         self.document_modified = True
-        self.exit_crop_mode()
+        self._crop_saved_cropbox = None
+        self.exit_crop_mode(restore=False)
         self.render_preview()
         self._session_changed()
 
+    def _restore_saved_cropbox(self):
+        if self._crop_saved_cropbox is None or not self.current_pdf_doc:
+            return
+        page_num = self._crop_page_num
+        if 0 <= page_num < len(self.current_pdf_doc):
+            try:
+                self.current_pdf_doc[page_num].set_cropbox(self._crop_saved_cropbox)
+            except Exception:
+                pass
 
-    def exit_crop_mode(self):
+    def exit_crop_mode(self, restore: bool = True):
+        if restore:
+            self._restore_saved_cropbox()
+        lbl = self._crop_label
+        if lbl is not None:
+            try:
+                lbl._crop_overlay = None
+                lbl._crop_refit = None
+            except Exception:
+                pass
         if self._crop_overlay:
             self._crop_overlay.setParent(None)
             self._crop_overlay.deleteLater()
             self._crop_overlay = None
+        self._crop_saved_cropbox = None
         self._crop_mode = False
         self._crop_page_num = -1
         self._crop_label = None
@@ -2143,6 +2262,7 @@ class ReviewTab(QWidget):
     def _on_escape(self):
         if self._crop_mode:
             self.exit_crop_mode()
+            self.render_preview()
             return
         if self._sort_mode:
             self._exit_sort_mode()
@@ -2762,6 +2882,7 @@ class ReviewTab(QWidget):
         config.enable_blank_removal = self.config.get("enable_blank_removal", True)
         config.qc_blank_threshold = self.config.get("qc_blank_threshold", 1.5)
         config.qc_rotation_threshold = self.config.get("qc_rotation_threshold", 65)
+        config.qc_rotation_enabled = self.config.get("qc_rotation_enabled", False)
         config.qc_min_text_threshold = self.config.get("qc_min_text_threshold", 5)
         config.qc_oversized_margin = self.config.get("qc_oversized_margin", 0.3)
         config.qc_blur_threshold = self.config.get("qc_blur_threshold", 100)
@@ -2845,7 +2966,7 @@ class ReviewTab(QWidget):
         if not (0 <= self.active_index < len(docs)):
             return
         current = docs[self.active_index]
-        if current.get("original_path") == doc_a.get("original_path") or current.get("original_path") == doc_b.get("original_path"):
+        if doc_key(current) in (doc_key(doc_a), doc_key(doc_b)):
             self.load_document(current)
 
     def _apply_organize(self, tab: str, doc_a: dict, doc_b: dict, sources: dict,
@@ -3234,7 +3355,9 @@ class ReviewTab(QWidget):
         if idx < 0 or idx >= len(docs):
             return None
         original_doc = docs[idx]
-        new_doc = dict(original_doc)
+        # Deep copy so page edits (delete/crop/organize/blank marks) stay isolated
+        # from the original; a fresh doc_id keeps path-keyed persistence separate.
+        new_doc = clone_document(original_doc)
         new_doc["is_duplicate"] = True
         base_name = original_doc.get("original_filename", "document.pdf")
         if "(" in base_name and base_name.endswith(")"):
@@ -3257,8 +3380,11 @@ class ReviewTab(QWidget):
         docs.insert(insert_idx, new_doc)
 
         if self.active_tab == "pending":
-            if new_doc not in self.all_flagged_docs:
-                af_idx = self.all_flagged_docs.index(original_doc) if original_doc in self.all_flagged_docs else len(self.all_flagged_docs)
+            if not any(doc_key(d) == doc_key(new_doc) for d in self.all_flagged_docs):
+                af_idx = next(
+                    (i for i, d in enumerate(self.all_flagged_docs) if doc_key(d) == doc_key(original_doc)),
+                    len(self.all_flagged_docs),
+                )
                 self.all_flagged_docs.insert(af_idx + 1, new_doc)
             self._save_flagged_updates()
         else:

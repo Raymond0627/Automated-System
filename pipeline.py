@@ -1,5 +1,6 @@
 import os
 import sys
+import stat
 import shutil
 import json
 import csv
@@ -13,6 +14,7 @@ from dataclasses import dataclass, asdict, field
 from date_extractor import extract_document_date, DateResult
 from auto_qc import run_qc_on_pdf, detect_docsep_flag
 from company_extractor import get_company_name_for_filename
+import manifest as manifest_store
 
 
 # Directories under the input/output roots that are pipeline artifacts, never
@@ -77,6 +79,9 @@ class PipelineConfig:
         self.enable_qc = None  # None = use config default
         self.qc_blank_threshold = 1.5
         self.qc_rotation_threshold = 65
+        # The Tesseract OSD rotation check costs ~0.5 s per page. Off by default
+        # so multi-hundred-page PDFs do not spend minutes on it.
+        self.qc_rotation_enabled = False
         self.enable_docsep_removal = True
         self.enable_blank_removal = True
         self.rename_enabled = True
@@ -191,7 +196,7 @@ def mirrored_output_dir(config, doc_or_path, rel_dir: str = "") -> Path:
     return config.output_root
 
 
-def parse_folder_structure(root: Path, division_code: str = "") -> List[DivisionBatch]:
+def parse_folder_structure(root: Path, division_code: str = "", progress_callback=None, should_cancel=None) -> List[DivisionBatch]:
     """
     Walk {root} recursively for *.pdf at any depth.
 
@@ -202,27 +207,62 @@ def parse_folder_structure(root: Path, division_code: str = "") -> List[Division
     The division code is supplied by the caller (from the Dashboard field), not
     derived from folder names. Grouping is reported as a single batch carrying
     `division_code`.
+
+    The walk is iterative (no unbounded recursion), skips pipeline artifact and
+    hidden/system folders, does not follow reparse points (junctions/symlinks)
+    and tolerates unreadable directories. `progress_callback(dirs_seen,
+    pdfs_found, current_dir)` is invoked as the walk advances and `should_cancel`
+    is polled so a long scan over a network share stays responsive.
     """
     division_code = normalize_division_code(division_code.strip()) if division_code else ""
 
     documents = []
+    root = Path(root)
     if root.exists():
-        for path in sorted(root.rglob("*.pdf")):
-            if not path.is_file():
+        stack = [root]
+        dirs_seen = 0
+        while stack:
+            if should_cancel is not None and should_cancel():
+                break
+            current = stack.pop()
+            dirs_seen += 1
+            if progress_callback is not None:
+                try:
+                    progress_callback(dirs_seen, len(documents), str(current))
+                except Exception:
+                    pass
+            try:
+                entries = list(os.scandir(current))
+            except (PermissionError, OSError):
                 continue
-            # Skip pipeline artifact folders (output/flagged/processed/...)
-            # wherever they appear in the tree.
-            rel_parts = path.relative_to(root).parts
-            if any(part.lower() in SKIP_NAMES for part in rel_parts[:-1]):
-                continue
-            rel_dir_parts = rel_parts[:-1]
-            documents.append(Document(
-                original_path=str(path),
-                division_code=division_code,
-                company_name="",
-                original_filename=path.name,
-                rel_dir="/".join(rel_dir_parts),
-            ))
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") or name.lower() in SKIP_NAMES:
+                    continue
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                    is_file = entry.is_file(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_dir:
+                    try:
+                        if entry.stat(follow_symlinks=False).st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+                            continue
+                    except (OSError, AttributeError):
+                        pass
+                    stack.append(Path(entry.path))
+                elif is_file and name.lower().endswith(".pdf"):
+                    rel_parts = Path(entry.path).relative_to(root).parts
+                    if any(part.lower() in SKIP_NAMES for part in rel_parts[:-1]):
+                        continue
+                    rel_dir_parts = rel_parts[:-1]
+                    documents.append(Document(
+                        original_path=entry.path,
+                        division_code=division_code,
+                        company_name="",
+                        original_filename=name,
+                        rel_dir="/".join(rel_dir_parts),
+                    ))
 
     if not documents:
         return []
@@ -272,15 +312,32 @@ def extract_dates_for_batch(batch: DivisionBatch, config: PipelineConfig) -> Non
 
             # Module 4: QC checks
             qc_result = None
+            rotation_enabled = getattr(config, "qc_rotation_enabled", False)
             if config.enable_qc and not result.all_blank:
-                try:
-                    qc_result = run_qc_on_pdf(
-                        doc.original_path,
-                        blank_threshold=config.qc_blank_threshold,
-                        rotation_threshold=config.qc_rotation_threshold,
-                    )
-                except Exception:
-                    pass
+                if rotation_enabled:
+                    try:
+                        qc_result = run_qc_on_pdf(
+                            doc.original_path,
+                            blank_threshold=config.qc_blank_threshold,
+                            rotation_threshold=config.qc_rotation_threshold,
+                            rotation_enabled=True,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    # Blank detection already ran above; with rotation off there
+                    # is nothing else to check, so skip the second raster pass.
+                    qc_result = {
+                        "blank_detected": bool(result.blank_pages),
+                        "blank_ink_ratio": 0.0,
+                        "rotation_detected": "skipped",
+                        "rotation_confidence": 0.0,
+                        "mirrored_detected": False,
+                        "mirror_delta": 0.0,
+                        "mirror_needs_review": False,
+                        "qc_status": "passed",
+                        "qc_failure_reasons": "",
+                    }
 
             # Handle all-blank documents
             if result.all_blank:
@@ -539,6 +596,31 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
                 else:
                     d.close()
 
+            try:
+                source_exists = bool(doc.original_path) and os.path.exists(doc.original_path)
+                document_date = (
+                    doc.confirmed_date.isoformat()
+                    if hasattr(doc.confirmed_date, "isoformat")
+                    else (str(doc.confirmed_date) if doc.confirmed_date else "")
+                )
+                manifest_store.append_manifest_entry(
+                    config.output_root,
+                    {
+                        "timestamp": datetime.now().isoformat(),
+                        "original_path": doc.original_path,
+                        "original_sha256": manifest_store.sha256_file(doc.original_path) if source_exists else "",
+                        "original_size": os.path.getsize(doc.original_path) if source_exists else "",
+                        "output_path": str(output_path),
+                        "output_sha256": manifest_store.sha256_file(output_path),
+                        "final_filename": output_path.name,
+                        "division_code": doc.division_code,
+                        "company_name": doc.company_name,
+                        "document_date": document_date,
+                    },
+                )
+            except Exception:
+                pass
+
             if log_writer:
                 log_writer.writerow({
                     "timestamp": datetime.now().isoformat(),
@@ -777,6 +859,27 @@ def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
         else:
             d.close()
 
+    try:
+        original_sha256 = manifest_store.sha256_file(original_path) if original_path and os.path.exists(original_path) else ""
+        manifest_store.append_manifest_entry(
+            output_root,
+            {
+                "timestamp": _dt.now().isoformat(),
+                "original_path": original_path,
+                "original_sha256": original_sha256,
+                "original_size": os.path.getsize(original_path) if original_path and os.path.exists(original_path) else "",
+                "output_path": str(output_path),
+                "output_sha256": manifest_store.sha256_file(output_path),
+                "final_filename": output_path.name,
+                "division_code": division_code,
+                "company_name": company_name,
+                "document_date": detected_date,
+            },
+        )
+    except Exception:
+        # The manifest is a convenience index; never fail a finalize for it.
+        pass
+
     return {
         "success": True,
         "final_filename": output_path.name,
@@ -807,6 +910,7 @@ if __name__ == "__main__":
         config.enable_blank_removal = cfg.get("enable_blank_removal", True)
         config.qc_blank_threshold = cfg.get("qc_blank_threshold", 1.5)
         config.qc_rotation_threshold = cfg.get("qc_rotation_threshold", 65)
+        config.qc_rotation_enabled = cfg.get("qc_rotation_enabled", False)
         config.render_dpi = cfg.get("render_dpi", 150)
     else:
         import argparse

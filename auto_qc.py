@@ -75,7 +75,7 @@ def check_blank(page_img: np.ndarray, ink_threshold: float = BLANK_INK_RATIO_THR
     }
 
 
-def check_rotation(page_img: np.ndarray, confidence_threshold: float = ROTATION_CONFIDENCE_THRESHOLD) -> Dict:
+def check_rotation(page_img: np.ndarray, confidence_threshold: float = ROTATION_CONFIDENCE_THRESHOLD, ocr_timeout: float = 0) -> Dict:
     """
     Detect page rotation using Tesseract OSD.
     Preprocess: denoise -> CLAHE contrast enhancement -> upscale 1.5x.
@@ -92,7 +92,7 @@ def check_rotation(page_img: np.ndarray, confidence_threshold: float = ROTATION_
     upscaled = cv2.resize(enhanced, (int(w * 1.2), int(h * 1.2)), interpolation=cv2.INTER_LINEAR)
 
     try:
-        osd = pytesseract.image_to_osd(upscaled, output_type=pytesseract.Output.DICT)
+        osd = pytesseract.image_to_osd(upscaled, output_type=pytesseract.Output.DICT, timeout=ocr_timeout)
         angle = int(osd.get("rotate", 0))
         conf = float(osd.get("orientation_conf", 0))
     except Exception:
@@ -170,8 +170,14 @@ def run_qc(
     use_gpu: bool = False,
     gpu_mode: str = "cpu",
     dpi: int = 150,
+    ocr_timeout: float = 0,
+    rotation_enabled: bool = True,
 ) -> Dict:
-    """Run all QC checks on a single page image. Returns combined results dict."""
+    """Run all QC checks on a single page image. Returns combined results dict.
+
+    ``rotation_enabled=False`` skips the Tesseract OSD rotation check. That
+    check costs ~0.5 s per page and is off by default for large documents.
+    """
     blank = check_blank(page_img, blank_threshold, dpi=dpi)
     if blank["is_blank"]:
         return {
@@ -185,7 +191,19 @@ def run_qc(
             "qc_status": "passed",
             "qc_failure_reasons": "",
         }
-    rotation = check_rotation(page_img, rotation_threshold)
+    if not rotation_enabled:
+        return {
+            "blank_detected": False,
+            "blank_ink_ratio": blank["ink_ratio"],
+            "rotation_detected": "skipped",
+            "rotation_confidence": 0.0,
+            "mirrored_detected": False,
+            "mirror_delta": 0.0,
+            "mirror_needs_review": False,
+            "qc_status": "passed",
+            "qc_failure_reasons": "",
+        }
+    rotation = check_rotation(page_img, rotation_threshold, ocr_timeout=ocr_timeout)
 
     failures = []
     if rotation["is_rotated"]:
@@ -372,10 +390,14 @@ def run_qc_on_pdf(
     use_gpu: bool = False,
     gpu_mode: str = "cpu",
     doc: Optional["fitz.Document"] = None,
+    should_cancel=None,
+    ocr_timeout: float = 0,
+    rotation_enabled: bool = True,
 ) -> Dict:
     """
     Run QC on a PDF file. Processes all pages (max_pages=0) or up to max_pages.
-    Returns aggregated QC results.
+    Returns aggregated QC results. Pass ``rotation_enabled=False`` to skip the
+    expensive per-page rotation check (default off for large documents).
     """
     import fitz
     own_doc = doc is None
@@ -409,13 +431,15 @@ def run_qc_on_pdf(
         }
 
         for pn in range(pages_to_check):
+            if should_cancel is not None and should_cancel():
+                break
             page = doc[pn]
             pix = page.get_pixmap(dpi=dpi)
             img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, 3)
             img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             del pix
 
-            result = run_qc(img, blank_threshold, rotation_threshold, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode, dpi=dpi)
+            result = run_qc(img, blank_threshold, rotation_threshold, mirror_threshold, use_gpu=use_gpu, gpu_mode=gpu_mode, dpi=dpi, ocr_timeout=ocr_timeout, rotation_enabled=rotation_enabled)
             del img
             if result["blank_detected"]:
                 agg["blank_detected"] = True

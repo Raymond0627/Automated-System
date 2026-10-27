@@ -78,6 +78,76 @@ class TestScanInfoRoundTrip(unittest.TestCase):
         session.discard_snapshot()
         self.assertIsNone(session.get_scan_info())
 
+    def test_derive_scan_info_from_pending_docs_when_snapshot_has_none(self):
+        snap = {
+            "all_flagged_docs": [{"original_path": "a.pdf"}],
+            "auto_confirmed_docs": [{"original_path": "b.pdf"}],
+            "scan": None,
+        }
+
+        scan = session.derive_scan_info(snap)
+
+        self.assertEqual(scan["plan"], ["a.pdf", "b.pdf"])
+        self.assertEqual(set(scan["processed"]), {"a.pdf", "b.pdf"})
+
+    def test_derive_scan_info_keeps_existing_scan(self):
+        existing = {"plan": ["a.pdf", "b.pdf"], "processed": ["a.pdf"]}
+        snap = {"all_flagged_docs": [{"original_path": "b.pdf"}], "scan": existing}
+
+        self.assertEqual(session.derive_scan_info(snap), existing)
+
+
+class TestResumeStatePersistence(unittest.TestCase):
+    def setUp(self):
+        _app()
+
+    def test_finished_keeps_scan_state_for_resume(self):
+        from ui.organize_dialog import _ensure_qapp
+        from ui.dashboard_tab import DashboardTab
+
+        _ensure_qapp()
+        config = {
+            "input_root": "",
+            "output_root": "",
+            "flagged_root": "",
+            "division_code": "156",
+            "confidence_threshold": 85,
+            "earliest_year": 1950,
+            "ocr_engine": "tesseract",
+            "theme": "Light Mode",
+            "render_dpi": 200,
+        }
+        tab = DashboardTab(config)
+        tab._scan_plan = ["a.pdf", "b.pdf"]
+        tab._processed_paths = {"a.pdf"}
+
+        tab._on_finished()
+
+        self.assertEqual(
+            tab.get_scan_state(),
+            {"plan": ["a.pdf", "b.pdf"], "processed": ["a.pdf"]},
+        )
+
+    def test_session_changed_schedules_save_while_scan_active(self):
+        from ui.organize_dialog import _ensure_qapp
+        from ui.review_tab import ReviewTab
+
+        _ensure_qapp()
+        config = {
+            "input_root": "",
+            "output_root": "",
+            "flagged_root": "",
+            "theme": "Light Mode",
+        }
+        tab = ReviewTab(config)
+        session.set_scan_info({"plan": ["a.pdf"], "processed": []})
+        try:
+            tab._session_changed()
+            self.assertTrue(tab._session_timer.isActive())
+        finally:
+            tab._session_timer.stop()
+            session.clear_scan_info()
+
 
 class TestJsonSafeFlagged(unittest.TestCase):
     def test_strips_bytes_only(self):
@@ -123,6 +193,34 @@ class TestPipelineResumeMode(unittest.TestCase):
     def tearDown(self):
         widgets._process_doc_worker = self._orig_worker
         self.tmp.cleanup()
+
+    def test_resume_replaces_stale_pending_for_same_path(self):
+        plan = [str(self.input_root / "a.pdf"), str(self.input_root / "b.pdf")]
+        old_flag = {
+            "original_path": plan[1],
+            "original_filename": "b.pdf",
+            "division_code": "D",
+            "company_name": "Old Company",
+            "reviewed": False,
+        }
+
+        thread = PipelineThread(
+            self.config,
+            0,
+            plan=plan,
+            existing_paths={plan[0]},
+            merged_flagged=[old_flag],
+            merged_confirmed=[],
+        )
+        finished = []
+        thread.finished_signal.connect(lambda flagged: finished.append(flagged))
+        thread.run()
+
+        self.assertEqual(len(finished), 1)
+        merged = finished[0]
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["original_path"], plan[1])
+        self.assertEqual(merged[0]["company_name"], "Acme")
 
     def test_resume_runs_only_remaining_and_merges_index(self):
         plan = [str(self.input_root / "a.pdf"), str(self.input_root / "b.pdf"), str(self.input_root / "c.pdf")]
@@ -219,7 +317,7 @@ class TestPipelineResumeMode(unittest.TestCase):
             division_code="D",
             company_name="Acme",
         )
-        widgets.parse_folder_structure = lambda root, division_code="": [DivisionBatch("D", [doc])]
+        widgets.parse_folder_structure = lambda root, division_code="", progress_callback=None, should_cancel=None: [DivisionBatch("D", [doc])]
 
         plan_events = []
         thread = PipelineThread(self.config, 0)

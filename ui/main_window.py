@@ -17,7 +17,7 @@ from .styles import get_theme_stylesheet, get_theme_palette, get_palette_dict, T
 from .dashboard_tab import DashboardTab
 from .review_tab import ReviewTab
 from .settings_tab import SettingsTab
-from session import set_scan_info
+from session import set_scan_info, derive_scan_info
 
 
 class MainWindow(QMainWindow):
@@ -174,6 +174,7 @@ class MainWindow(QMainWindow):
             "enable_blank_removal": True,
             "qc_blank_threshold": 1.5,
             "qc_rotation_threshold": 65,
+            "qc_rotation_enabled": False,
             "rename_enabled": False,
             "document_date_enabled": False,
             "audit_enabled": True,
@@ -264,6 +265,6 @@ class MainWindow(QMainWindow):
             self.config["input_root"] = in_root
             self.config["output_root"] = out_root
             self.config["flagged_root"] = dashboard_data.get("flagged_root", "")
-        scan = (snap or {}).get("scan")
+        scan = derive_scan_info(snap)
         if scan and ((scan.get("plan") or scan.get("processed"))):
             self.dashboard_tab.resume_scan(scan, self.review_tab)

@@ -2,12 +2,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Optional, List
 import re
-import io
 import gc
 import cv2
 import numpy as np
 import fitz
-from PIL import Image
 import dateparser
 from blank_page_detector import detect_blank_page
 
@@ -324,16 +322,22 @@ def pdf_to_image(pdf_path: str, page_index: int = 0, dpi: int = 200, doc: Option
             page_index = 0
         page = doc[page_index]
         pix = page.get_pixmap(dpi=dpi)
-        img_data = pix.tobytes("png")
-        del pix
-        img = Image.open(io.BytesIO(img_data))
-        img_np = np.array(img)
-        del img, img_data
-        if len(img_np.shape) == 3:
-            if img_np.shape[2] == 4:
-                img_np = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
-            else:
-                img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        try:
+            # Read the raw raster buffer directly. Encoding every page to PNG
+            # and decoding it again measured ~0.5 s/page (~45x slower) and is
+            # what made 1000+ page scans appear to hang.
+            n = pix.n
+            width = pix.width
+            height = pix.height
+            img_np = np.frombuffer(pix.samples, dtype=np.uint8).reshape(height, width, n).copy()
+        finally:
+            del pix
+        if n == 4:
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_RGBA2BGR)
+        elif n == 3:
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+        elif n == 1:
+            img_np = cv2.cvtColor(img_np, cv2.COLOR_GRAY2BGR)
         return img_np
     except Exception as e:
         print(f"Error converting PDF to image: {e}")
@@ -346,15 +350,17 @@ def pdf_to_image(pdf_path: str, page_index: int = 0, dpi: int = 200, doc: Option
                 pass
 
 
-def run_ocr_tesseract(image: np.ndarray, psm: int = 6) -> dict:
+def run_ocr_tesseract(image: np.ndarray, psm: int = 6, timeout: float = 0) -> dict:
     if pytesseract is None:
         raise ImportError("pytesseract is not installed. Install it with: pip install pytesseract")
     config = f'--psm {psm} --oem 3'
-    return pytesseract.image_to_data(image, config=config, output_type=pytesseract.Output.DICT)
+    return pytesseract.image_to_data(
+        image, config=config, output_type=pytesseract.Output.DICT, timeout=timeout
+    )
 
 
-def run_ocr(image: np.ndarray, psm: int = 6, engine: str = "tesseract") -> dict:
-    return run_ocr_tesseract(image, psm)
+def run_ocr(image: np.ndarray, psm: int = 6, engine: str = "tesseract", timeout: float = 0) -> dict:
+    return run_ocr_tesseract(image, psm, timeout=timeout)
 
 
 def extract_candidates_from_ocr(ocr_data: dict, psm: int, page_width: int, page_height: int, page_idx: int) -> List[DateCandidate]:
@@ -488,7 +494,7 @@ def _quick_confidence(all_candidates, page_ocr_data_list, control_results):
     return int(min(best_score, 100)), True
 
 
-def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150, doc: Optional["fitz.Document"] = None, docsep_pages: Optional[List[int]] = None, include_date: bool = True) -> DateResult:
+def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150, doc: Optional["fitz.Document"] = None, docsep_pages: Optional[List[int]] = None, include_date: bool = True, skip_ocr: bool = False, page_image_callback=None, should_cancel=None, ocr_timeout: float = 0, page_progress_callback=None) -> DateResult:
     all_candidates = []
     raw_texts = []
     page_ocr_data_list = []
@@ -510,12 +516,27 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
 
     # --- Module 1: Blank detection (all pages, no early exit) ---
     for page_idx in range(num_pages):
-        if page_idx in skip_pages:
+        if should_cancel is not None and should_cancel():
+            break
+        if page_progress_callback is not None:
+            try:
+                page_progress_callback(page_idx, num_pages)
+            except Exception:
+                pass
+        if page_idx in skip_pages and page_image_callback is None:
             continue
         img = pdf_to_image(pdf_path, page_idx, dpi=dpi, doc=doc)
         if img is None:
             continue
         if img.size == 0 or img.shape[0] < 10 or img.shape[1] < 10:
+            continue
+        if page_image_callback is not None:
+            try:
+                page_image_callback(page_idx, img)
+            except Exception:
+                pass
+        if page_idx in skip_pages:
+            del img
             continue
         blank_result = detect_blank_page(img)
         if blank_result["is_blank"] is True or blank_result["is_blank"] == "needs_review":
@@ -523,22 +544,23 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
             is_confirmed_blank = False
             native_txt = ""
             try:
-                _chk_doc = fitz.open(pdf_path) if own_doc else doc
-                native_txt = _chk_doc[page_idx].get_text().strip()
-                if own_doc:
-                    _chk_doc.close()
+                # Reuse the already-open handle: re-opening the PDF per blank
+                # page is O(file size) and stalls large documents for minutes.
+                native_txt = doc[page_idx].get_text().strip()
             except Exception:
                 pass
             words = [w for w in native_txt.split() if len(w) >= 2]
             if len(words) >= 2:
                 is_confirmed_blank = False
-            elif pytesseract is not None:
+            elif skip_ocr or pytesseract is None:
+                is_confirmed_blank = (blank_result["is_blank"] is True)
+            else:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
-                tess_txt = pytesseract.image_to_string(gray, config='--psm 6').strip()
+                tess_txt = pytesseract.image_to_string(
+                    gray, config='--psm 6', timeout=ocr_timeout
+                ).strip()
                 tess_words = [w for w in tess_txt.split() if len(w) >= 2]
                 is_confirmed_blank = len(tess_words) < 2
-            else:
-                is_confirmed_blank = (blank_result["is_blank"] is True)
 
             if is_confirmed_blank:
                 blank_pages.append(page_idx)
@@ -548,7 +570,13 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
 
     # --- Module 2: Date extraction via OCR (skip blank + docsep, early exit OK) ---
     for page_idx in range(num_pages):
+        if should_cancel is not None and should_cancel():
+            break
         if page_idx in skip_pages:
+            continue
+        if skip_ocr:
+            # Date scan disabled or the caller has native text: real blank
+            # verification was already handled per-page in Module 1.
             continue
 
         img = pdf_to_image(pdf_path, page_idx, dpi=dpi, doc=doc)
@@ -569,7 +597,7 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
 
         for psm in [6]:
             try:
-                ocr_data = run_ocr(processed, psm, engine=engine)
+                ocr_data = run_ocr(processed, psm, engine=engine, timeout=ocr_timeout)
                 del processed
                 raw_text = ' '.join([t for t in ocr_data['text'] if t.strip()])
                 raw_texts.append(raw_text)
