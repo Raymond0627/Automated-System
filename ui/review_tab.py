@@ -34,7 +34,9 @@ from organize_model import (PageRef, page_refs_for_source, markers_for, build_pd
 from doc_identity import clone_document, doc_key, ensure_doc_id
 from crop_geometry import cropbox_rect_from_display
 
-from .widgets import DocCardWidget, PassedDocCardWidget
+from ui.interactive_preview import InteractivePageLabel, ClickableLabel
+from ocr_box_cache import get_page_word_boxes
+from candidate_scorer import extract_company_candidates
 from .styles import get_palette_dict, get_combobox_popup_style, THEME_DARK
 from session import (
     serialize as serialize_session,
@@ -1612,6 +1614,32 @@ class ReviewTab(QWidget):
     def _set_company_to_widgets(self, company_name: str):
         self.company_input.setText(company_name or "")
 
+    def _set_company_with_undo(self, company_name: str):
+        if not hasattr(self, "_company_undo_stack"):
+            self._company_undo_stack = []
+        current = self.company_input.text()
+        if current != company_name:
+            self._company_undo_stack.append(current)
+            if len(self._company_undo_stack) > 30:
+                self._company_undo_stack.pop(0)
+        self.company_input.setText(company_name or "")
+
+    def _undo_company(self):
+        if hasattr(self, "_company_undo_stack") and self._company_undo_stack:
+            prev = self._company_undo_stack.pop()
+            self.company_input.setText(prev)
+
+    def _on_candidate_selected(self, company_name: str):
+        if not company_name:
+            return
+        cleaned = company_name.strip()
+        self._set_company_with_undo(cleaned)
+        # Learn into known companies list
+        try:
+            learn_company_name(cleaned)
+        except Exception:
+            pass
+
     def _get_company_from_widgets(self) -> str:
         return self.company_input.text().strip()
 
@@ -1624,12 +1652,13 @@ class ReviewTab(QWidget):
         return doc.get("docsep_pages", []) if doc else []
 
     def _create_page_label(self, page_num, pixmap, blank_pages, docsep_pages, sort_slot=-1):
-        lbl = ClickableLabel(page_num)
+        lbl = InteractivePageLabel(page_num)
         lbl.setPixmap(pixmap)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         lbl.customContextMenuRequested.connect(lambda pos, pn=page_num, lb=lbl: self._show_page_menu(pos, pn, lb))
         lbl.clicked.connect(self._select_page)
+        lbl.company_selected.connect(self._on_candidate_selected)
 
         is_blank = page_num in blank_pages
         is_docsep = page_num in docsep_pages
@@ -1770,11 +1799,52 @@ class ReviewTab(QWidget):
                 lbl.setPixmap(QPixmap())
                 lbl._lazy_rendered = False
 
+    def keyPressEvent(self, event):
+        # Hotkeys: 1-4 selects candidate badge on active page
+        key = event.key()
+        if not self.company_input.hasFocus():
+            if Qt.Key.Key_1 <= key <= Qt.Key.Key_4:
+                badge_num = key - Qt.Key.Key_0
+                active_lbl = None
+                for lbl in self.page_labels:
+                    pn = getattr(lbl, "_page_num", getattr(lbl, "_lazy_page_num", None))
+                    if pn == self.selected_page:
+                        active_lbl = lbl
+                        break
+                if not active_lbl and self.page_labels:
+                    active_lbl = self.page_labels[0]
+                if active_lbl and hasattr(active_lbl, "select_candidate_by_badge"):
+                    if active_lbl.select_candidate_by_badge(badge_num):
+                        event.accept()
+                        return
+            elif key == Qt.Key.Key_Z and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                self._undo_company()
+                event.accept()
+                return
+
+        super().keyPressEvent(event)
+
     def _ensure_label_rendered(self, lbl, page_num):
         try:
             pixmap = self._make_page_pixmap(page_num, getattr(lbl, "_lazy_width", 400))
             lbl.setPixmap(pixmap)
             lbl._lazy_rendered = True
+            self._populate_label_candidates(lbl, page_num)
+        except Exception:
+            pass
+
+    def _populate_label_candidates(self, lbl, page_num):
+        if not hasattr(lbl, "set_candidates"):
+            return
+        doc = self._get_current_doc()
+        if not doc or not doc.get("original_path"):
+            return
+        try:
+            page_obj = self.current_pdf_doc[page_num] if self.current_pdf_doc else None
+            page_rect = (0, 0, page_obj.rect.width, page_obj.rect.height) if page_obj else (0, 0, 612, 792)
+            word_boxes = get_page_word_boxes(doc["original_path"], page_num=page_num, use_cache=True)
+            candidates = extract_company_candidates(word_boxes, page_rect=page_rect)
+            lbl.set_candidates(candidates, word_boxes, (page_rect[2], page_rect[3]))
         except Exception:
             pass
 
