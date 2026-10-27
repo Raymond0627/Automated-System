@@ -35,6 +35,7 @@ from doc_identity import clone_document, doc_key, ensure_doc_id
 from crop_geometry import cropbox_rect_from_display
 
 from ui.interactive_preview import InteractivePageLabel, ClickableLabel
+from ui.widgets import DocCardWidget, PassedDocCardWidget
 from ocr_box_cache import get_page_word_boxes
 from candidate_scorer import extract_company_candidates
 from .styles import get_palette_dict, get_combobox_popup_style, THEME_DARK
