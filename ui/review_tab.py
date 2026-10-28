@@ -917,19 +917,21 @@ class ReviewTab(QWidget):
         if not out_root or not os.path.exists(out_root):
             return
         if self.active_tab == "reviewed":
-            # Save selection and scroll state before showing loading item
+            # Save selection and scroll state before rescan
             if 0 <= self.active_index < len(self.reviewed_docs):
                 self._reviewed_saved_doc_path = self.reviewed_docs[self.active_index].get("original_path")
             sb = self.reviewed_tree.verticalScrollBar()
             self._reviewed_saved_scroll = sb.value() if sb else 0
 
-            self.reviewed_tree.blockSignals(True)
-            self.reviewed_tree.clear()
-            self.reviewed_tree.blockSignals(False)
-            self.reviewed_index_to_item = {}
-            loading_item = QTreeWidgetItem(["Scanning output folder..."])
-            loading_item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.reviewed_tree.addTopLevelItem(loading_item)
+            # Only show placeholder if tree is empty; otherwise keep existing tree intact during scan
+            if self.reviewed_tree.topLevelItemCount() == 0:
+                self.reviewed_tree.blockSignals(True)
+                self.reviewed_tree.clear()
+                self.reviewed_tree.blockSignals(False)
+                self.reviewed_index_to_item = {}
+                loading_item = QTreeWidgetItem(["Scanning output folder..."])
+                loading_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.reviewed_tree.addTopLevelItem(loading_item)
         self._reviewed_scan_token += 1
         token = self._reviewed_scan_token
         self._reviewed_scan_worker = ReviewedScanWorker(out_root)
@@ -1297,6 +1299,12 @@ class ReviewTab(QWidget):
                         QMessageBox.critical(self, "Delete Error", f"Could not delete:\n{e}")
                         return
                 self._show_toast(f"Deleted '{name}'")
+                next_idx = min(idx, len(self.reviewed_docs) - 2) if len(self.reviewed_docs) > 1 else -1
+                if next_idx >= 0 and next_idx < len(self.reviewed_docs):
+                    # Pick adjacent file path so selection lands there
+                    adj_idx = next_idx if next_idx < idx else idx + 1
+                    if adj_idx < len(self.reviewed_docs):
+                        self._reviewed_saved_doc_path = self.reviewed_docs[adj_idx].get("original_path")
                 self._start_reviewed_scan()
 
     def _rename_reviewed_at(self, idx: int):
@@ -1397,6 +1405,7 @@ class ReviewTab(QWidget):
                 if len(self._doc_undo_stack) > self._doc_undo_max:
                     self._doc_undo_stack.pop(0)
                 self._show_toast(f"Duplicated: {new_path.name}")
+                self._reviewed_saved_doc_path = str(new_path)
                 self._start_reviewed_scan()
             except Exception as e:
                 QMessageBox.critical(self, "Duplicate Error", f"Failed to duplicate:\n{e}")
@@ -2827,18 +2836,21 @@ class ReviewTab(QWidget):
                 doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
             result = finalize_single_document(doc, config)
             if result.get("success"):
-                self.pending_docs.pop(self.active_index)
+                confirmed_idx = self.active_index
+                self.pending_docs.pop(confirmed_idx)
                 self.all_flagged_docs = [d for d in self.all_flagged_docs if d is not doc]
                 self._save_flagged_updates()
                 self._register_finalized_doc(doc, result)
                 self._learn_company_hints(doc)
                 self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
                 self.current_pdf_doc = None
-                self.active_index = -1
                 for lbl in self.page_labels:
                     lbl.deleteLater()
                 self.page_labels = []
-                self.refresh_doc_list()
+                # Smoothly advance to next document at confirmed_idx without jumping to 0
+                next_row = min(confirmed_idx, len(self.pending_docs) - 1) if self.pending_docs else None
+                self.active_index = next_row if next_row is not None else -1
+                self.refresh_doc_list(select_row=next_row)
                 self._session_changed()
             else:
                 QMessageBox.warning(self, "Finalize Failed", f"Could not save: {result.get('error', 'Unknown')}")
@@ -2857,17 +2869,20 @@ class ReviewTab(QWidget):
                 doc["_pending_pdf_bytes"] = self.current_pdf_doc.tobytes(garbage=4, deflate=True)
             result = finalize_single_document(doc, config)
             if result.get("success"):
-                self.auto_confirmed_docs.pop(self.active_index)
+                confirmed_idx = self.active_index
+                self.auto_confirmed_docs.pop(confirmed_idx)
                 self._save_auto_confirmed_updates()
                 self._register_finalized_doc(doc, result)
                 self._learn_company_hints(doc)
                 self._show_toast(f"Saved: {result.get('final_filename', '')}\n→ {os.path.dirname(result.get('output_path', ''))}")
                 self.current_pdf_doc = None
-                self.active_index = -1
                 for lbl in self.page_labels:
                     lbl.deleteLater()
                 self.page_labels = []
-                self.refresh_doc_list()
+                # Smoothly advance to next document at confirmed_idx without jumping to 0
+                next_row = min(confirmed_idx, len(self.auto_confirmed_docs) - 1) if self.auto_confirmed_docs else None
+                self.active_index = next_row if next_row is not None else -1
+                self.refresh_doc_list(select_row=next_row)
                 self._session_changed()
             else:
                 QMessageBox.warning(self, "Finalize Failed", f"Could not save: {result.get('error', 'Unknown')}")
@@ -2948,10 +2963,7 @@ class ReviewTab(QWidget):
                 doc["company_name"] = normalize_company_name(company_text)
             self._learn_company_hints(doc)
 
-            self.active_index = -1
-            for lbl in self.page_labels:
-                lbl.deleteLater()
-            self.page_labels = []
+            self._reviewed_saved_doc_path = new_path
             self._show_toast(f"Renamed: {old_name}\n→ {new_name}")
             self._start_reviewed_scan()
             self._session_changed()
