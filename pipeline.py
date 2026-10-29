@@ -63,6 +63,7 @@ class PipelineConfig:
         ocr_engine: str = "tesseract",
         division_code: str = "",
         document_date_enabled: bool = False,
+        uppercase_filenames: bool = True,
     ):
         self.input_root = Path(input_root)
         self.output_root = Path(output_root)
@@ -88,6 +89,7 @@ class PipelineConfig:
         # "Document date" tickbox on the Settings tab: when False the date is
         # neither scanned nor written into the output filename.
         self.document_date_enabled = document_date_enabled
+        self.uppercase_filenames = uppercase_filenames
         self.audit_enabled = True
         self.render_dpi = 150
         self.keep_input_structure = False
@@ -114,11 +116,15 @@ def build_final_filename(
     include_date: bool = True,
     yyyymm: str = "",
     duplicate_suffix: str = "",
+    uppercase: bool = True,
 ) -> str:
     """Build the output filename: [YYYYMM]####_###_COMPANY.pdf"""
     prefix = yyyymm if (include_date and yyyymm) else ""
     seq_str = seq if isinstance(seq, str) else f"{seq:04d}"
-    return f"{prefix}{seq_str}_{division_code}_{company}{duplicate_suffix}.pdf"
+    stem = f"{prefix}{seq_str}_{division_code}_{company}{duplicate_suffix}"
+    if uppercase:
+        stem = stem.upper()
+    return f"{stem}.pdf"
 
 
 def parse_final_stem(stem: str) -> Optional[Dict[str, str]]:
@@ -531,7 +537,8 @@ def finalize_division(batch: DivisionBatch, config: PipelineConfig, log_writer) 
             company = sanitize_filename(doc.company_name)
 
             doc.final_filename = build_final_filename(
-                i, div, company, include_date=include_date, yyyymm=yyyymm
+                i, div, company, include_date=include_date, yyyymm=yyyymm,
+                uppercase=getattr(config, "uppercase_filenames", True)
             )
 
             if mirror:
@@ -812,6 +819,7 @@ def finalize_single_document(doc_data: dict, config: PipelineConfig) -> dict:
         include_date=include_date,
         yyyymm=yyyymm,
         duplicate_suffix=doc_data.get("duplicate_suffix", "") if doc_data.get("is_duplicate") else "",
+        uppercase=getattr(config, "uppercase_filenames", True),
     )
     
     output_path = output_div_dir / final_filename

@@ -654,6 +654,11 @@ class SettingsTab(QWidget):
         self.document_date_check.toggled.connect(self._toggle_date_format)
         format_col.addWidget(self.document_date_check)
 
+        self.uppercase_filenames_check = QCheckBox("Auto-capitalize output filename (ALL UPPERCASE)")
+        self.uppercase_filenames_check.setChecked(self.config.get("uppercase_filenames", True))
+        self.uppercase_filenames_check.toggled.connect(lambda: self._toggle_date_format(self.document_date_check.isChecked()))
+        format_col.addWidget(self.uppercase_filenames_check)
+
         self._dated_pattern = "{YYYYMM}{SEQ}_{DIVISION}_{Company_Name}.pdf"
         self._dated_example = "Example: 2026010001_031_NEW_ZEALAND_INS_CORP.pdf"
         self._dateless_pattern = "{SEQ}_{DIVISION}_{Company_Name}.pdf"
@@ -925,6 +930,7 @@ class SettingsTab(QWidget):
         self.config["ocr_timeout_sec"] = self.ocr_timeout_spin.value()
         self.config["output_layout"] = self.layout_combo.currentData()
         self.config["document_date_enabled"] = self.document_date_check.isChecked()
+        self.config["uppercase_filenames"] = self.uppercase_filenames_check.isChecked()
         self.config["enable_qc"] = self.enable_qc_check.isChecked()
         self.config["enable_docsep_removal"] = self.enable_docsep.isChecked()
         self.config["enable_blank_removal"] = self.enable_blank_rm.isChecked()

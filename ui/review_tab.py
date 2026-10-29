@@ -2919,7 +2919,8 @@ class ReviewTab(QWidget):
 
             new_ym = dt.replace("-", "")[:6]
             new_name = build_final_filename(
-                seq, division, new_company, include_date=include_date, yyyymm=new_ym
+                seq, division, new_company, include_date=include_date, yyyymm=new_ym,
+                uppercase=self.config.get("uppercase_filenames", True)
             )
             if os.path.normcase(os.path.normpath(new_name)) == os.path.normcase(os.path.normpath(old_name)):
                 self.refresh_doc_list()
@@ -3045,6 +3046,7 @@ class ReviewTab(QWidget):
         config.min_file_size_kb = self.config.get("min_file_size_kb", 10)
         config.output_layout = self.config.get("output_layout", "flat")
         config.document_date_enabled = self.config.get("document_date_enabled", False)
+        config.uppercase_filenames = self.config.get("uppercase_filenames", True)
         return config
 
     def _show_document_menu(self, idx: int, global_pos: QPoint):
