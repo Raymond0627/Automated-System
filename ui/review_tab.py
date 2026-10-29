@@ -61,60 +61,6 @@ def _norm_path(p):
     return os.path.normcase(os.path.normpath(os.path.abspath(p))) if p else ""
 
 
-class ClickableLabel(QLabel):
-    clicked = pyqtSignal(int)
-
-    def __init__(self, page_num, parent=None):
-        super().__init__(parent)
-        self._page_num = page_num
-        self._sort_slot = -1
-        self._sort_mode = False
-        self._sort_handler = None
-        self._press_screen = None
-        self._drag_active = False
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            if self._sort_mode:
-                self._press_screen = event.globalPosition().toPoint()
-                self._drag_active = False
-                event.accept()
-                return
-            self.clicked.emit(self._page_num)
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event):
-        if self._sort_mode and self._sort_handler:
-            if self._press_screen is not None:
-                delta = event.globalPosition().toPoint() - self._press_screen
-                if delta.manhattanLength() > 12:
-                    self._sort_handler.on_sort_drag(self._sort_slot)
-                    self._drag_active = True
-                    self._press_screen = None
-            elif self._drag_active:
-                self._sort_handler.on_drag_move(self._sort_slot, event.globalPosition().toPoint())
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event):
-        if self._sort_mode and self._sort_handler:
-            if self._press_screen is not None:
-                self._press_screen = None
-            self._drag_active = False
-            self._sort_handler.on_sort_release(self._sort_slot)
-        super().mouseReleaseEvent(event)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        # Keep an active crop overlay aligned to the pixmap after a resize.
-        refit = getattr(self, "_crop_refit", None)
-        if refit is not None and getattr(self, "_crop_overlay", None) is not None:
-            try:
-                refit()
-            except Exception:
-                pass
-
-
 class CropOverlay(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2548,7 +2494,26 @@ class ReviewTab(QWidget):
             if lbl.rect().contains(pt):
                 target = i
                 where = "before" if pt.y() < lbl.rect().center().y() else "after"
-                break
+                return target, where
+
+        # Fallback to closest label if hovering in margin/padding between cards
+        if self.page_labels:
+            closest_idx = -1
+            min_dist = float('inf')
+            for i, lbl in enumerate(self.page_labels):
+                if not lbl.isVisible():
+                    continue
+                center_g = lbl.mapToGlobal(lbl.rect().center())
+                dist = (center_g.x() - global_pos.x())**2 + (center_g.y() - global_pos.y())**2
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_idx = i
+            if closest_idx >= 0:
+                lbl = self.page_labels[closest_idx]
+                pt = lbl.mapFromGlobal(global_pos)
+                target = closest_idx
+                where = "before" if pt.y() < lbl.rect().center().y() else "after"
+
         return target, where
 
     def _update_sort_indicator(self, global_pos):

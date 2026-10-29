@@ -30,6 +30,36 @@ class ClickableLabel(QLabel):
             self.clicked.emit(self._page_num)
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event):
+        if self._sort_mode and self._sort_handler:
+            if self._press_screen is not None:
+                delta = event.globalPosition().toPoint() - self._press_screen
+                if delta.manhattanLength() > 8:
+                    self._sort_handler.on_sort_drag(self._sort_slot)
+                    self._drag_active = True
+                    self._press_screen = None
+            elif self._drag_active:
+                self._sort_handler.on_drag_move(self._sort_slot, event.globalPosition().toPoint())
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._sort_mode and self._sort_handler:
+            if self._press_screen is not None:
+                self._press_screen = None
+            self._drag_active = False
+            self._sort_handler.on_sort_release(self._sort_slot)
+        super().mouseReleaseEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep an active crop overlay aligned to the pixmap after a resize.
+        refit = getattr(self, "_crop_refit", None)
+        if refit is not None and getattr(self, "_crop_overlay", None) is not None:
+            try:
+                refit()
+            except Exception:
+                pass
+
 
 class InteractivePageLabel(ClickableLabel):
     """Interactive preview label that renders company candidate overlays and supports click selection."""

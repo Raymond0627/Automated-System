@@ -836,11 +836,11 @@ class SettingsTab(QWidget):
         update_row.setSpacing(14)
 
         self.version_info_label = QLabel(f"Current Version: <b>v{__version__}</b>")
-        self.version_info_label.setFont(QFont("Segoe UI", 9.5))
+        self.version_info_label.setFont(QFont("Segoe UI", 10))
         update_row.addWidget(self.version_info_label)
 
         self.update_status_label = QLabel("")
-        self.update_status_label.setFont(QFont("Segoe UI", 8.5))
+        self.update_status_label.setFont(QFont("Segoe UI", 9))
         update_row.addWidget(self.update_status_label)
 
         update_row.addStretch()

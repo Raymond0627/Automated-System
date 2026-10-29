@@ -63,7 +63,7 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _setup_ui(self):
-        self.setWindowTitle("Lumeed QScan")
+        self.setWindowTitle(f"Lumeed QScan v{__version__}")
         self.setMinimumSize(1000, 700)
         self.resize(1200, 800)
 

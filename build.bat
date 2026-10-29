@@ -1,7 +1,7 @@
 @echo off
 echo ============================================
 echo  Lumeed QScan - Build Installer Script
-echo  Produces Output\LumeedQScan_Setup_1.9.4.exe
+echo  Produces Output\LumeedQScan_Setup_1.9.5.exe
 echo ============================================
 echo.
 

@@ -174,7 +174,7 @@ def test_finalize_single_document_keeps_date_prefix_when_date_enabled(tmp_path):
         cfg,
     )
     assert result["success"], result.get("error")
-    assert result["final_filename"] == "2024050001_003_Acme Corp.pdf"
+    assert result["final_filename"] == "2024050001_003_ACME CORP.pdf"
 
 
 def test_finalize_single_document_omits_date_when_disabled(tmp_path):
@@ -186,7 +186,7 @@ def test_finalize_single_document_omits_date_when_disabled(tmp_path):
         cfg,
     )
     assert result["success"], result.get("error")
-    assert result["final_filename"] == "0001_003_Acme Corp.pdf"
+    assert result["final_filename"] == "0001_003_ACME CORP.pdf"
 
 
 # ------------------------------------------------- flat folder sequence
@@ -221,7 +221,8 @@ def test_finalize_division_builds_dated_names_when_date_enabled(tmp_path):
     doc = _confirmed_doc(tmp_path, "a.pdf", confirmed_date=date(2021, 1, 1))
     batch = DivisionBatch(division_code="003", documents=[doc])
     finalize_division(batch, cfg, None)
-    assert doc.final_filename == "2021010001_003_Acme.pdf"
+    assert doc.final_filename == "2021010001_003_ACME.pdf"
+    cfg.output_root / "003" / "Acme" / doc.final_filename
 
 
 def test_finalize_division_keeps_documents_without_date_when_disabled(tmp_path):
@@ -229,7 +230,7 @@ def test_finalize_division_keeps_documents_without_date_when_disabled(tmp_path):
     doc = _confirmed_doc(tmp_path, "a.pdf", confirmed_date=None)
     batch = DivisionBatch(division_code="003", documents=[doc])
     finalize_division(batch, cfg, None)
-    assert doc.final_filename == "0001_003_Acme.pdf"
+    assert doc.final_filename == "0001_003_ACME.pdf"
     assert (cfg.output_root / "003" / "Acme" / doc.final_filename).exists()
 
 
