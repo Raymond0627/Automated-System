@@ -17,6 +17,9 @@ from .styles import get_theme_stylesheet, get_theme_palette, get_palette_dict, T
 from .dashboard_tab import DashboardTab
 from .review_tab import ReviewTab
 from .settings_tab import SettingsTab
+from .update_dialog import UpdateDialog
+from updater import UpdateCheckWorker
+from version import __version__
 from session import set_scan_info, derive_scan_info
 
 
@@ -46,6 +49,18 @@ class MainWindow(QMainWindow):
             self._check_first_run()
         if self.config.get("output_root"):
             self.review_tab._start_reviewed_scan()
+
+        # 3. Check for app updates in the background after startup
+        QTimer.singleShot(2500, self._check_for_updates_background)
+
+    def _check_for_updates_background(self):
+        self._update_worker = UpdateCheckWorker(current_ver=__version__, parent=self)
+        self._update_worker.update_available.connect(self._show_update_dialog)
+        self._update_worker.start()
+
+    def _show_update_dialog(self, version_tag: str, notes: str, download_url: str):
+        dialog = UpdateDialog(version_tag, notes, download_url, parent=self)
+        dialog.exec()
 
     def _setup_ui(self):
         self.setWindowTitle("Lumeed QScan")

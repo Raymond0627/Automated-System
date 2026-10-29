@@ -25,6 +25,9 @@ from .styles import (
     get_palette_dict, get_dashboard_card_style, get_primary_btn_style,
     get_secondary_btn_style, get_combobox_popup_style, THEME_DARK, THEME_LIGHT
 )
+from version import __version__
+from updater import UpdateCheckWorker
+from .update_dialog import UpdateDialog
 
 
 class NumberStepper(QFrame):
@@ -824,6 +827,32 @@ class SettingsTab(QWidget):
         enh_layout.addLayout(enh_grid)
         cards_grid.addWidget(enh_card, 3, 0, 1, 2)
 
+        # Row 4: 8. Application & Updates Card
+        update_card, update_layout = self._create_card(
+            "Application & Updates",
+            "Software version and automatic online update checks"
+        )
+        update_row = QHBoxLayout()
+        update_row.setSpacing(14)
+
+        self.version_info_label = QLabel(f"Current Version: <b>v{__version__}</b>")
+        self.version_info_label.setFont(QFont("Segoe UI", 9.5))
+        update_row.addWidget(self.version_info_label)
+
+        self.update_status_label = QLabel("")
+        self.update_status_label.setFont(QFont("Segoe UI", 8.5))
+        update_row.addWidget(self.update_status_label)
+
+        update_row.addStretch()
+
+        self.check_update_btn = QPushButton("Check for Updates")
+        self.check_update_btn.setFixedHeight(30)
+        self.check_update_btn.clicked.connect(self._manual_check_updates)
+        update_row.addWidget(self.check_update_btn)
+
+        update_layout.addLayout(update_row)
+        cards_grid.addWidget(update_card, 4, 0, 1, 2)
+
         layout.addLayout(cards_grid)
 
         layout.addSpacing(8)
@@ -914,6 +943,34 @@ class SettingsTab(QWidget):
         dlg.exec()
         companies = load_known_companies()
         self.roster_count_label.setText(f"{len(companies)} companies in lookup roster")
+
+    def _manual_check_updates(self):
+        self.check_update_btn.setEnabled(False)
+        self.update_status_label.setText("Checking for updates...")
+        self._manual_updater = UpdateCheckWorker(current_ver=__version__, parent=self)
+        self._manual_updater.update_available.connect(self._on_manual_update_found)
+        self._manual_updater.no_update.connect(self._on_manual_no_update)
+        self._manual_updater.check_failed.connect(self._on_manual_update_failed)
+        self._manual_updater.start()
+
+    def _on_manual_update_found(self, version_tag: str, notes: str, download_url: str):
+        self.check_update_btn.setEnabled(True)
+        self.update_status_label.setText(f"Update available: {version_tag}")
+        dialog = UpdateDialog(version_tag, notes, download_url, parent=self)
+        dialog.exec()
+
+    def _on_manual_no_update(self):
+        self.check_update_btn.setEnabled(True)
+        self.update_status_label.setText("✓ You are up to date.")
+        QMessageBox.information(
+            self, "No Updates",
+            f"You are already running the latest version of Lumeed QScan (v{__version__})."
+        )
+
+    def _on_manual_update_failed(self, err: str):
+        self.check_update_btn.setEnabled(True)
+        self.update_status_label.setText("Could not check updates.")
+        QMessageBox.warning(self, "Update Check Failed", f"Could not connect to update server:\n{err}")
 
     def _toggle_date_format(self, enabled: bool):
         self.pattern_label.setText(self._dated_pattern if enabled else self._dateless_pattern)
