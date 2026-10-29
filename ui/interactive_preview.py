@@ -100,50 +100,5 @@ class InteractivePageLabel(ClickableLabel):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if not self._candidates or self.pixmap() is None:
-            return
-
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        for c in self._candidates:
-            rect = self._scale_bbox_to_widget(c["bbox"])
-            is_first = (c.get("badge") == 1)
-            is_high = c.get("is_high_conf", False)
-
-            # Color coding: Green for auto-accepted / high confidence top candidate;
-            # Cyan / Yellow for runner-up alternatives
-            if is_first and is_high:
-                border_color = QColor(46, 204, 113, 220)  # Green
-                bg_color = QColor(46, 204, 113, 40)
-            elif is_first:
-                border_color = QColor(241, 196, 15, 220)  # Yellow
-                bg_color = QColor(241, 196, 15, 40)
-            else:
-                border_color = QColor(52, 152, 219, 200)  # Cyan/Blue
-                bg_color = QColor(52, 152, 219, 35)
-
-            # Draw highlight rectangle
-            pen = QPen(border_color, 2.0)
-            painter.setPen(pen)
-            painter.setBrush(QBrush(bg_color))
-            painter.drawRoundedRect(rect, 3, 3)
-
-            # Draw badge number tag (1, 2, 3, 4)
-            badge_num = c.get("badge")
-            if badge_num:
-                tag_w = 16.0
-                tag_h = 16.0
-                tag_x = rect.left() - tag_w / 2.0
-                tag_y = rect.top() - tag_h / 2.0
-                tag_rect = QRectF(tag_x, tag_y, tag_w, tag_h)
-
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(border_color))
-                painter.drawEllipse(tag_rect)
-
-                painter.setPen(QPen(QColor(255, 255, 255)))
-                painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
-                painter.drawText(tag_rect, Qt.AlignmentFlag.AlignCenter, str(badge_num))
-
-        painter.end()
+        # Transparent overlays: Keep document rendering 100% natural and clean
+        # without drawing color fills or overlapping boxes that obscure text.

@@ -30,6 +30,12 @@ from pipeline import (
 )
 from enhance import enhance_page
 from company_extractor import normalize_company_name, learn_company_name, load_known_companies
+try:
+    from rapidfuzz import fuzz
+    from rapidfuzz.process import extractOne
+except ImportError:
+    fuzz = None
+    extractOne = None
 from organize_model import (PageRef, page_refs_for_source, markers_for, build_pdf_bytes)
 from doc_identity import clone_document, doc_key, ensure_doc_id
 from crop_geometry import cropbox_rect_from_display
@@ -1715,10 +1721,23 @@ class ReviewTab(QWidget):
         if not company_name:
             return
         cleaned = company_name.strip()
-        self._set_company_with_undo(cleaned)
-        # Learn into known companies list
+
+        # Check if matches an existing roster company (handling faded/scrambled OCR)
+        chosen = cleaned
         try:
-            learn_company_name(cleaned)
+            roster = load_known_companies()
+            if roster and extractOne is not None:
+                norm_input = normalize_company_name(cleaned)
+                match = extractOne(norm_input, roster, scorer=fuzz.token_set_ratio)
+                if match and match[1] >= 70:
+                    chosen = match[0]
+        except Exception:
+            pass
+
+        self._set_company_with_undo(chosen)
+        # Learn into known companies list if clean
+        try:
+            learn_company_name(chosen)
         except Exception:
             pass
 
@@ -2562,6 +2581,24 @@ class ReviewTab(QWidget):
             self._sort_indicator.deleteLater()
             self._sort_indicator = None
 
+    def _calculate_new_sort_order(self, current_order: list, dragged_slot: int, target_slot: int, where: str) -> list:
+        if dragged_slot < 0 or dragged_slot >= len(current_order):
+            return list(current_order)
+        if target_slot < 0 or target_slot >= len(current_order):
+            return list(current_order)
+        if target_slot == dragged_slot:
+            return list(current_order)
+
+        order = list(current_order)
+        item = order.pop(dragged_slot)
+        # Target position in new list of length (N - 1)
+        insert_at = target_slot if target_slot < dragged_slot else target_slot - 1
+        if where == "after":
+            insert_at += 1
+        insert_at = max(0, min(insert_at, len(order)))
+        order.insert(insert_at, item)
+        return order
+
     def on_sort_release(self, slot):
         if not self._sort_mode:
             return
@@ -2576,14 +2613,7 @@ class ReviewTab(QWidget):
         if target < 0 or target == dragged:
             self._clear_sort_drag_ui()
             return
-        order = list(self._sort_order)
-        item = order.pop(dragged)
-        insert_at = target - 1 if target > dragged else target
-        if where == "after":
-            insert_at += 1
-        insert_at = max(0, min(insert_at, len(order)))
-        order.insert(insert_at, item)
-        self._sort_order = order
+        self._sort_order = self._calculate_new_sort_order(self._sort_order, dragged, target, where)
         self._clear_sort_drag_ui()
         self.render_preview()
 
