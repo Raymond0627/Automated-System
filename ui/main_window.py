@@ -47,7 +47,7 @@ class MainWindow(QMainWindow):
         # 2. If no session was restored, check if first run setup is needed
         if not restored:
             self._check_first_run()
-        if self.config.get("output_root"):
+        if self.config.get("output_root") and self.review_tab.active_tab == "reviewed":
             self.review_tab._start_reviewed_scan()
 
         # 3. Check for app updates in the background after startup

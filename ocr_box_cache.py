@@ -2,28 +2,45 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import fitz
 
 from paths import DATA_DIR, configure_tesseract
 
 OCR_CACHE_DIR = DATA_DIR / "ocr_cache"
+_FILE_HASH_CACHE: Dict[str, Tuple[float, int, str]] = {}
 
 def ensure_cache_dir() -> Path:
     OCR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     return OCR_CACHE_DIR
 
 def compute_file_hash(file_path: str) -> str:
+    stat = None
+    try:
+        stat = os.stat(file_path)
+        mtime = stat.st_mtime
+        size = stat.st_size
+        abs_p = os.path.abspath(file_path)
+        cached = _FILE_HASH_CACHE.get(abs_p)
+        if cached and cached[0] == mtime and cached[1] == size:
+            return cached[2]
+    except Exception:
+        stat = None
+
     h = hashlib.sha256()
     with open(file_path, "rb") as f:
         while chunk := f.read(65536):
             h.update(chunk)
-    return h.hexdigest()
+    digest = h.hexdigest()
+    if stat is not None:
+        _FILE_HASH_CACHE[abs_p] = (mtime, size, digest)
+    return digest
 
 def _get_cache_path(file_hash: str, page_num: int) -> Path:
     return ensure_cache_dir() / f"{file_hash}_{page_num}.json"
 
 def clear_disk_cache() -> None:
+    _FILE_HASH_CACHE.clear()
     if OCR_CACHE_DIR.exists():
         for item in OCR_CACHE_DIR.glob("*.json"):
             try:
@@ -35,7 +52,8 @@ def get_page_word_boxes(
     doc_path: str,
     page_num: int = 0,
     use_cache: bool = True,
-    zone_crop_ratio: Optional[float] = None
+    zone_crop_ratio: Optional[float] = None,
+    allow_ocr: bool = True
 ) -> List[Dict[str, Any]]:
     """Extract word bounding boxes from a PDF page.
     
@@ -84,7 +102,7 @@ def get_page_word_boxes(
                 })
 
         # 2. Scanned image check (pytesseract fallback)
-        if not boxes:
+        if not boxes and allow_ocr:
             try:
                 import pytesseract
                 configure_tesseract()

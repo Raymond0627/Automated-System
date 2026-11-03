@@ -334,8 +334,11 @@ class ReviewTab(QWidget):
         self._auto_refresh_timer.setSingleShot(True)
         self._auto_refresh_timer.setInterval(120)
         self._auto_refresh_timer.timeout.connect(self._on_auto_refresh)
+        self._pixmap_cache = {}
+        self._pixmap_cache_order = []
+        self._pixmap_cache_max = 24
         self.build_ui()
-        if self.config.get("output_root"):
+        if self.config.get("output_root") and self.active_tab == "reviewed":
             QTimer.singleShot(150, self._start_reviewed_scan)
 
     def build_ui(self):
@@ -762,6 +765,7 @@ class ReviewTab(QWidget):
             saved_doc_key = doc_key(current_docs_pre[self.active_index])
 
         self.doc_list.blockSignals(True)
+        self.doc_list.setUpdatesEnabled(False)
         self.doc_list.clear()
         self.doc_card_widgets = []
         theme = self.config.get("theme", THEME_DARK)
@@ -794,6 +798,7 @@ class ReviewTab(QWidget):
         self.doc_nav_label.setText(f"{len(docs)} docs")
         self.confirm_all_btn.setVisible(self.active_tab == "auto_confirmed")
         self.confirm_all_btn.setEnabled(self.active_tab == "auto_confirmed" and bool(docs))
+        self.doc_list.setUpdatesEnabled(True)
         self.doc_list.blockSignals(False)
         if docs:
             # Determine target row to select
@@ -1002,7 +1007,11 @@ class ReviewTab(QWidget):
                 self.reviewed_index_to_item[i] = file_item
 
         self.reviewed_tree.resizeColumnToContents(0)
-        self.reviewed_tree.expandAll()
+        if len(docs) <= 100:
+            self.reviewed_tree.expandAll()
+        else:
+            if self.reviewed_tree.topLevelItemCount() > 0:
+                self.reviewed_tree.topLevelItem(0).setExpanded(True)
 
         # Restore selection and scroll position
         target_idx = saved_doc_idx
@@ -1014,6 +1023,9 @@ class ReviewTab(QWidget):
         if 0 <= target_idx < len(docs):
             item = self.reviewed_index_to_item.get(target_idx)
             if item:
+                parent = item.parent()
+                if parent:
+                    parent.setExpanded(True)
                 self.reviewed_tree.setCurrentItem(item)
             self.active_index = target_idx
             self.reviewed_selected_indices = [target_idx]
@@ -1539,9 +1551,14 @@ class ReviewTab(QWidget):
         else:
             self.refresh_doc_list()
 
+    def _clear_pixmap_cache(self):
+        self._pixmap_cache.clear()
+        self._pixmap_cache_order.clear()
+
     def load_document(self, doc: dict):
         self.exit_crop_mode()
         self._exit_sort_mode(rerender=False)
+        self._clear_pixmap_cache()
         if self.current_pdf_doc:
             try:
                 self.current_pdf_doc.close()
@@ -1774,6 +1791,13 @@ class ReviewTab(QWidget):
                 lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 1px solid {p['border']}; border-radius: 4px; padding: 4px;")
 
     def _make_page_pixmap(self, page_num, page_width):
+        cache_key = (page_num, self.zoom_level, page_width)
+        if cache_key in self._pixmap_cache:
+            if cache_key in self._pixmap_cache_order:
+                self._pixmap_cache_order.remove(cache_key)
+            self._pixmap_cache_order.append(cache_key)
+            return self._pixmap_cache[cache_key]
+
         page = self.current_pdf_doc[page_num]
         dpi = max(25, int(150 * (self.zoom_level / 100)))
         pix = page.get_pixmap(dpi=dpi)
@@ -1781,6 +1805,12 @@ class ReviewTab(QWidget):
         pixmap = QPixmap.fromImage(img)
         if pixmap.width() > page_width:
             pixmap = pixmap.scaledToWidth(page_width, Qt.TransformationMode.SmoothTransformation)
+
+        if len(self._pixmap_cache_order) >= self._pixmap_cache_max:
+            oldest = self._pixmap_cache_order.pop(0)
+            self._pixmap_cache.pop(oldest, None)
+        self._pixmap_cache[cache_key] = pixmap
+        self._pixmap_cache_order.append(cache_key)
         return pixmap
 
     def _make_page_placeholder(self, page_num, page_width):
@@ -1843,7 +1873,12 @@ class ReviewTab(QWidget):
             lbl_top = lbl.mapTo(self.preview_container, QPoint(0, 0)).y()
             lbl_h = lbl.height()
             if lbl_top + lbl_h < scroll_top - margin - view_h or lbl_top > scroll_bottom + margin + view_h:
-                lbl.setPixmap(QPixmap())
+                pn = getattr(lbl, "_lazy_page_num", None)
+                w = getattr(lbl, "_lazy_width", 400)
+                if pn is not None and self.current_pdf_doc and pn < len(self.current_pdf_doc):
+                    lbl.setPixmap(self._make_page_placeholder(pn, w))
+                else:
+                    lbl.setPixmap(QPixmap())
                 lbl._lazy_rendered = False
 
     def keyPressEvent(self, event):
@@ -1889,7 +1924,7 @@ class ReviewTab(QWidget):
         try:
             page_obj = self.current_pdf_doc[page_num] if self.current_pdf_doc else None
             page_rect = (0, 0, page_obj.rect.width, page_obj.rect.height) if page_obj else (0, 0, 612, 792)
-            word_boxes = get_page_word_boxes(doc["original_path"], page_num=page_num, use_cache=True)
+            word_boxes = get_page_word_boxes(doc["original_path"], page_num=page_num, use_cache=True, allow_ocr=False)
             candidates = extract_company_candidates(word_boxes, page_rect=page_rect)
             lbl.set_candidates(candidates, word_boxes, (page_rect[2], page_rect[3]))
         except Exception:
@@ -2116,6 +2151,7 @@ class ReviewTab(QWidget):
             return
         if self._sort_mode:
             self._exit_sort_mode()
+        self._clear_pixmap_cache()
         self._push_undo()
         self.current_pdf_doc.delete_page(page_num)
         doc = self._get_current_doc()
@@ -2132,6 +2168,7 @@ class ReviewTab(QWidget):
     def _rotate_page(self, page_num, degrees):
         if not self.current_pdf_doc:
             return
+        self._clear_pixmap_cache()
         self._push_undo()
         page = self.current_pdf_doc[page_num]
         current = page.rotation or 0
@@ -2147,6 +2184,7 @@ class ReviewTab(QWidget):
         import cv2
         import numpy as np
         import tempfile
+        self._clear_pixmap_cache()
         self._push_undo()
         try:
             page = self.current_pdf_doc[page_num]
@@ -2181,6 +2219,7 @@ class ReviewTab(QWidget):
     def _enhance_page(self, page_num):
         if not self.current_pdf_doc:
             return
+        self._clear_pixmap_cache()
         self._push_undo()
         try:
             page = self.current_pdf_doc[page_num]
@@ -2324,6 +2363,7 @@ class ReviewTab(QWidget):
 
         self.document_modified = True
         self._crop_saved_cropbox = None
+        self._clear_pixmap_cache()
         self.exit_crop_mode(restore=False)
         self.render_preview()
         self._session_changed()
@@ -2431,6 +2471,7 @@ class ReviewTab(QWidget):
                 doc["blank_pages"] = [pos_map[p] for p in doc.get("blank_pages", []) if p in pos_map]
                 doc["docsep_pages"] = [pos_map[p] for p in doc.get("docsep_pages", []) if p in pos_map]
             self.document_modified = True
+            self._clear_pixmap_cache()
             self._exit_sort_mode()
             self._show_toast("Sort applied — press Enter again to save")
             self._session_changed()

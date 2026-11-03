@@ -525,6 +525,16 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
                 pass
         if page_idx in skip_pages and page_image_callback is None:
             continue
+        if page_image_callback is None:
+            try:
+                native_txt = doc[page_idx].get_text().strip()
+                words = [w for w in native_txt.split() if len(w) >= 2]
+                if len(words) >= 5:
+                    # Page has confirmed digital text; cannot be blank.
+                    # Skip expensive rasterization and OpenCV ink detection.
+                    continue
+            except Exception:
+                pass
         img = pdf_to_image(pdf_path, page_idx, dpi=dpi, doc=doc)
         if img is None:
             continue
