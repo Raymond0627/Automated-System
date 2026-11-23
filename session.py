@@ -12,6 +12,10 @@ SESSION_FILE = SESSION_DIR / "latest_session.json"
 SESSION_TMP = SESSION_DIR / "latest_session.json.tmp"
 SESSION_VERSION = 1
 
+# Raw OCR text is kept for the OCR panel but can be very large on multi-page
+# scans. Session snapshots only need enough for a quick look after a restart.
+RAW_OCR_SNAPSHOT_LIMIT = 20000
+
 scan_info = None
 
 
@@ -115,6 +119,9 @@ def _clean_doc(doc: dict, keep_bytes: bool) -> dict:
             clean["_pending_pdf_bytes"] = _b64(pb)
         else:
             clean.pop("_pending_pdf_bytes", None)
+    raw = clean.get("raw_ocr_text")
+    if isinstance(raw, str) and len(raw) > RAW_OCR_SNAPSHOT_LIMIT:
+        clean["raw_ocr_text"] = raw[:RAW_OCR_SNAPSHOT_LIMIT]
     return clean
 
 

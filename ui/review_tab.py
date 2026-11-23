@@ -328,12 +328,22 @@ class ReviewTab(QWidget):
         self._session_dirty = False
         self._session_timer = QTimer(self)
         self._session_timer.setSingleShot(True)
-        self._session_timer.setInterval(500)
+        self._session_timer.setInterval(2000)
         self._session_timer.timeout.connect(self._save_session_now)
         self._auto_refresh_timer = QTimer(self)
         self._auto_refresh_timer.setSingleShot(True)
-        self._auto_refresh_timer.setInterval(120)
+        self._auto_refresh_timer.setInterval(300)
         self._auto_refresh_timer.timeout.connect(self._on_auto_refresh)
+        # Coalesce full index rewrites: confirming many documents used to
+        # re-serialize the whole flagged/auto index for every single confirm.
+        self._index_save_timer = QTimer(self)
+        self._index_save_timer.setSingleShot(True)
+        self._index_save_timer.setInterval(800)
+        self._index_save_timer.timeout.connect(self._flush_indexes)
+        self._flagged_index_dirty = False
+        self._auto_index_dirty = False
+        self._rendered_card_keys = []
+        self._rendered_card_tab = None
         self._pixmap_cache = {}
         self._pixmap_cache_order = []
         self._pixmap_cache_max = 24
@@ -659,6 +669,8 @@ class ReviewTab(QWidget):
 
     def refresh_review(self):
         self._exit_sort_mode(rerender=False)
+        # Persist any pending confirm/delete before re-reading the indexes.
+        self._flush_indexes()
         _prev_flagged = list(self.all_flagged_docs) if self.all_flagged_docs else []
         _prev_auto = list(self.auto_confirmed_docs) if self.auto_confirmed_docs else []
 
@@ -670,6 +682,8 @@ class ReviewTab(QWidget):
 
         self.doc_list.clear()
         self.doc_card_widgets = []
+        self._rendered_card_keys = []
+        self._rendered_card_tab = None
         self.active_index = -1
         self.current_pdf_doc = None
         for lbl in self.page_labels:
@@ -759,38 +773,73 @@ class ReviewTab(QWidget):
         # Capture current scroll position and selected document key before clearing
         scroll_bar = self.doc_list.verticalScrollBar()
         saved_scroll_pos = scroll_bar.value() if scroll_bar else 0
-        current_docs_pre = self.pending_docs if self.active_tab == "pending" else self.auto_confirmed_docs
+        docs = self.pending_docs if self.active_tab == "pending" else self.auto_confirmed_docs
         saved_doc_key = None
-        if 0 <= self.active_index < len(current_docs_pre):
-            saved_doc_key = doc_key(current_docs_pre[self.active_index])
+        if 0 <= self.active_index < len(docs):
+            saved_doc_key = doc_key(docs[self.active_index])
+
+        # Fast path: while the pipeline streams documents in, the list only
+        # grows. Appending cards avoids destroying/recreating hundreds of
+        # widgets on every arrival (which made 500-PDF folders crawl).
+        new_keys = [doc_key(d) for d in docs]
+        rendered = self._rendered_card_keys
+        can_append = (
+            len(new_keys) > len(rendered)
+            and self._rendered_card_tab == self.active_tab
+            and len(new_keys) >= len(rendered)
+            and new_keys[:len(rendered)] == rendered
+            and len(self.doc_card_widgets) == len(rendered)
+        )
+        if can_append:
+            self.doc_list.blockSignals(True)
+            self.doc_list.setUpdatesEnabled(False)
+            try:
+                self._append_doc_cards(docs, len(rendered))
+            finally:
+                self.doc_list.blockSignals(False)
+                self.doc_list.setUpdatesEnabled(True)
+            self._rendered_card_keys = new_keys
+            self._update_doc_list_chrome(docs)
+            self._apply_doc_selection(
+                docs, select_row, preserve_current, saved_doc_key,
+                scroll_bar, saved_scroll_pos,
+            )
+            return
 
         self.doc_list.blockSignals(True)
         self.doc_list.setUpdatesEnabled(False)
         self.doc_list.clear()
         self.doc_card_widgets = []
+        try:
+            self._append_doc_cards(docs, 0)
+        finally:
+            self.doc_list.blockSignals(False)
+            self.doc_list.setUpdatesEnabled(True)
+        self._rendered_card_keys = new_keys
+        self._rendered_card_tab = self.active_tab
+        self._update_doc_list_chrome(docs)
+        self._apply_doc_selection(
+            docs, select_row, preserve_current, saved_doc_key,
+            scroll_bar, saved_scroll_pos,
+        )
+
+    def _append_doc_cards(self, docs, start: int):
         theme = self.config.get("theme", THEME_DARK)
-        if self.active_tab == "pending":
-            docs = self.pending_docs
-            for i, doc in enumerate(docs):
+        for i in range(start, len(docs)):
+            doc = docs[i]
+            if self.active_tab == "pending":
                 card = DocCardWidget(doc, i, theme=theme)
-                card.clicked.connect(self._on_card_clicked)
-                card.contextMenuRequested.connect(self._show_document_menu)
-                item = QListWidgetItem()
-                item.setSizeHint(QSize(0, 62))
-                self.doc_list.addItem(item)
-                self.doc_list.setItemWidget(item, card)
-                self.doc_card_widgets.append(card)
-        elif self.active_tab == "auto_confirmed":
-            docs = self.auto_confirmed_docs
-            for i, doc in enumerate(docs):
+            else:
                 card = PassedDocCardWidget(doc, i, theme=theme)
-                card.clicked.connect(self._on_card_clicked)
-                card.contextMenuRequested.connect(self._show_document_menu)
-                item = QListWidgetItem()
-                item.setSizeHint(QSize(0, 62))
-                self.doc_list.addItem(item)
-                self.doc_list.setItemWidget(item, card)
-                self.doc_card_widgets.append(card)
+            card.clicked.connect(self._on_card_clicked)
+            card.contextMenuRequested.connect(self._show_document_menu)
+            item = QListWidgetItem()
+            item.setSizeHint(QSize(0, 62))
+            self.doc_list.addItem(item)
+            self.doc_list.setItemWidget(item, card)
+            self.doc_card_widgets.append(card)
+
+    def _update_doc_list_chrome(self, docs):
         self.tab_pending_btn.setText(f"Pending ({len(self.pending_docs)})")
         self.tab_auto_confirmed_btn.setText(f"Auto-Confirmed ({len(self.auto_confirmed_docs)})")
         self.tab_reviewed_btn.setText(f"Reviewed ({len(self.reviewed_docs)})")
@@ -798,40 +847,40 @@ class ReviewTab(QWidget):
         self.doc_nav_label.setText(f"{len(docs)} docs")
         self.confirm_all_btn.setVisible(self.active_tab == "auto_confirmed")
         self.confirm_all_btn.setEnabled(self.active_tab == "auto_confirmed" and bool(docs))
-        self.doc_list.setUpdatesEnabled(True)
-        self.doc_list.blockSignals(False)
-        if docs:
-            # Determine target row to select
-            if select_row is not None:
-                row = min(max(0, select_row), len(docs) - 1)
-            elif saved_doc_key is not None:
-                # Find matching doc by key in new list
-                matching = next((i for i, d in enumerate(docs) if doc_key(d) == saved_doc_key), None)
-                if matching is not None:
-                    row = matching
-                else:
-                    row = min(max(0, self.active_index), len(docs) - 1)
+
+    def _apply_doc_selection(self, docs, select_row, preserve_current, saved_doc_key, scroll_bar, saved_scroll_pos):
+        if not docs:
+            self.selected_indices = []
+            return
+        # Determine target row to select
+        if select_row is not None:
+            row = min(max(0, select_row), len(docs) - 1)
+        elif saved_doc_key is not None:
+            # Find matching doc by key in new list
+            matching = next((i for i, d in enumerate(docs) if doc_key(d) == saved_doc_key), None)
+            if matching is not None:
+                row = matching
             else:
                 row = min(max(0, self.active_index), len(docs) - 1)
-
-            self.selected_indices = [row]
-            self.active_index = row
-            if preserve_current:
-                # Rebuild the list but do NOT emit currentRowChanged, otherwise
-                # _on_doc_selected → load_document would reset the company/date
-                # (file name) fields the user is currently editing.
-                self.doc_list.blockSignals(True)
-                self.doc_list.setCurrentRow(row)
-                self.doc_list.blockSignals(False)
-            else:
-                self.doc_list.setCurrentRow(row)
-            self._update_cards_selection()
-
-            # Restore scroll position so user does not jump back to top
-            if scroll_bar:
-                scroll_bar.setValue(saved_scroll_pos)
         else:
-            self.selected_indices = []
+            row = min(max(0, self.active_index), len(docs) - 1)
+
+        self.selected_indices = [row]
+        self.active_index = row
+        if preserve_current:
+            # Rebuild the list but do NOT emit currentRowChanged, otherwise
+            # _on_doc_selected → load_document would reset the company/date
+            # (file name) fields the user is currently editing.
+            self.doc_list.blockSignals(True)
+            self.doc_list.setCurrentRow(row)
+            self.doc_list.blockSignals(False)
+        else:
+            self.doc_list.setCurrentRow(row)
+        self._update_cards_selection()
+
+        # Restore scroll position so user does not jump back to top
+        if scroll_bar:
+            scroll_bar.setValue(saved_scroll_pos)
 
     def _load_reviewed_from_output(self):
         output_root = Path(self.config.get("output_root", ""))
@@ -1471,13 +1520,8 @@ class ReviewTab(QWidget):
             self.load_document(self.reviewed_docs[row])
 
     def _save_auto_confirmed_updates(self):
-        f_root = self.config.get("flagged_root", "")
-        if f_root:
-            auto_file = Path(f_root) / "auto_confirmed_index.json"
-            auto_file.parent.mkdir(parents=True, exist_ok=True)
-            clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.auto_confirmed_docs]
-            with open(auto_file, "w", encoding="utf-8") as f:
-                json.dump(clean, f, indent=2, ensure_ascii=False)
+        self._auto_index_dirty = True
+        self._index_save_timer.start()
         self._session_changed()
 
     def clear_all(self):
@@ -1485,6 +1529,8 @@ class ReviewTab(QWidget):
         self.doc_list.clear()
         self.doc_list.blockSignals(False)
         self.doc_card_widgets = []
+        self._rendered_card_keys = []
+        self._rendered_card_tab = None
         self.reviewed_tree.clear()
         self.reviewed_index_to_item = {}
         self.all_flagged_docs = []
@@ -1516,6 +1562,10 @@ class ReviewTab(QWidget):
         self.confirm_all_btn.setText("CONFIRM ALL")
         discard_snapshot()
         self._session_changed()
+
+    def backlog_count(self) -> int:
+        """Unreviewed documents still waiting in the Review tab."""
+        return len(self.pending_docs) + len(self.auto_confirmed_docs)
 
     def add_doc(self, doc_type: str, data: dict):
         if doc_type == "pending":
@@ -3049,14 +3099,39 @@ class ReviewTab(QWidget):
             return False
 
     def _save_flagged_updates(self):
-        f_root = self.config.get("flagged_root", "")
-        if f_root:
-            flagged_file = Path(f_root) / "flagged_index.json"
-            flagged_file.parent.mkdir(parents=True, exist_ok=True)
-            clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.all_flagged_docs]
-            with open(flagged_file, "w", encoding="utf-8") as f:
-                json.dump(clean, f, indent=2, ensure_ascii=False)
+        # Coalesce: a full rewrite per confirm is O(all pending docs) and was
+        # a major stall when reviewing hundreds of documents.
+        self._flagged_index_dirty = True
+        self._index_save_timer.start()
         self._session_changed()
+
+    def _flush_indexes(self):
+        f_root = self.config.get("flagged_root", "")
+        if not f_root:
+            self._flagged_index_dirty = False
+            self._auto_index_dirty = False
+            return
+        root = Path(f_root)
+        if self._flagged_index_dirty:
+            flag_file = root / "flagged_index.json"
+            flag_file.parent.mkdir(parents=True, exist_ok=True)
+            clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.all_flagged_docs]
+            try:
+                with open(flag_file, "w", encoding="utf-8") as f:
+                    json.dump(clean, f, indent=2, ensure_ascii=False)
+            except OSError:
+                return
+            self._flagged_index_dirty = False
+        if self._auto_index_dirty:
+            auto_file = root / "auto_confirmed_index.json"
+            auto_file.parent.mkdir(parents=True, exist_ok=True)
+            clean = [{k: v for k, v in d.items() if k != "_pending_pdf_bytes"} for d in self.auto_confirmed_docs]
+            try:
+                with open(auto_file, "w", encoding="utf-8") as f:
+                    json.dump(clean, f, indent=2, ensure_ascii=False)
+            except OSError:
+                return
+            self._auto_index_dirty = False
 
     def _pipeline_config(self):
         from pipeline import PipelineConfig
@@ -4007,6 +4082,10 @@ class ReviewTab(QWidget):
             QTimer.singleShot(100, self.render_preview)
 
     def closeEvent(self, event):
+        try:
+            self._flush_indexes()
+        except Exception:
+            pass
         try:
             self._save_session_now()
         except Exception:

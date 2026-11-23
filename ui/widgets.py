@@ -5,6 +5,7 @@ import time
 import gc
 import shutil
 import tempfile
+import threading
 import numpy as np
 import cv2
 import fitz
@@ -492,6 +493,69 @@ def _merge_flagged_docs(existing, new):
     return merged
 
 
+class BackpressureGate:
+    """Bounds how many unreviewed documents may exist at once.
+
+    The pipeline pauses submitting new work while the Review tab holds
+    ``high`` unreviewed documents and only resumes once the reviewer has
+    drained the queue down to ``low``.  This keeps memory, widget count and
+    index writes flat on folders with hundreds of PDFs while the reviewer
+    works through the current window.
+
+    The backlog is pushed in from the GUI thread (``set_backlog``); the
+    pipeline thread reads it through ``has_capacity`` / ``wait_for_capacity``.
+    """
+
+    def __init__(self, high: int = 50, low: int = 10):
+        self.high = max(1, int(high))
+        self.low = max(0, min(int(low), self.high - 1))
+        self._cond = threading.Condition()
+        self._backlog = 0
+        self._paused = False
+        self._cancelled = False
+
+    @property
+    def paused(self) -> bool:
+        with self._cond:
+            return self._paused
+
+    @property
+    def backlog(self) -> int:
+        with self._cond:
+            return self._backlog
+
+    def set_backlog(self, count: int) -> None:
+        """Report the current number of unreviewed docs in the Review tab."""
+        with self._cond:
+            self._backlog = max(0, int(count))
+            if self._backlog >= self.high:
+                self._paused = True
+            elif self._backlog <= self.low:
+                self._paused = False
+            self._cond.notify_all()
+
+    def has_capacity(self, in_flight: int = 0) -> bool:
+        with self._cond:
+            if self._cancelled or self._paused:
+                return False
+            return self._backlog + max(0, int(in_flight)) < self.high
+
+    def wait_for_capacity(self, in_flight: int = 0, should_cancel=None, poll: float = 0.25) -> bool:
+        """Block until capacity is available. Returns False when cancelled."""
+        with self._cond:
+            while True:
+                if self._cancelled or (should_cancel is not None and should_cancel()):
+                    return False
+                if not self._paused and self._backlog + max(0, int(in_flight)) < self.high:
+                    return True
+                self._cond.wait(poll)
+
+    def cancel(self) -> None:
+        with self._cond:
+            self._cancelled = True
+            self._cond.notify_all()
+
+
 class PipelineThread(QThread):
     progress = pyqtSignal(str, int)
     page_progress = pyqtSignal(str, int, int)
@@ -510,6 +574,7 @@ class PipelineThread(QThread):
         existing_paths: set = None,
         merged_flagged: list = None,
         merged_confirmed: list = None,
+        gate: "BackpressureGate" = None,
     ):
         super().__init__()
         self.config = config
@@ -519,9 +584,12 @@ class PipelineThread(QThread):
         self.existing_paths = set(existing_paths or ())
         self.merged_flagged = list(merged_flagged or [])
         self.merged_confirmed = list(merged_confirmed or [])
+        self.gate = gate
 
     def cancel(self):
         self._cancelled = True
+        if self.gate is not None:
+            self.gate.cancel()
 
     def run(self):
         try:
@@ -657,29 +725,71 @@ class PipelineThread(QThread):
             start_time = time.time()
             results_by_path = {}
             new_flagged = []
+            total_docs = len(doc_infos)
+            gate = self.gate
+            paused_logged = False
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                future_to_info = {}
-                submitted = 0
-
-                for info in doc_infos:
+            executor = ThreadPoolExecutor(max_workers=max_workers)
+            future_to_info = {}
+            pending = set()
+            next_index = 0
+            submitted = 0
+            try:
+                while True:
                     if self._cancelled:
-                        break
-                    future = executor.submit(_process_doc_worker, info, self.config, render_dpi)
-                    future_to_info[future] = info
-                    submitted += 1
+                        self.log_message.emit("--- Pipeline Cancelled ---")
+                        self.progress.emit("Cancelled", 0)
+                        self.finished_signal.emit([])
+                        return
 
-                    if submitted % batch_size == 0:
-                        self.log_message.emit(f"[INFO] Submitted {submitted}/{len(doc_infos)} documents...")
+                    if gate is not None:
+                        if gate.paused and not paused_logged:
+                            paused_logged = True
+                            self.log_message.emit(
+                                f"[PAUSE] Review window full ({gate.backlog} unreviewed). "
+                                f"Processing resumes when the queue drops to {gate.low}."
+                            )
+                            self.progress.emit(
+                                f"Waiting for review ({processed}/{total_docs} processed)",
+                                10 + int(80 * processed / max(1, total)),
+                            )
+                        elif not gate.paused and paused_logged:
+                            paused_logged = False
+                            self.log_message.emit("[RESUME] Review queue drained - refilling window")
 
-                pending = set(future_to_info)
-                while pending:
+                    # Submit only what the review window can absorb instead of
+                    # queueing an entire 500-PDF folder up front.
+                    while next_index < total_docs:
+                        if gate is not None and not gate.has_capacity(len(pending)):
+                            break
+                        info = doc_infos[next_index]
+                        next_index += 1
+                        future = executor.submit(_process_doc_worker, info, self.config, render_dpi)
+                        future_to_info[future] = info
+                        pending.add(future)
+                        submitted += 1
+
+                        if submitted % batch_size == 0:
+                            self.log_message.emit(f"[INFO] Submitted {submitted}/{total_docs} documents...")
+
+                    if not pending:
+                        if next_index >= total_docs:
+                            break
+                        # Gate closed and nothing in flight: park until the
+                        # reviewer drains the queue (cancel-aware).
+                        if gate is None or not gate.wait_for_capacity(0, lambda: self._cancelled):
+                            if self._cancelled:
+                                self.log_message.emit("--- Pipeline Cancelled ---")
+                                self.progress.emit("Cancelled", 0)
+                                self.finished_signal.emit([])
+                            return
+                        continue
+
                     done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
                     if self._cancelled:
                         self.log_message.emit("--- Pipeline Cancelled ---")
                         self.progress.emit("Cancelled", 0)
                         self.finished_signal.emit([])
-                        executor.shutdown(wait=False, cancel_futures=True)
                         return
                     if not done:
                         # Heartbeat keeps the UI responsive while a long document
@@ -747,6 +857,11 @@ class PipelineThread(QThread):
 
                         if processed % 50 == 0:
                             gc.collect()
+            finally:
+                # Cancel queued work but let an in-flight document finish
+                # before the thread reports itself stopped (matches the old
+                # ThreadPoolExecutor context-manager behaviour).
+                executor.shutdown(wait=True, cancel_futures=True)
 
             if self.plan is None:
                 fresh_flagged = []

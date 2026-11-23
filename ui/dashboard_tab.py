@@ -9,13 +9,13 @@ from PyQt6.QtWidgets import (
     QLineEdit, QProgressBar, QFileDialog, QMessageBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QFrame
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QFont, QColor, QPixmap
 
 if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).parent.parent))
 from paths import BASE_DIR, DATA_DIR, ensure_data_dir
-from .widgets import PipelineThread
+from .widgets import PipelineThread, BackpressureGate
 from find_remaining import build_report as build_remaining_report
 from find_remaining import plan_for_pipeline
 from .styles import (
@@ -146,6 +146,15 @@ class DashboardTab(QWidget):
         self._scan_worker = None
         self._compare_worker = None
         self._processed_paths = set()
+
+        # Review-window backpressure: the pipeline parks while the Review tab
+        # holds too many unreviewed documents and refills once it drains.
+        self.review_tab = None
+        self._review_gate = None
+        self._resuming_run = False
+        self._backlog_timer = QTimer(self)
+        self._backlog_timer.setInterval(500)
+        self._backlog_timer.timeout.connect(self._sync_review_gate)
 
         # KPI metric counters
         self._stat_total = 0
@@ -1004,17 +1013,22 @@ class DashboardTab(QWidget):
         self.pipeline_started.emit()
         self._scan_plan = list(plan) if resuming else None
         self._processed_paths = set(existing_paths or ()) if resuming else set()
+        self._resuming_run = resuming
         if resuming:
             self._stat_total = len(plan)
             self._update_kpi_cards()
         self._emit_state_changed()
 
+        self._start_review_gate()
         if resuming:
             self.pipeline_thread = PipelineThread(
-                self.config, 0, plan=plan, existing_paths=existing_paths
+                self.config, 0, plan=plan, existing_paths=existing_paths,
+                gate=self._review_gate,
             )
         else:
-            self.pipeline_thread = PipelineThread(self.config, 0)
+            self.pipeline_thread = PipelineThread(
+                self.config, 0, gate=self._review_gate
+            )
         self.pipeline_thread.progress.connect(self._on_progress)
         self.pipeline_thread.page_progress.connect(self._on_page_progress)
         self.pipeline_thread.log_message.connect(self._append_log)
@@ -1024,6 +1038,7 @@ class DashboardTab(QWidget):
         self.pipeline_thread.doc_completed.connect(self._on_doc_completed)
         self.pipeline_thread.scan_plan.connect(self._on_scan_plan)
         self.pipeline_thread.start()
+        self._sync_review_gate()
 
     def _on_scan_plan(self, paths):
         self._scan_plan = list(paths)
@@ -1060,6 +1075,8 @@ class DashboardTab(QWidget):
         self._set_status_pill("running", "RESUMING")
         self.log_signal.emit(f"=== Resuming Pipeline ({len(remaining)} remaining) ===")
 
+        self._resuming_run = True
+        self._start_review_gate()
         self.pipeline_thread = PipelineThread(
             self.config,
             0,
@@ -1067,6 +1084,7 @@ class DashboardTab(QWidget):
             existing_paths=set(processed),
             merged_flagged=merged_flagged,
             merged_confirmed=merged_confirmed,
+            gate=self._review_gate,
         )
         self.pipeline_thread.progress.connect(self._on_progress)
         self.pipeline_thread.page_progress.connect(self._on_page_progress)
@@ -1076,6 +1094,7 @@ class DashboardTab(QWidget):
         self.pipeline_thread.doc_processed.connect(self.doc_update)
         self.pipeline_thread.doc_completed.connect(self._on_doc_completed)
         self.pipeline_thread.start()
+        self._sync_review_gate()
 
     def cancel_pipeline(self):
         if self.pipeline_thread and self.pipeline_thread.isRunning():
@@ -1103,7 +1122,43 @@ class DashboardTab(QWidget):
     def _on_doc_completed(self, kind: str, path: str):
         if kind == "doc":
             self._processed_paths.add(path)
+            # The Review tab appended this doc a moment ago (doc_update is
+            # queued first), so sync the window immediately.
+            self._sync_review_gate()
             self._emit_state_changed()
+
+    def _start_review_gate(self):
+        high = int(self.config.get("review_window_high", 50) or 50)
+        low = int(self.config.get("review_window_low", 10) or 0)
+        self._review_gate = BackpressureGate(high, low)
+        self._backlog_timer.start()
+
+    def _stop_review_gate(self):
+        self._backlog_timer.stop()
+        self._review_gate = None
+
+    def _sync_review_gate(self):
+        gate = self._review_gate
+        if gate is None:
+            return
+        rt = self.review_tab
+        pending = len(getattr(rt, "pending_docs", []) or []) if rt else 0
+        auto = len(getattr(rt, "auto_confirmed_docs", []) or []) if rt else 0
+        gate.set_backlog(pending + auto)
+
+        running = bool(self.pipeline_thread and self.pipeline_thread.isRunning())
+        if not running:
+            return
+        if gate.paused:
+            done = len(self._processed_paths)
+            total = len(self._scan_plan) if self._scan_plan else 0
+            self._set_status_pill("running", "WAITING FOR REVIEW")
+            self.progress_bar.setFormat(
+                f"Waiting for review — {pending} pending · {auto} auto "
+                f"({done}/{total} processed)"
+            )
+        else:
+            self._set_status_pill("running", "RESUMING" if self._resuming_run else "RUNNING")
 
     def _emit_state_changed(self):
         try:
@@ -1120,6 +1175,8 @@ class DashboardTab(QWidget):
         }
 
     def _on_finished(self, flagged=None):
+        self._stop_review_gate()
+        self._resuming_run = False
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶  Run Pipeline")
         self.cancel_btn.setEnabled(False)
@@ -1140,6 +1197,8 @@ class DashboardTab(QWidget):
         self.pipeline_finished.emit()
 
     def _on_error(self, err_msg):
+        self._stop_review_gate()
+        self._resuming_run = False
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶  Run Pipeline")
         self.cancel_btn.setEnabled(False)

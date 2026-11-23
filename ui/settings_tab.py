@@ -607,6 +607,30 @@ class SettingsTab(QWidget):
         self._steppers.append(self.company_conf_spin)
         pipe_grid.addWidget(self.make_field_column("Company Confidence", self.company_conf_spin), 2, 0)
 
+        self.review_high_spin = NumberStepper(
+            min_val=1, max_val=500, step=10,
+            initial=self.config.get("review_window_high", 50),
+            suffix=" docs", theme=theme
+        )
+        self.review_high_spin.setToolTip(
+            "Processing pauses once this many documents are waiting for review. "
+            "Keeps memory and the Review list responsive on very large folders."
+        )
+        self._steppers.append(self.review_high_spin)
+        pipe_grid.addWidget(self.make_field_column("Review Window", self.review_high_spin), 3, 0)
+
+        self.review_low_spin = NumberStepper(
+            min_val=0, max_val=499, step=5,
+            initial=self.config.get("review_window_low", 10),
+            suffix=" docs", theme=theme
+        )
+        self.review_low_spin.setToolTip(
+            "When the review queue drains to this many documents (or fewer), "
+            "processing automatically refills the window."
+        )
+        self._steppers.append(self.review_low_spin)
+        pipe_grid.addWidget(self.make_field_column("Refill At", self.review_low_spin), 3, 1)
+
         pipe_layout.addLayout(pipe_grid)
         cards_grid.addWidget(pipe_card, 0, 1)
 
@@ -985,6 +1009,9 @@ class SettingsTab(QWidget):
         self.config["render_dpi"] = self.dpi_spin.value()
         self.config["max_workers"] = self.workers_spin.value()
         self.config["ocr_timeout_sec"] = self.ocr_timeout_spin.value()
+        review_high = self.review_high_spin.value()
+        self.config["review_window_high"] = review_high
+        self.config["review_window_low"] = max(0, min(self.review_low_spin.value(), review_high - 1))
         self.config["output_layout"] = self.layout_combo.currentData()
         self.config["document_date_enabled"] = self.document_date_check.isChecked()
         self.config["uppercase_filenames"] = self.uppercase_filenames_check.isChecked()

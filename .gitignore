@@ -27,5 +27,7 @@ __pycache__/
 .worktrees/
 company_hints.json
 resume_reports/
+sessions/
 .superpowers/
 ocr_cache/
+.aider*

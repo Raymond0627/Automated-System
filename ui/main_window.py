@@ -89,6 +89,9 @@ class MainWindow(QMainWindow):
         self.review_tab = ReviewTab(self.config)
         self.settings_tab = SettingsTab(self.config)
 
+        # Let the dashboard read the review backlog for the processing window.
+        self.dashboard_tab.review_tab = self.review_tab
+
         self.settings_tab.theme_changed.connect(self.apply_theme)
 
         self.dashboard_tab.pipeline_started.connect(self.review_tab.clear_all)
@@ -213,6 +216,8 @@ class MainWindow(QMainWindow):
             "enhance_color_clahe_tile": 8,
             "auto_save_enabled": False,
             "batch_size": 50,
+            "review_window_high": 50,
+            "review_window_low": 10,
             "output_layout": "flat",
         }
         if Path(self.config_path).exists():
@@ -250,6 +255,7 @@ class MainWindow(QMainWindow):
         # Guarantee unsaved session is safely persisted before closing
         try:
             if hasattr(self, "review_tab"):
+                self.review_tab._flush_indexes()
                 self.review_tab._save_session_now()
         except Exception:
             pass
