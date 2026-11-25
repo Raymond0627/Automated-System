@@ -613,8 +613,9 @@ class SettingsTab(QWidget):
             suffix=" docs", theme=theme
         )
         self.review_high_spin.setToolTip(
-            "Processing pauses once this many documents are waiting for review. "
-            "Keeps memory and the Review list responsive on very large folders."
+            "Processing pauses once this many documents are waiting in the "
+            "Review tab (auto-confirmed documents count too). Use CONFIRM ALL "
+            "on the Auto-Confirmed tab to free the window."
         )
         self._steppers.append(self.review_high_spin)
         pipe_grid.addWidget(self.make_field_column("Review Window", self.review_high_spin), 3, 0)

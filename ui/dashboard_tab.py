@@ -152,6 +152,8 @@ class DashboardTab(QWidget):
         self.review_tab = None
         self._review_gate = None
         self._resuming_run = False
+        self._start_after_cancel = False
+        self._accepting_docs = False
         self._backlog_timer = QTimer(self)
         self._backlog_timer.setInterval(500)
         self._backlog_timer.timeout.connect(self._sync_review_gate)
@@ -865,6 +867,27 @@ class DashboardTab(QWidget):
 
     def run_pipeline(self):
         if self.pipeline_thread and self.pipeline_thread.isRunning():
+            if (
+                self._review_gate is not None
+                and self._review_gate.paused
+                and not self._cancel_requested
+            ):
+                answer = QMessageBox.question(
+                    self,
+                    "Processing Paused",
+                    "Processing is paused because the review window is full.\n\n"
+                    "Cancel this run and start a new run for the selected folder?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer == QMessageBox.StandardButton.Yes:
+                    self._start_after_cancel = True
+                    self.log_signal.emit(
+                        "=== Switching folders: cancelling the paused run ==="
+                    )
+                    self.cancel_pipeline()
+            else:
+                self.log_signal.emit("[INFO] A pipeline run is already in progress.")
             return
         if self._compare_worker and self._compare_worker.isRunning():
             return
@@ -993,6 +1016,8 @@ class DashboardTab(QWidget):
         if self.pipeline_thread and self.pipeline_thread.isRunning():
             return
 
+        self._start_after_cancel = False
+        self._accepting_docs = False
         resuming = plan is not None
         self.run_btn.setEnabled(False)
         self.run_btn.setText("Resuming..." if resuming else "Running...")
@@ -1031,19 +1056,25 @@ class DashboardTab(QWidget):
             )
         self.pipeline_thread.progress.connect(self._on_progress)
         self.pipeline_thread.page_progress.connect(self._on_page_progress)
-        self.pipeline_thread.log_message.connect(self._append_log)
+        self.pipeline_thread.log_message.connect(self._on_pipeline_log)
         self.pipeline_thread.finished_signal.connect(self._on_finished)
         self.pipeline_thread.error_signal.connect(self._on_error)
-        self.pipeline_thread.doc_processed.connect(self.doc_update)
+        self.pipeline_thread.doc_processed.connect(self._on_doc_processed)
         self.pipeline_thread.doc_completed.connect(self._on_doc_completed)
         self.pipeline_thread.scan_plan.connect(self._on_scan_plan)
         self.pipeline_thread.start()
         self._sync_review_gate()
 
     def _on_scan_plan(self, paths):
+        if not self._is_current_pipeline_sender():
+            return
+        self._accepting_docs = True
         self._scan_plan = list(paths)
         self._stat_total = len(self._scan_plan)
         self._update_kpi_cards()
+        # The plan is now known: drop any review docs that belong to an older
+        # folder/session so they cannot starve this run's window.
+        self._sync_review_gate()
         self._emit_state_changed()
 
     def resume_scan(self, scan_info, rt):
@@ -1057,6 +1088,7 @@ class DashboardTab(QWidget):
 
         self._scan_plan = list(plan)
         self._processed_paths = set(processed)
+        self._accepting_docs = True
         self._stat_total = len(self._scan_plan)
         self._update_kpi_cards()
         self._emit_state_changed()
@@ -1088,10 +1120,10 @@ class DashboardTab(QWidget):
         )
         self.pipeline_thread.progress.connect(self._on_progress)
         self.pipeline_thread.page_progress.connect(self._on_page_progress)
-        self.pipeline_thread.log_message.connect(self._append_log)
+        self.pipeline_thread.log_message.connect(self._on_pipeline_log)
         self.pipeline_thread.finished_signal.connect(self._on_finished)
         self.pipeline_thread.error_signal.connect(self._on_error)
-        self.pipeline_thread.doc_processed.connect(self.doc_update)
+        self.pipeline_thread.doc_processed.connect(self._on_doc_processed)
         self.pipeline_thread.doc_completed.connect(self._on_doc_completed)
         self.pipeline_thread.start()
         self._sync_review_gate()
@@ -1100,16 +1132,35 @@ class DashboardTab(QWidget):
         if self.pipeline_thread and self.pipeline_thread.isRunning():
             self._cancel_requested = True
             self.pipeline_thread.cancel()
+            self.run_btn.setEnabled(False)
             self.cancel_btn.setEnabled(False)
             self.cancel_btn.setText("Cancelling...")
             self.log_signal.emit("Cancelling pipeline...")
             self._set_status_pill("error", "CANCELLING")
 
+    def _is_current_pipeline_sender(self) -> bool:
+        """Ignore queued signals that arrive from a previous/cancelled run."""
+        sender = self.sender()
+        return sender is None or sender is self.pipeline_thread
+
+    def _on_pipeline_log(self, msg: str):
+        if self._is_current_pipeline_sender():
+            self._append_log(msg)
+
+    def _on_doc_processed(self, kind: str, data: dict):
+        if not self._accepting_docs or not self._is_current_pipeline_sender():
+            return
+        self.doc_update.emit(kind, data)
+
     def _on_progress(self, msg: str, pct: int):
+        if not self._is_current_pipeline_sender():
+            return
         self.progress_bar.setValue(pct)
         self.progress_bar.setFormat(msg)
 
     def _on_page_progress(self, filename: str, page_idx: int, total_pages: int):
+        if not self._is_current_pipeline_sender():
+            return
         # Keep the overall percentage; just make the frozen "working..." state
         # show live page movement on long documents.
         pct = self.progress_bar.value()
@@ -1120,6 +1171,8 @@ class DashboardTab(QWidget):
             )
 
     def _on_doc_completed(self, kind: str, path: str):
+        if not self._accepting_docs or not self._is_current_pipeline_sender():
+            return
         if kind == "doc":
             self._processed_paths.add(path)
             # The Review tab appended this doc a moment ago (doc_update is
@@ -1134,30 +1187,86 @@ class DashboardTab(QWidget):
         self._backlog_timer.start()
 
     def _stop_review_gate(self):
+        self._accepting_docs = False
         self._backlog_timer.stop()
         self._review_gate = None
+
+    @staticmethod
+    def _doc_in_scan_plan(doc: dict, plan_paths: set) -> bool:
+        """True when the review doc belongs to the run currently in progress.
+
+        Backpressure is meant to bound the queue produced by *this* scan. Docs
+        left in the Review tab by an earlier folder/session (or restored from a
+        snapshot) must not consume the current run's window, otherwise a small
+        2-6 PDF folder can start with zero capacity and look "stuck".
+        """
+        if not plan_paths:
+            return True
+        for key in ("original_path", "modified_path"):
+            path = doc.get(key)
+            if not path:
+                continue
+            try:
+                if os.path.normcase(os.path.abspath(path)) in plan_paths:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _sync_review_gate(self):
         gate = self._review_gate
         if gate is None:
             return
         rt = self.review_tab
-        pending = len(getattr(rt, "pending_docs", []) or []) if rt else 0
-        auto = len(getattr(rt, "auto_confirmed_docs", []) or []) if rt else 0
+        pending = auto = 0
+        if rt is not None:
+            pending_docs = list(getattr(rt, "pending_docs", []) or [])
+            auto_docs = list(getattr(rt, "auto_confirmed_docs", []) or [])
+            plan_paths = set()
+            for path in (self._scan_plan or ()):
+                if path:
+                    try:
+                        plan_paths.add(os.path.normcase(os.path.abspath(path)))
+                    except Exception:
+                        pass
+            if plan_paths:
+                pending = sum(
+                    1 for d in pending_docs if self._doc_in_scan_plan(d, plan_paths)
+                )
+                auto = sum(
+                    1 for d in auto_docs if self._doc_in_scan_plan(d, plan_paths)
+                )
+            else:
+                # Before the scan plan arrives (or for legacy states) count
+                # everything; the Review tab is cleared when a new run starts.
+                pending = len(pending_docs)
+                auto = len(auto_docs)
         gate.set_backlog(pending + auto)
 
         running = bool(self.pipeline_thread and self.pipeline_thread.isRunning())
-        if not running:
+        if not running or self._cancel_requested:
             return
         if gate.paused:
             done = len(self._processed_paths)
             total = len(self._scan_plan) if self._scan_plan else 0
             self._set_status_pill("running", "WAITING FOR REVIEW")
             self.progress_bar.setFormat(
-                f"Waiting for review — {pending} pending · {auto} auto "
+                f"Paused — waiting for review: {pending} pending · {auto} auto "
                 f"({done}/{total} processed)"
             )
+            # Let the operator abandon a paused run and pick another folder
+            # without having to discover Cancel first.
+            if not self._start_after_cancel:
+                self.run_btn.setEnabled(True)
+                self.run_btn.setText("▶  Start New Run")
+                self.run_btn.setToolTip(
+                    "The current run is paused for review. Click to cancel it "
+                    "and start a run for the selected folder."
+                )
         else:
+            self.run_btn.setEnabled(False)
+            self.run_btn.setText("Resuming..." if self._resuming_run else "Running...")
+            self.run_btn.setToolTip("")
             self._set_status_pill("running", "RESUMING" if self._resuming_run else "RUNNING")
 
     def _emit_state_changed(self):
@@ -1175,10 +1284,15 @@ class DashboardTab(QWidget):
         }
 
     def _on_finished(self, flagged=None):
+        if not self._is_current_pipeline_sender():
+            return
         self._stop_review_gate()
         self._resuming_run = False
+        restart = self._start_after_cancel
+        self._start_after_cancel = False
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶  Run Pipeline")
+        self.run_btn.setToolTip("")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setText("✕  Cancel")
         if self._cancel_requested:
@@ -1195,12 +1309,20 @@ class DashboardTab(QWidget):
         self._emit_state_changed()
         self.log_signal.emit("=== Pipeline Completed ===")
         self.pipeline_finished.emit()
+        if restart:
+            # Defer so this run's teardown signals settle before starting the
+            # new folder the operator picked while the old run was paused.
+            QTimer.singleShot(0, self.run_pipeline)
 
     def _on_error(self, err_msg):
+        if not self._is_current_pipeline_sender():
+            return
         self._stop_review_gate()
         self._resuming_run = False
+        self._start_after_cancel = False
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶  Run Pipeline")
+        self.run_btn.setToolTip("")
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.setText("✕  Cancel")
         self.progress_bar.setFormat("Error")

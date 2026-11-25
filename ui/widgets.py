@@ -747,7 +747,8 @@ class PipelineThread(QThread):
                             paused_logged = True
                             self.log_message.emit(
                                 f"[PAUSE] Review window full ({gate.backlog} unreviewed). "
-                                f"Processing resumes when the queue drops to {gate.low}."
+                                f"Review the queue to resume at {gate.low}, use CONFIRM ALL "
+                                f"on auto-confirmed docs, or cancel to switch folders."
                             )
                             self.progress.emit(
                                 f"Waiting for review ({processed}/{total_docs} processed)",
