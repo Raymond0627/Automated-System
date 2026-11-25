@@ -494,13 +494,14 @@ def _quick_confidence(all_candidates, page_ocr_data_list, control_results):
     return int(min(best_score, 100)), True
 
 
-def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150, doc: Optional["fitz.Document"] = None, docsep_pages: Optional[List[int]] = None, include_date: bool = True, skip_ocr: bool = False, page_image_callback=None, should_cancel=None, ocr_timeout: float = 0, page_progress_callback=None) -> DateResult:
+def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = None, engine: str = "tesseract", dpi: int = 150, doc: Optional["fitz.Document"] = None, docsep_pages: Optional[List[int]] = None, include_date: bool = True, skip_ocr: bool = False, page_image_callback=None, should_cancel=None, ocr_timeout: float = 0, page_progress_callback=None, ocr_page_limit: int = 0) -> DateResult:
     all_candidates = []
     raw_texts = []
     page_ocr_data_list = []
     control_results = {}
     method = f"{engine}_heuristic"
     blank_pages = []
+    verified_text = {}
     EARLY_EXIT_CONFIDENCE = 85
     skip_pages = set(docsep_pages or [])
 
@@ -569,6 +570,7 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
                 tess_txt = pytesseract.image_to_string(
                     gray, config='--psm 6', timeout=ocr_timeout
                 ).strip()
+                verified_text[page_idx] = tess_txt
                 tess_words = [w for w in tess_txt.split() if len(w) >= 2]
                 is_confirmed_blank = len(tess_words) < 2
 
@@ -588,6 +590,16 @@ def extract_document_date(pdf_path: str, page_index: int = 0, max_pages: int = N
             # Date scan disabled or the caller has native text: real blank
             # verification was already handled per-page in Module 1.
             continue
+        if not include_date and page_idx in verified_text:
+            # Module 1 already OCR'd this page while verifying blankness; reuse
+            # it instead of paying for a second OCR pass.
+            raw_texts.append(verified_text[page_idx])
+            continue
+        if not include_date and ocr_page_limit and page_idx >= ocr_page_limit:
+            # Date scanning is off: only the first few pages are needed for the
+            # OCR panel. OCRing every page of a large scan was the main cause of
+            # multi-minute documents.
+            break
 
         img = pdf_to_image(pdf_path, page_idx, dpi=dpi, doc=doc)
         if img is None:

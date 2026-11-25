@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -154,6 +155,7 @@ class DashboardTab(QWidget):
         self._resuming_run = False
         self._start_after_cancel = False
         self._accepting_docs = False
+        self._page_status_text = ""
         self._backlog_timer = QTimer(self)
         self._backlog_timer.setInterval(500)
         self._backlog_timer.timeout.connect(self._sync_review_gate)
@@ -1018,6 +1020,7 @@ class DashboardTab(QWidget):
 
         self._start_after_cancel = False
         self._accepting_docs = False
+        self._page_status_text = ""
         resuming = plan is not None
         self.run_btn.setEnabled(False)
         self.run_btn.setText("Resuming..." if resuming else "Running...")
@@ -1155,6 +1158,18 @@ class DashboardTab(QWidget):
     def _on_progress(self, msg: str, pct: int):
         if not self._is_current_pipeline_sender():
             return
+        if self._review_gate is not None and self._review_gate.paused:
+            # Keep the "Paused — waiting for review" text visible while an
+            # in-flight document finishes.
+            self.progress_bar.setValue(pct)
+            return
+        if "working..." in msg and self._page_status_text:
+            # The pipeline heartbeat fires twice a second. Do not overwrite a
+            # live "file - page x/y" message from the current document.
+            self.progress_bar.setValue(pct)
+            return
+        if "working..." not in msg:
+            self._page_status_text = ""
         self.progress_bar.setValue(pct)
         self.progress_bar.setFormat(msg)
 
@@ -1166,14 +1181,16 @@ class DashboardTab(QWidget):
         pct = self.progress_bar.value()
         if total_pages > 0:
             short = filename if len(filename) <= 32 else filename[:29] + "..."
-            self.progress_bar.setFormat(
+            self._page_status_text = (
                 f"{short} - page {page_idx + 1}/{total_pages} ({pct}%)"
             )
+            self.progress_bar.setFormat(self._page_status_text)
 
     def _on_doc_completed(self, kind: str, path: str):
         if not self._accepting_docs or not self._is_current_pipeline_sender():
             return
         if kind == "doc":
+            self._page_status_text = ""
             self._processed_paths.add(path)
             # The Review tab appended this doc a moment ago (doc_update is
             # queued first), so sync the window immediately.
@@ -1290,6 +1307,7 @@ class DashboardTab(QWidget):
         self._resuming_run = False
         restart = self._start_after_cancel
         self._start_after_cancel = False
+        self._page_status_text = ""
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶  Run Pipeline")
         self.run_btn.setToolTip("")
@@ -1320,6 +1338,7 @@ class DashboardTab(QWidget):
         self._stop_review_gate()
         self._resuming_run = False
         self._start_after_cancel = False
+        self._page_status_text = ""
         self.run_btn.setEnabled(True)
         self.run_btn.setText("▶  Run Pipeline")
         self.run_btn.setToolTip("")

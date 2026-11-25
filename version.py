@@ -1,4 +1,4 @@
 """Application version definition and update constants."""
 
-__version__ = "1.9.8"
+__version__ = "1.9.9"
 GITHUB_REPO = "Raymond0627/Automated-System"

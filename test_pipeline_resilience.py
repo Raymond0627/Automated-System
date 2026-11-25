@@ -265,7 +265,9 @@ def test_pipeline_cancel_returns_while_worker_is_busy(tmp_path):
         thread.cancel()
         _pump(app, lambda: bool(finished), timeout=2)
         assert finished == [[]], "cancel did not report completion while the worker was busy"
-        assert runner.is_alive(), "cancel should not block on the busy worker"
+        # Cancel must not leave the pipeline thread parked on a busy/stalled
+        # worker: the UI has already been released and a new run may start.
+        assert not runner.is_alive(), "cancel blocked on the busy worker"
     finally:
         release.set()
         runner.join(timeout=5)

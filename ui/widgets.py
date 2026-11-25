@@ -55,7 +55,7 @@ def _is_network_path(path: str) -> bool:
     return False
 
 
-def _stage_local_copy(path: str, should_cancel=None):
+def _stage_local_copy(path: str, should_cancel=None, activity_callback=None):
     """Copy a network file to a local temp dir so PDF/OCR work runs on a fast
     local disk instead of crossing the network per page. Returns
     (work_path, temp_dir); temp_dir is None when no copy was made."""
@@ -73,6 +73,8 @@ def _stage_local_copy(path: str, should_cancel=None):
                 if not chunk:
                     break
                 fdst.write(chunk)
+                if activity_callback is not None:
+                    activity_callback()
     except Exception:
         _cleanup_staged(temp_dir)
         return path, None
@@ -106,8 +108,19 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
     temp_dir = None
     _shared_doc = None
     started = time.time()
+
+    def _touch():
+        # Shared with PipelineThread: a watchdog stops waiting for a document
+        # that has shown no activity for too long (network copy, OCR, render).
+        doc_info["_last_activity"] = time.time()
+
+    doc_info["_started"] = True
+    _touch()
     try:
-        work_path, temp_dir = _stage_local_copy(original_path, should_cancel=should_cancel)
+        work_path, temp_dir = _stage_local_copy(
+            original_path, should_cancel=should_cancel, activity_callback=_touch
+        )
+        _touch()
         if temp_dir:
             result["log_messages"].append(f"[STAGE] {doc_info['original_filename']}: copied to local temp for processing")
 
@@ -149,6 +162,16 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
 
         page_index = config.get("page_index", 0)
         include_date = config.get("document_date_enabled", False)
+        # With the date scan off, the OCR text is only used by the OCR panel.
+        # OCRing every page of a long scan made single documents take minutes;
+        # keep the first few pages and let blank detection cover the rest.
+        ocr_page_limit = 0
+        if not include_date:
+            try:
+                ocr_page_limit = max(0, int(config.get("ocr_text_page_limit", 3)))
+            except (TypeError, ValueError):
+                ocr_page_limit = 3
+        _touch()
         date_result = extract_document_date(
             work_path,
             page_index,
@@ -160,7 +183,9 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
             should_cancel=should_cancel,
             ocr_timeout=ocr_timeout,
             page_progress_callback=doc_info.get("_page_progress"),
+            ocr_page_limit=ocr_page_limit,
         )
+        _touch()
         result["blank_pages"] = list(date_result.blank_pages or [])
         result["log_messages"].append(
             f"[TIMING] {original_filename}: docsep+blank {time.time() - stage_t0:.1f}s"
@@ -251,7 +276,9 @@ def _process_doc_worker(doc_info: dict, config: dict, render_dpi: int) -> dict:
                         ocr_timeout=ocr_timeout,
                         should_cancel=should_cancel,
                         rotation_enabled=rotation_enabled,
+                        activity_callback=_touch,
                     )
+                    _touch()
                     result["log_messages"].append(
                         f"[TIMING] {original_filename}: qc {time.time() - qc_t0:.1f}s ({total_pages} pages)"
                     )
@@ -381,6 +408,7 @@ def _run_qc_on_pages(
     ocr_timeout: float,
     should_cancel=None,
     rotation_enabled: bool = True,
+    activity_callback=None,
 ) -> dict:
     """Run QC over every page.
 
@@ -413,6 +441,8 @@ def _run_qc_on_pages(
             for pn in range(total):
                 if should_cancel is not None and should_cancel():
                     break
+                if activity_callback is not None:
+                    activity_callback()
                 img = images_by_idx.get(pn)
                 if img is None:
                     page = doc[pn]
@@ -709,13 +739,16 @@ class PipelineThread(QThread):
             for info in doc_infos:
                 info["_should_cancel"] = lambda: self._cancelled
 
-            def _make_page_progress(name):
+            def _make_page_progress(name, info):
                 def _cb(page_idx, total_pages):
+                    info["_last_activity"] = time.time()
                     self.page_progress.emit(name, page_idx, total_pages)
                 return _cb
 
             for info in doc_infos:
-                info["_page_progress"] = _make_page_progress(info["original_filename"])
+                info["_page_progress"] = _make_page_progress(info["original_filename"], info)
+                info["_started"] = False
+                info["_last_activity"] = time.time()
 
             # Extra workers beyond the number of documents add nothing: the pool
             # creates threads lazily per submitted task, so clamp for clarity.
@@ -729,11 +762,69 @@ class PipelineThread(QThread):
             gate = self.gate
             paused_logged = False
 
-            executor = ThreadPoolExecutor(max_workers=max_workers)
+            executors = [ThreadPoolExecutor(max_workers=max_workers)]
+            executor = executors[0]
             future_to_info = {}
             pending = set()
             next_index = 0
             submitted = 0
+            stall_timeout = float(self.config.get("doc_stall_timeout_sec", 300) or 0)
+
+            def _new_executor():
+                nonlocal executor
+                executor = ThreadPoolExecutor(max_workers=max_workers)
+                executors.append(executor)
+
+            def _handle_result(info, worker_result):
+                nonlocal processed
+                doc = info.get("_doc")
+                original_path = info["original_path"]
+
+                results_by_path[original_path] = worker_result
+
+                for msg in worker_result.get("log_messages", []):
+                    self.log_message.emit(msg)
+
+                status = worker_result.get("status", "error")
+                passed_data = worker_result.get("passed_data")
+
+                if status == "confirmed" and passed_data:
+                    self.doc_processed.emit("passed", passed_data)
+                elif worker_result.get("flagged_data"):
+                    flagged_data = worker_result["flagged_data"]
+                    new_flagged.append(flagged_data)
+                    self.doc_processed.emit("pending", flagged_data)
+
+                if doc is not None:
+                    doc.blank_pages = list(worker_result.get("blank_pages", []))
+                    doc.docsep_pages = list(worker_result.get("docsep_pages", []))
+                    doc.status = status
+                    if status == "flagged" and worker_result.get("flagged_data"):
+                        doc.flagged_data = worker_result["flagged_data"]
+                        doc.company_name = worker_result["flagged_data"].get("company_name", doc.company_name)
+                        doc.company_confidence = worker_result["flagged_data"].get("company_confidence", 0)
+                    elif status == "confirmed" and passed_data:
+                        doc.confirmed_date = passed_data.get("detected_date")
+                        doc.confirmed_method = passed_data.get("method", "auto")
+                        doc.company_name = passed_data.get("company_name", doc.company_name)
+                        doc.company_confidence = passed_data.get("company_confidence", 100)
+                        doc.flagged_data = None
+                    else:
+                        doc.flagged_data = None
+
+                self.doc_completed.emit("doc", original_path)
+
+                processed += 1
+                elapsed = time.time() - start_time
+                avg_per = elapsed / max(1, processed)
+                remaining = avg_per * (total - processed)
+                eta = f" ~{int(remaining)}s left" if remaining > 5 else ""
+                pct = 10 + int(80 * processed / max(1, total))
+                self.progress.emit(f"Processing {processed}/{total}...{eta}", pct)
+
+                if processed % 50 == 0:
+                    gc.collect()
+
             try:
                 while True:
                     if self._cancelled:
@@ -758,13 +849,15 @@ class PipelineThread(QThread):
                             paused_logged = False
                             self.log_message.emit("[RESUME] Review queue drained - refilling window")
 
-                    # Submit only what the review window can absorb instead of
-                    # queueing an entire 500-PDF folder up front.
-                    while next_index < total_docs:
+                    # Keep at most one task per worker thread in flight. This
+                    # also lets the watchdog replace a stalled worker without
+                    # losing a queue of already submitted documents.
+                    while next_index < total_docs and len(pending) < max_workers:
                         if gate is not None and not gate.has_capacity(len(pending)):
                             break
                         info = doc_infos[next_index]
                         next_index += 1
+                        info["_last_activity"] = time.time()
                         future = executor.submit(_process_doc_worker, info, self.config, render_dpi)
                         future_to_info[future] = info
                         pending.add(future)
@@ -792,7 +885,43 @@ class PipelineThread(QThread):
                         self.progress.emit("Cancelled", 0)
                         self.finished_signal.emit([])
                         return
-                    if not done:
+
+                    # A document that has shown no activity for stall_timeout is
+                    # treated as hung: mark it failed and keep the rest of the
+                    # folder moving on a fresh executor.
+                    timed_out = []
+                    if stall_timeout > 0 and pending:
+                        now = time.time()
+                        for future in list(pending):
+                            info = future_to_info.get(future)
+                            if info is None or not info.get("_started"):
+                                continue
+                            last = info.get("_last_activity", now)
+                            if now - last > stall_timeout:
+                                timed_out.append((future, info))
+                    if timed_out:
+                        for future, info in timed_out:
+                            pending.discard(future)
+                            future_to_info.pop(future, None)
+                            name = info.get("original_filename", "?")
+                            self.log_message.emit(
+                                f"[ERROR] {name}: no progress for {int(stall_timeout)}s "
+                                f"- skipped. Check the file or network share."
+                            )
+                            _handle_result(
+                                info,
+                                {
+                                    "status": "error",
+                                    "flagged_data": None,
+                                    "passed_data": None,
+                                    "log_messages": [],
+                                    "blank_pages": [],
+                                    "docsep_pages": [],
+                                },
+                            )
+                        _new_executor()
+
+                    if not done and not timed_out:
                         # Heartbeat keeps the UI responsive while a long document
                         # is still being processed.
                         elapsed = time.time() - start_time
@@ -804,65 +933,24 @@ class PipelineThread(QThread):
                         continue
 
                     for future in done:
-                        info = future_to_info[future]
+                        info = future_to_info.pop(future, None)
+                        if info is None:
+                            continue
                         try:
                             worker_result = future.result()
                         except Exception as e:
-                            worker_result = {"status": "error", "log_messages": [f"[ERROR] {info['original_filename']}: {e}"]}
-
-                        doc = info.get("_doc")
-                        batch = info.get("_batch")
-                        original_path = info["original_path"]
-
-                        results_by_path[original_path] = worker_result
-
-                        for msg in worker_result.get("log_messages", []):
-                            self.log_message.emit(msg)
-
-                        status = worker_result["status"]
-
-                        if status == "confirmed" and worker_result.get("passed_data"):
-                            passed_data = worker_result["passed_data"]
-                            self.doc_processed.emit("passed", passed_data)
-                        elif worker_result.get("flagged_data"):
-                            flagged_data = worker_result["flagged_data"]
-                            new_flagged.append(flagged_data)
-                            self.doc_processed.emit("pending", flagged_data)
-
-                        if doc is not None:
-                            doc.blank_pages = list(worker_result.get("blank_pages", []))
-                            doc.docsep_pages = list(worker_result.get("docsep_pages", []))
-                            doc.status = status
-                            if status == "flagged" and worker_result.get("flagged_data"):
-                                doc.flagged_data = worker_result["flagged_data"]
-                                doc.company_name = worker_result["flagged_data"].get("company_name", doc.company_name)
-                                doc.company_confidence = worker_result["flagged_data"].get("company_confidence", 0)
-                            elif status == "confirmed" and worker_result.get("passed_data"):
-                                doc.confirmed_date = passed_data.get("detected_date")
-                                doc.confirmed_method = passed_data.get("method", "auto")
-                                doc.company_name = passed_data.get("company_name", doc.company_name)
-                                doc.company_confidence = passed_data.get("company_confidence", 100)
-                                doc.flagged_data = None
-                            else:
-                                doc.flagged_data = None
-
-                        self.doc_completed.emit("doc", original_path)
-
-                        processed += 1
-                        elapsed = time.time() - start_time
-                        avg_per = elapsed / max(1, processed)
-                        remaining = avg_per * (total - processed)
-                        eta = f" ~{int(remaining)}s left" if remaining > 5 else ""
-                        pct = 10 + int(80 * processed / max(1, total))
-                        self.progress.emit(f"Processing {processed}/{total}...{eta}", pct)
-
-                        if processed % 50 == 0:
-                            gc.collect()
+                            worker_result = {
+                                "status": "error",
+                                "log_messages": [f"[ERROR] {info['original_filename']}: {e}"],
+                            }
+                        _handle_result(info, worker_result)
             finally:
-                # Cancel queued work but let an in-flight document finish
-                # before the thread reports itself stopped (matches the old
-                # ThreadPoolExecutor context-manager behaviour).
-                executor.shutdown(wait=True, cancel_futures=True)
+                # Never wait forever on a worker that stopped responding. On
+                # normal completion there are no pending futures; on cancel a
+                # busy worker is detached and its late signals are ignored by
+                # the dashboard (they come from a previous pipeline object).
+                for ex in executors:
+                    ex.shutdown(wait=False, cancel_futures=True)
 
             if self.plan is None:
                 fresh_flagged = []
