@@ -564,6 +564,18 @@ class BackpressureGate:
                 self._paused = False
             self._cond.notify_all()
 
+    def set_high(self, high: int) -> None:
+        """Apply a new leverage limit immediately (live Settings change).
+
+        Raising the limit above the current backlog releases a paused
+        pipeline; lowering it to/below the backlog pauses new submissions.
+        The refill threshold (``low``) is unchanged.
+        """
+        with self._cond:
+            self.high = max(self.low + 1, int(high))
+            self._paused = not self._cancelled and self._backlog >= self.high
+            self._cond.notify_all()
+
     def has_capacity(self, in_flight: int = 0) -> bool:
         with self._cond:
             if self._cancelled or self._paused:

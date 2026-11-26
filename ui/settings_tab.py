@@ -28,6 +28,9 @@ from .styles import (
 from version import __version__
 from updater import UpdateCheckWorker
 from .update_dialog import UpdateDialog
+from review_window import (
+    LEVERAGE_DEFAULT, LEVERAGE_MAX, LEVERAGE_MIN, REFILL_AT, clamp_leverage,
+)
 
 
 class NumberStepper(QFrame):
@@ -403,6 +406,7 @@ class CompanyRosterDialog(QDialog):
 
 class SettingsTab(QWidget):
     theme_changed = pyqtSignal(str)
+    review_leverage_changed = pyqtSignal(int)
 
     def __init__(self, config: dict):
         super().__init__()
@@ -607,30 +611,35 @@ class SettingsTab(QWidget):
         self._steppers.append(self.company_conf_spin)
         pipe_grid.addWidget(self.make_field_column("Company Confidence", self.company_conf_spin), 2, 0)
 
+        initial_leverage = clamp_leverage(
+            self.config.get("review_window_high", LEVERAGE_DEFAULT)
+        )
+        self.config["review_window_high"] = initial_leverage
+        self.config["review_window_low"] = REFILL_AT
         self.review_high_spin = NumberStepper(
-            min_val=1, max_val=500, step=10,
-            initial=self.config.get("review_window_high", 50),
+            min_val=LEVERAGE_MIN, max_val=LEVERAGE_MAX, step=10,
+            initial=initial_leverage,
             suffix=" docs", theme=theme
         )
         self.review_high_spin.setToolTip(
-            "Processing pauses once this many documents are waiting in the "
-            "Review tab (auto-confirmed documents count too). Use CONFIRM ALL "
-            "on the Auto-Confirmed tab to free the window."
+            "How many documents may wait in the Review tab before processing "
+            "pauses. When the queue drops to 10, processing resumes and refills "
+            "back to this value. Changes save and apply immediately, even while "
+            "a scan is running."
         )
         self._steppers.append(self.review_high_spin)
-        pipe_grid.addWidget(self.make_field_column("Review Window", self.review_high_spin), 3, 0)
+        pipe_grid.addWidget(self.make_field_column("Leverage", self.review_high_spin), 3, 0)
 
-        self.review_low_spin = NumberStepper(
-            min_val=0, max_val=499, step=5,
-            initial=self.config.get("review_window_low", 10),
-            suffix=" docs", theme=theme
+        _hint_palette = get_palette_dict(theme)
+        self.review_hint = QLabel(
+            f"Refill at {REFILL_AT} docs · saves automatically"
         )
-        self.review_low_spin.setToolTip(
-            "When the review queue drains to this many documents (or fewer), "
-            "processing automatically refills the window."
+        self.review_hint.setFont(QFont("Segoe UI", 8))
+        self.review_hint.setStyleSheet(
+            f"color: {_hint_palette['text_secondary']}; padding-top: 6px;"
         )
-        self._steppers.append(self.review_low_spin)
-        pipe_grid.addWidget(self.make_field_column("Refill At", self.review_low_spin), 3, 1)
+        pipe_grid.addWidget(self.make_field_column("Refill", self.review_hint), 3, 1)
+        self.review_high_spin.valueChanged.connect(self._on_leverage_changed)
 
         pipe_layout.addLayout(pipe_grid)
         cards_grid.addWidget(pipe_card, 0, 1)
@@ -1001,6 +1010,24 @@ class SettingsTab(QWidget):
         self.pattern_label.setText(self._dated_pattern if enabled else self._dateless_pattern)
         self.example_label.setText(self._dated_example if enabled else self._dateless_example)
 
+    def _persist_config(self):
+        config_file = DATA_DIR / "config.json"
+        ensure_data_dir()
+        with open(config_file, "w", encoding="utf-8") as f:
+            json.dump(self.config, f, indent=2, ensure_ascii=False)
+
+    def _on_leverage_changed(self, value):
+        """Auto-save and live-apply the leverage control (no Save click)."""
+        high = clamp_leverage(value)
+        if self.review_high_spin.value() != high:
+            self.review_high_spin.blockSignals(True)
+            self.review_high_spin.setValue(high)
+            self.review_high_spin.blockSignals(False)
+        self.config["review_window_high"] = high
+        self.config["review_window_low"] = REFILL_AT
+        self._persist_config()
+        self.review_leverage_changed.emit(high)
+
     def save_settings(self):
         self.config["confidence_threshold"] = self.conf_spin.value()
         self.config["company_confidence_threshold"] = self.company_conf_spin.value()
@@ -1010,9 +1037,10 @@ class SettingsTab(QWidget):
         self.config["render_dpi"] = self.dpi_spin.value()
         self.config["max_workers"] = self.workers_spin.value()
         self.config["ocr_timeout_sec"] = self.ocr_timeout_spin.value()
-        review_high = self.review_high_spin.value()
-        self.config["review_window_high"] = review_high
-        self.config["review_window_low"] = max(0, min(self.review_low_spin.value(), review_high - 1))
+        self.config["review_window_high"] = clamp_leverage(
+            self.review_high_spin.value()
+        )
+        self.config["review_window_low"] = REFILL_AT
         self.config["output_layout"] = self.layout_combo.currentData()
         self.config["document_date_enabled"] = self.document_date_check.isChecked()
         self.config["uppercase_filenames"] = self.uppercase_filenames_check.isChecked()
@@ -1034,8 +1062,5 @@ class SettingsTab(QWidget):
         self.config["remote_gpu_url"] = self.remote_url_input.text().strip()
         self.config["theme"] = self.theme_combo.currentText()
 
-        config_file = DATA_DIR / "config.json"
-        ensure_data_dir()
-        with open(config_file, "w", encoding="utf-8") as f:
-            json.dump(self.config, f, indent=2, ensure_ascii=False)
+        self._persist_config()
         QMessageBox.information(self, "Saved", "Settings saved successfully")

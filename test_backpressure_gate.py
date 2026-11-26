@@ -77,3 +77,42 @@ def test_cancel_wakes_waiter_without_deadlock():
     assert not waiter.is_alive()
     assert result == [False]
     assert not gate.has_capacity(0)
+
+
+def test_raising_leverage_unpauses_below_new_limit():
+    gate = BackpressureGate(high=5, low=2)
+    gate.set_backlog(5)
+    assert gate.paused
+    gate.set_high(10)
+    assert gate.high == 10
+    assert not gate.paused
+    assert gate.has_capacity(0)
+
+
+def test_lowering_leverage_pauses_when_backlog_exceeds_it():
+    gate = BackpressureGate(high=10, low=2)
+    gate.set_backlog(8)
+    assert not gate.paused
+    gate.set_high(5)
+    assert gate.paused
+    assert not gate.has_capacity(0)
+
+
+def test_set_high_keeps_low_watermark_and_clamps_above_it():
+    gate = BackpressureGate(high=10, low=3)
+    gate.set_high(1)
+    assert gate.high == 4
+    assert gate.low == 3
+
+
+def test_set_high_wakes_waiter():
+    gate = BackpressureGate(high=5, low=1)
+    gate.set_backlog(5)
+    result = []
+    waiter = threading.Thread(target=lambda: result.append(gate.wait_for_capacity(0)))
+    waiter.start()
+    time.sleep(0.2)
+    gate.set_high(10)
+    waiter.join(timeout=2)
+    assert not waiter.is_alive()
+    assert result == [True]

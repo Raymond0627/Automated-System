@@ -21,6 +21,7 @@ from .update_dialog import UpdateDialog
 from updater import UpdateCheckWorker
 from version import __version__
 from session import set_scan_info, derive_scan_info
+from review_window import normalize_review_window
 
 
 class MainWindow(QMainWindow):
@@ -93,6 +94,9 @@ class MainWindow(QMainWindow):
         self.dashboard_tab.review_tab = self.review_tab
 
         self.settings_tab.theme_changed.connect(self.apply_theme)
+        self.settings_tab.review_leverage_changed.connect(
+            self.dashboard_tab.set_review_leverage
+        )
 
         self.dashboard_tab.pipeline_started.connect(self.review_tab.clear_all)
         self.dashboard_tab.doc_update.connect(self.review_tab.add_doc)
@@ -229,6 +233,7 @@ class MainWindow(QMainWindow):
                     defaults.update(json.load(f))
             except Exception:
                 pass
+        normalize_review_window(defaults)
         return defaults
 
     def _on_tab_changed(self, index):

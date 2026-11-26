@@ -17,6 +17,9 @@ if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).parent.parent))
 from paths import BASE_DIR, DATA_DIR, ensure_data_dir
 from .widgets import PipelineThread, BackpressureGate
+from review_window import (
+    LEVERAGE_DEFAULT, REFILL_AT, clamp_leverage, normalize_review_window,
+)
 from find_remaining import build_report as build_remaining_report
 from find_remaining import plan_for_pipeline
 from .styles import (
@@ -1198,10 +1201,21 @@ class DashboardTab(QWidget):
             self._emit_state_changed()
 
     def _start_review_gate(self):
-        high = int(self.config.get("review_window_high", 50) or 50)
-        low = int(self.config.get("review_window_low", 10) or 0)
-        self._review_gate = BackpressureGate(high, low)
+        normalize_review_window(self.config)
+        high = clamp_leverage(
+            self.config.get("review_window_high", LEVERAGE_DEFAULT)
+        )
+        self._review_gate = BackpressureGate(high, REFILL_AT)
         self._backlog_timer.start()
+
+    def set_review_leverage(self, value: int):
+        """Live-apply the Settings leverage control to a running pipeline."""
+        high = clamp_leverage(value)
+        self.config["review_window_high"] = high
+        self.config["review_window_low"] = REFILL_AT
+        if self._review_gate is not None:
+            self._review_gate.set_high(high)
+            self._sync_review_gate()
 
     def _stop_review_gate(self):
         self._accepting_docs = False
