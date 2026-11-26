@@ -407,6 +407,8 @@ class CompanyRosterDialog(QDialog):
 class SettingsTab(QWidget):
     theme_changed = pyqtSignal(str)
     review_leverage_changed = pyqtSignal(int)
+    update_found = pyqtSignal(str, str, str)
+    update_none = pyqtSignal()
 
     def __init__(self, config: dict):
         super().__init__()
@@ -990,12 +992,14 @@ class SettingsTab(QWidget):
     def _on_manual_update_found(self, version_tag: str, notes: str, download_url: str):
         self.check_update_btn.setEnabled(True)
         self.update_status_label.setText(f"Update available: {version_tag}")
+        self.update_found.emit(version_tag, notes, download_url)
         dialog = UpdateDialog(version_tag, notes, download_url, parent=self)
         dialog.exec()
 
     def _on_manual_no_update(self):
         self.check_update_btn.setEnabled(True)
         self.update_status_label.setText("✓ You are up to date.")
+        self.update_none.emit()
         QMessageBox.information(
             self, "No Updates",
             f"You are already running the latest version of Lumeed QScan (v{__version__})."

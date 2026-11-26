@@ -16,7 +16,7 @@ from PyQt6.QtGui import QFont, QColor, QPixmap
 if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).parent.parent))
 from paths import BASE_DIR, DATA_DIR, ensure_data_dir
-from .widgets import PipelineThread, BackpressureGate
+from .widgets import PipelineThread, BackpressureGate, UpdateIndicatorButton
 from review_window import (
     LEVERAGE_DEFAULT, REFILL_AT, clamp_leverage, normalize_review_window,
 )
@@ -140,6 +140,7 @@ class DashboardTab(QWidget):
     doc_update = pyqtSignal(str, dict)
     pipeline_started = pyqtSignal()
     state_changed = pyqtSignal()
+    update_clicked = pyqtSignal()
 
     def __init__(self, config: dict):
         super().__init__()
@@ -204,6 +205,14 @@ class DashboardTab(QWidget):
         header.addLayout(title_col)
 
         header.addStretch()
+
+        # Minimal update indicator: dark when current, red when an update is ready.
+        self.update_btn = UpdateIndicatorButton(
+            self.config.get("theme", THEME_DARK)
+        )
+        self.update_btn.clicked.connect(self.update_clicked.emit)
+        header.addWidget(self.update_btn)
+        header.addSpacing(2)
 
         # Modern System Status Badge Pill
         self.status_pill = QLabel("●  IDLE")
@@ -404,6 +413,12 @@ class DashboardTab(QWidget):
         self.log_signal.connect(self._append_log)
         self.apply_theme(self.config.get("theme", THEME_DARK))
 
+    def set_update_available(self, available: bool, version: str = ""):
+        self.update_btn.set_available(available, version)
+
+    def set_update_checking(self):
+        self.update_btn.set_checking()
+
     def _set_status_pill(self, state: str, text: str):
         theme = self.config.get("theme", THEME_DARK)
         p = get_palette_dict(theme)
@@ -507,6 +522,8 @@ class DashboardTab(QWidget):
             current_txt = self.status_pill.text().replace("●  ", "").strip()
             state = "running" if "RUNNING" in current_txt or "SCANNING" in current_txt else ("done" if "COMPLETED" in current_txt else "idle")
             self._set_status_pill(state, current_txt if current_txt else "IDLE")
+        if hasattr(self, "update_btn"):
+            self.update_btn.apply_theme(theme_name)
 
         # Update existing table row labels & pills
         if hasattr(self, "log_table"):

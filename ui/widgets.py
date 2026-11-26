@@ -14,9 +14,9 @@ from typing import Dict
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from datetime import date, datetime
 
-from PyQt6.QtWidgets import QWidget, QFrame, QHBoxLayout, QVBoxLayout, QLabel
+from PyQt6.QtWidgets import QWidget, QFrame, QHBoxLayout, QVBoxLayout, QLabel, QToolButton
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QFont, QColor, QPainter, QPen
 
 if not getattr(sys, 'frozen', False):
     sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -521,6 +521,63 @@ def _merge_flagged_docs(existing, new):
             positions[key] = len(merged)
             merged.append(doc)
     return merged
+
+
+class UpdateIndicatorButton(QToolButton):
+    """Minimal download/update glyph: dark when idle, red when an update exists."""
+
+    def __init__(self, theme: str = THEME_DARK, parent=None):
+        super().__init__(parent)
+        self._theme = theme
+        self._available = False
+        self.setFixedSize(28, 28)
+        self.setAutoRaise(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setStyleSheet(
+            "QToolButton { border: none; background: transparent; padding: 0; }"
+        )
+        self.setToolTip("You're up to date")
+
+    def set_available(self, available: bool, version: str = "") -> None:
+        self._available = bool(available)
+        if self._available:
+            label = f"Update {version} available — click to install".strip()
+        else:
+            label = "You're up to date — click to check"
+        self.setToolTip(label)
+        self.update()
+
+    def set_checking(self) -> None:
+        self.setToolTip("Checking for updates...")
+
+    def apply_theme(self, theme: str) -> None:
+        self._theme = theme
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        if self._available:
+            color = QColor("#e5484d")
+        elif self._theme == THEME_DARK:
+            color = QColor("#d4d9e6")
+        else:
+            color = QColor("#1f2430")
+
+        pen = QPen(color, 1.8)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+
+        cx = self.width() / 2
+        # Download arrow + tray: 28x28 glyph, deliberately minimal.
+        painter.drawLine(int(cx), 7, int(cx), 17)
+        painter.drawLine(int(cx) - 4, 13, int(cx), 17)
+        painter.drawLine(int(cx) + 4, 13, int(cx), 17)
+        painter.drawLine(8, 21, 20, 21)
 
 
 class BackpressureGate:

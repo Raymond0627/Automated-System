@@ -32,6 +32,9 @@ class MainWindow(QMainWindow):
         self._seed_config_if_needed()
         self.config = self._load_config()
         self._startup_checks_done = False
+        self._update_info = None
+        self._manual_update_check = False
+        self._update_worker = None
         self._setup_ui()
 
     def showEvent(self, event):
@@ -54,10 +57,55 @@ class MainWindow(QMainWindow):
         # 3. Check for app updates in the background after startup
         QTimer.singleShot(2500, self._check_for_updates_background)
 
-    def _check_for_updates_background(self):
+    def _check_for_updates_background(self, manual: bool = False):
+        if self._update_worker and self._update_worker.isRunning():
+            if manual:
+                self._manual_update_check = True
+            return
+        self._manual_update_check = manual
+        self.dashboard_tab.set_update_checking()
+        if manual:
+            self.statusBar().showMessage("Checking for updates...", 4000)
         self._update_worker = UpdateCheckWorker(current_ver=__version__, parent=self)
-        self._update_worker.update_available.connect(self._show_update_dialog)
+        self._update_worker.update_available.connect(self._on_update_available)
+        self._update_worker.no_update.connect(self._on_update_none)
+        self._update_worker.check_failed.connect(self._on_update_failed)
         self._update_worker.start()
+
+    def _on_update_indicator_clicked(self):
+        if self._update_info:
+            self._show_update_dialog(*self._update_info)
+        else:
+            self._check_for_updates_background(manual=True)
+
+    def _on_update_available(self, version_tag: str, notes: str, download_url: str):
+        self._update_info = (version_tag, notes, download_url)
+        self.dashboard_tab.set_update_available(True, version_tag)
+        self.statusBar().showMessage(
+            f"Update {version_tag} is available — click the update icon to install",
+            8000,
+        )
+        if self._manual_update_check:
+            self._manual_update_check = False
+            self._show_update_dialog(version_tag, notes, download_url)
+
+    def _on_update_none(self):
+        self._update_info = None
+        self.dashboard_tab.set_update_available(False)
+        if self._manual_update_check:
+            self._manual_update_check = False
+            self.statusBar().showMessage(
+                f"You are up to date (v{__version__})", 5000
+            )
+
+    def _on_update_failed(self, err_msg: str):
+        if self._update_info:
+            self.dashboard_tab.set_update_available(True, self._update_info[0])
+        else:
+            self.dashboard_tab.set_update_available(False)
+        if self._manual_update_check:
+            self._manual_update_check = False
+            self.statusBar().showMessage("Could not check for updates", 5000)
 
     def _show_update_dialog(self, version_tag: str, notes: str, download_url: str):
         dialog = UpdateDialog(version_tag, notes, download_url, parent=self)
@@ -97,11 +145,14 @@ class MainWindow(QMainWindow):
         self.settings_tab.review_leverage_changed.connect(
             self.dashboard_tab.set_review_leverage
         )
+        self.settings_tab.update_found.connect(self._on_update_available)
+        self.settings_tab.update_none.connect(self._on_update_none)
 
         self.dashboard_tab.pipeline_started.connect(self.review_tab.clear_all)
         self.dashboard_tab.doc_update.connect(self.review_tab.add_doc)
         self.dashboard_tab.pipeline_finished.connect(self._on_pipeline_finished)
         self.dashboard_tab.state_changed.connect(self._sync_scan_to_session)
+        self.dashboard_tab.update_clicked.connect(self._on_update_indicator_clicked)
         self.review_tab.session_restored.connect(self._on_session_restored)
 
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
