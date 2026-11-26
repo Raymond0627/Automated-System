@@ -1605,6 +1605,25 @@ class ReviewTab(QWidget):
         self._pixmap_cache.clear()
         self._pixmap_cache_order.clear()
 
+    def _invalidate_page_pixmap(self, page_num):
+        """Drop cached renders for one page only (rotate/flip/enhance)."""
+        stale = [key for key in self._pixmap_cache if key[0] == page_num]
+        for key in stale:
+            self._pixmap_cache.pop(key, None)
+            if key in self._pixmap_cache_order:
+                self._pixmap_cache_order.remove(key)
+
+    def _peek_page_pixmap(self, page_num, page_width):
+        """Return a cached page pixmap without rasterizing anything."""
+        key = (page_num, self.zoom_level, page_width)
+        pixmap = self._pixmap_cache.get(key)
+        if pixmap is None:
+            return None
+        if key in self._pixmap_cache_order:
+            self._pixmap_cache_order.remove(key)
+        self._pixmap_cache_order.append(key)
+        return pixmap
+
     def load_document(self, doc: dict):
         self.exit_crop_mode()
         self._exit_sort_mode(rerender=False)
@@ -1840,6 +1859,101 @@ class ReviewTab(QWidget):
             else:
                 lbl.setStyleSheet(f"background-color: {p['bg_surface']}; border: 1px solid {p['border']}; border-radius: 4px; padding: 4px;")
 
+    def _update_preview_status(self):
+        if not self.current_pdf_doc:
+            return
+        total_pages = len(self.current_pdf_doc)
+        blank_count = len([p for p in self._get_blank_pages() if p < total_pages])
+        docsep_count = len([p for p in self._get_docsep_pages() if p < total_pages])
+        status = f"{total_pages} page(s)"
+        if blank_count:
+            status += f" | {blank_count} blank"
+        if docsep_count:
+            status += f" | {docsep_count} DOCSEP"
+        if self._sort_mode:
+            status += "  |  SORTING: drag pages to reorder  (Enter=apply, Esc=cancel)"
+        else:
+            status += f" | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)"
+        self.page_label.setText(status)
+
+    def _refresh_page_label(self, page_num, content_changed=True, reuse_candidates=False):
+        """Rebuild only one page label instead of the whole preview.
+
+        Rotation/flip/enhance change that page's raster; blank marks only
+        change its border/badge. Keeping the other labels alive removes the
+        white flash caused by a full render_preview() rebuild.
+        """
+        if not self.current_pdf_doc or self._sort_mode:
+            self.render_preview()
+            return
+        labels = self.page_labels
+        index = None
+        old = None
+        for i, lbl in enumerate(labels):
+            pn = getattr(lbl, "_page_num", getattr(lbl, "_lazy_page_num", None))
+            if pn == page_num:
+                index, old = i, lbl
+                break
+        if old is None:
+            self.render_preview()
+            return
+
+        width = getattr(old, "_lazy_width", None) or old.width()
+        if not width:
+            width = max(400, self.preview_scroll.viewport().width() - 50)
+        blank_pages = self._get_blank_pages()
+        docsep_pages = self._get_docsep_pages()
+        was_rendered = bool(getattr(old, "_lazy_rendered", False))
+
+        if content_changed:
+            pixmap = self._make_page_pixmap(page_num, width)
+            rendered = True
+        elif was_rendered:
+            pixmap = old.pixmap()
+            rendered = True
+        else:
+            pixmap = self._make_page_placeholder(page_num, width)
+            rendered = False
+
+        new = self._create_page_label(
+            page_num, pixmap, blank_pages, docsep_pages, sort_slot=-1
+        )
+        new._lazy_page_num = page_num
+        new._lazy_width = width
+        new._lazy_rendered = rendered
+        if reuse_candidates and not content_changed and hasattr(old, "_candidates"):
+            new._candidates = list(getattr(old, "_candidates", []))
+            new._word_boxes = list(getattr(old, "_word_boxes", []))
+            new._page_size = getattr(old, "_page_size", (612.0, 792.0))
+        elif rendered:
+            self._populate_label_candidates(new, page_num)
+
+        scroll_bar = self.preview_scroll.verticalScrollBar()
+        saved_scroll = scroll_bar.value() if scroll_bar else 0
+        old_top = old.mapTo(self.preview_container, QPoint(0, 0)).y()
+
+        parent = old.parentWidget()
+        layout = parent.layout() if parent is not None else None
+        if layout is None or layout.indexOf(old) < 0:
+            layout = self.preview_container_layout
+        old.hide()
+        layout.replaceWidget(old, new)
+        new.show()
+        old.deleteLater()
+        labels[index] = new
+
+        self._update_preview_status()
+        if not rendered:
+            self._schedule_preview_render()
+        if scroll_bar:
+            def _restore_scroll():
+                try:
+                    new_top = new.mapTo(self.preview_container, QPoint(0, 0)).y()
+                    scroll_bar.setValue(max(0, saved_scroll + (new_top - old_top)))
+                except RuntimeError:
+                    scroll_bar.setValue(saved_scroll)
+            QTimer.singleShot(0, _restore_scroll)
+
     def _make_page_pixmap(self, page_num, page_width):
         cache_key = (page_num, self.zoom_level, page_width)
         if cache_key in self._pixmap_cache:
@@ -2014,9 +2128,10 @@ class ReviewTab(QWidget):
                     )
                     lbl._lazy_rendered = True
                     return lbl
+                cached = self._peek_page_pixmap(page_num, width)
                 lbl = self._create_page_label(
                     page_num,
-                    self._make_page_placeholder(page_num, width),
+                    cached if cached is not None else self._make_page_placeholder(page_num, width),
                     blank_pages,
                     docsep_pages,
                     sort_slot=-1,
@@ -2101,18 +2216,7 @@ class ReviewTab(QWidget):
                         row.setSpacing(8)
                         count = 0
 
-            blank_count = len([p for p in blank_pages if p < total_pages])
-            docsep_count = len([p for p in docsep_pages if p < total_pages])
-            status = f"{total_pages} page(s)"
-            if blank_count:
-                status += f" | {blank_count} blank"
-            if docsep_count:
-                status += f" | {docsep_count} DOCSEP"
-            if self._sort_mode:
-                status += "  |  SORTING: drag pages to reorder  (Enter=apply, Esc=cancel)"
-            else:
-                status += f" | Zoom: {self.zoom_level}%  (Ctrl+Scroll to zoom)"
-            self.page_label.setText(status)
+            self._update_preview_status()
             self._schedule_preview_render()
         except Exception as e:
             self.preview_placeholder.setText(f"Error rendering: {e}")
@@ -2218,13 +2322,13 @@ class ReviewTab(QWidget):
     def _rotate_page(self, page_num, degrees):
         if not self.current_pdf_doc:
             return
-        self._clear_pixmap_cache()
-        self._push_undo()
         page = self.current_pdf_doc[page_num]
         current = page.rotation or 0
+        self._push_rotation_undo(page_num, current)
         page.set_rotation((current + degrees) % 360)
         self.document_modified = True
-        self.render_preview()
+        self._invalidate_page_pixmap(page_num)
+        self._refresh_page_label(page_num, content_changed=True)
         self._session_changed()
 
 
@@ -2234,7 +2338,6 @@ class ReviewTab(QWidget):
         import cv2
         import numpy as np
         import tempfile
-        self._clear_pixmap_cache()
         self._push_undo()
         try:
             page = self.current_pdf_doc[page_num]
@@ -2260,7 +2363,8 @@ class ReviewTab(QWidget):
             tmp.close()
             os.unlink(tmp.name)
             self.document_modified = True
-            self.render_preview()
+            self._invalidate_page_pixmap(page_num)
+            self._refresh_page_label(page_num, content_changed=True)
             self._session_changed()
     
         except Exception as e:
@@ -2269,14 +2373,14 @@ class ReviewTab(QWidget):
     def _enhance_page(self, page_num):
         if not self.current_pdf_doc:
             return
-        self._clear_pixmap_cache()
         self._push_undo()
         try:
             page = self.current_pdf_doc[page_num]
             dpi = self.config.get("render_dpi", 150)
             enhance_page(page, dpi=dpi, config=self.config)
             self.document_modified = True
-            self.render_preview()
+            self._invalidate_page_pixmap(page_num)
+            self._refresh_page_label(page_num, content_changed=True)
             self._session_changed()
     
         except Exception as e:
@@ -2301,6 +2405,7 @@ class ReviewTab(QWidget):
         self._crop_page_num = page_num
         # Rebuild the preview so every label is sized for the box it shows now
         # (the target page is currently the full, uncropped page).
+        self._invalidate_page_pixmap(page_num)
         self.render_preview()
 
         if page_num >= len(self.page_labels):
@@ -2468,7 +2573,10 @@ class ReviewTab(QWidget):
 
     def _on_escape(self):
         if self._crop_mode:
+            page_num = self._crop_page_num
             self.exit_crop_mode()
+            if self.current_pdf_doc and 0 <= page_num < len(self.current_pdf_doc):
+                self._invalidate_page_pixmap(page_num)
             self.render_preview()
             return
         if self._sort_mode:
@@ -2478,7 +2586,10 @@ class ReviewTab(QWidget):
         if self._sort_mode or not self.current_pdf_doc:
             return
         if self._crop_mode:
+            page_num = self._crop_page_num
             self.exit_crop_mode()
+            if self.current_pdf_doc and 0 <= page_num < len(self.current_pdf_doc):
+                self._invalidate_page_pixmap(page_num)
         if len(self.current_pdf_doc) < 2:
             self._show_toast("Sorting needs at least 2 pages")
             return
@@ -2714,14 +2825,14 @@ class ReviewTab(QWidget):
         doc = self._get_current_doc()
         if not doc:
             return
-        self._push_undo()
+        self._push_marks_undo(page_num)
         blank_pages = doc.setdefault("blank_pages", [])
         if page_num not in blank_pages:
             blank_pages.append(page_num)
         docsep_pages = doc.get("docsep_pages", [])
         if page_num in docsep_pages:
             docsep_pages.remove(page_num)
-        self.render_preview()
+        self._refresh_page_label(page_num, content_changed=False, reuse_candidates=True)
         self._session_changed()
 
 
@@ -2729,14 +2840,14 @@ class ReviewTab(QWidget):
         doc = self._get_current_doc()
         if not doc:
             return
-        self._push_undo()
+        self._push_marks_undo(page_num)
         blank_pages = doc.get("blank_pages", [])
         if page_num in blank_pages:
             blank_pages.remove(page_num)
         docsep_pages = doc.get("docsep_pages", [])
         if page_num in docsep_pages:
             docsep_pages.remove(page_num)
-        self.render_preview()
+        self._refresh_page_label(page_num, content_changed=False, reuse_candidates=True)
         self._session_changed()
 
 
@@ -2757,27 +2868,50 @@ class ReviewTab(QWidget):
             img_rect = fitz.Rect((612 - w) / 2, (792 - h) / 2, (612 + w) / 2, (792 + h) / 2)
             new_page.insert_image(img_rect, pixmap=img_pix)
             self.document_modified = True
+            self._clear_pixmap_cache()
             self.render_preview()
             self._session_changed()
     
         except Exception as e:
             QMessageBox.critical(self, "Insert Error", f"Failed to insert image:\n{e}")
 
+    def _push_undo_state(self, state):
+        self.undo_stack.append(state)
+        total = sum(len(s.get("pdf", b"")) for s in self.undo_stack)
+        while (len(self.undo_stack) > self.undo_max) or (total > self.undo_max_bytes and len(self.undo_stack) > 1):
+            dropped = self.undo_stack.pop(0)
+            total -= len(dropped.get("pdf", b""))
+
     def _push_undo(self):
         if not self.current_pdf_doc:
             return
         doc = self._get_current_doc()
-        pdf_bytes = self.current_pdf_doc.tobytes()
         state = {
-            "pdf": pdf_bytes,
+            "kind": "pdf",
+            "pdf": self.current_pdf_doc.tobytes(),
             "blank_pages": list(doc.get("blank_pages", [])) if doc else [],
             "docsep_pages": list(doc.get("docsep_pages", [])) if doc else [],
         }
-        self.undo_stack.append(state)
-        total = sum(len(s["pdf"]) for s in self.undo_stack)
-        while (len(self.undo_stack) > self.undo_max) or (total > self.undo_max_bytes and len(self.undo_stack) > 1):
-            dropped = self.undo_stack.pop(0)
-            total -= len(dropped["pdf"])
+        self._push_undo_state(state)
+
+    def _push_marks_undo(self, page_num):
+        doc = self._get_current_doc()
+        self._push_undo_state({
+            "kind": "marks",
+            "page": page_num,
+            "blank_pages": list(doc.get("blank_pages", [])) if doc else [],
+            "docsep_pages": list(doc.get("docsep_pages", [])) if doc else [],
+        })
+
+    def _push_rotation_undo(self, page_num, rotation):
+        doc = self._get_current_doc()
+        self._push_undo_state({
+            "kind": "rotation",
+            "page": page_num,
+            "rotation": rotation,
+            "blank_pages": list(doc.get("blank_pages", [])) if doc else [],
+            "docsep_pages": list(doc.get("docsep_pages", [])) if doc else [],
+        })
 
     def _undo(self):
         self.exit_crop_mode()
@@ -2787,13 +2921,42 @@ class ReviewTab(QWidget):
         if not self.undo_stack or not self.current_pdf_doc:
             return
         state = self.undo_stack.pop()
+        kind = state.get("kind", "pdf")
+        doc = self._get_current_doc()
+
+        if kind == "rotation":
+            page_num = state.get("page", -1)
+            if 0 <= page_num < len(self.current_pdf_doc):
+                self.current_pdf_doc[page_num].set_rotation(state.get("rotation", 0))
+                if doc:
+                    doc["blank_pages"] = state.get("blank_pages", [])
+                    doc["docsep_pages"] = state.get("docsep_pages", [])
+                self.document_modified = True
+                self._invalidate_page_pixmap(page_num)
+                self._refresh_page_label(page_num, content_changed=True)
+                self._session_changed()
+            return
+
+        if kind == "marks":
+            page_num = state.get("page", -1)
+            if doc:
+                doc["blank_pages"] = state.get("blank_pages", [])
+                doc["docsep_pages"] = state.get("docsep_pages", [])
+            if 0 <= page_num < len(self.current_pdf_doc):
+                self._refresh_page_label(
+                    page_num, content_changed=False, reuse_candidates=True
+                )
+            self._session_changed()
+            return
+
+        # Full PDF snapshot (delete/insert/flip/enhance/crop/sort).
         self.current_pdf_doc.close()
         self.current_pdf_doc = fitz.open("pdf", state["pdf"])
-        doc = self._get_current_doc()
         if doc:
             doc["blank_pages"] = state["blank_pages"]
             doc["docsep_pages"] = state["docsep_pages"]
         self.document_modified = True
+        self._clear_pixmap_cache()
         self.render_preview()
         self._session_changed()
 
